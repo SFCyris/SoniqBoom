@@ -500,7 +500,8 @@ _INDEXED_FIELDS = (_TOKEN_FIELDS | _AGG_FIELDS
 # first art extraction of every track, so bumping for it re-cooled every
 # library-wide cache on normal browsing; ``default_subsong`` (a multi-tune
 # file's probed default tune) on its first play.
-_SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "default_subsong"))
+_SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "default_subsong",
+                                "duration_rev"))
 
 # Fields a browse surface reads besides the indexed ones: the duplicate
 # stand-in pick (``duplicates.primary_sort_key`` — ``bitrate``) and the
@@ -525,7 +526,7 @@ _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     "health", "health_note", "health_by", "health_at", "health_renderer",
     "defect", "defect_detail", "defect_renderer", "defect_at", "defect_evidence",
     # tune data of SID / libgme / PSF files (the start pass, HVSC, repair)
-    "subsongs", "subsong_base", "start_subsong", "tune_lengths", "fade_s",
+    "subsongs", "subsong_base", "start_subsong", "tune_lengths", "fade_s", "tune_fades",
     "hvsc_lengths", "stil", "sid_md5", "sid_model",
     # enrichment join keys and provenance (the values they set are indexed)
     "file_md5", "scene_path", "scene_use", "scene_party", "scene_compo", "scene_place",
@@ -571,6 +572,7 @@ _TWIN_WATCH = _TWIN_FIELDS | {"is_duplicate_primary"}
 # pass whose last run is older runs over everything.
 _ENRICH_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "duplicate_group_id",
                                    "is_duplicate_primary", "format_score", "default_subsong",
+                                   "duration_rev",
                                    # the derived-genre pass's own output: no
                                    # pass reads it (core/genre_derive.py)
                                    "genre_derived"))
@@ -586,7 +588,7 @@ _CATALOG_FIELDS = frozenset(("title", "artist", "album_artist", "album", "genre"
                              "track_number", "disc_number",
                              "subsongs", "start_subsong", "hvsc_lengths",
                              # (what "Skip short tunes" lists in a multi-tune file)
-                             "tune_lengths", "fade_s", "default_subsong"))
+                             "tune_lengths", "fade_s", "tune_fades", "default_subsong"))
 
 # A write that changes ``duration`` and nothing else (besides seq-exempt fields)
 # — the render-time / probe backfill of a render-only format's real length,
@@ -1491,6 +1493,7 @@ def _carry_default_tune(old: dict, new: dict) -> None:
     new["default_subsong"] = z
     if z and "duration" in old:
         new["duration"] = old["duration"]
+        new["duration_rev"] = old.get("duration_rev")
 
 
 class PrimarySwap:
@@ -4896,7 +4899,9 @@ class TrackStore:
         the format of that name (any case); else, when ``value`` is a file
         extension, every format files with that extension are given (with
         "DSD" its quality tiers DSD64, DSD128, … — ``dsd`` itself also names
-        "DSD" and every tier); else, when it is a family
+        "DSD" and every tier; a ``search_values.FORMAT_GROUPS`` word — ``dts``,
+        ``dts-hd``, ``dolby`` — names every format of its group, its own
+        name included); else, when it is a family
         word (``search_values.FAMILIES``), every format of that family
         (``retro.coarse_family``; unopened online-collection packages are no
         format of any family); else none."""
@@ -4904,7 +4909,9 @@ class TrackStore:
         key = str(value).strip().lower()
         idx = self._tag_format
         hit = idx.get(key)
-        names = {"dsd"} if key == "dsd" else None        # (DSD: with its tiers)
+        names = ({"dsd"} if key == "dsd"                 # (DSD: with its tiers)
+                 else set(search_values.FORMAT_GROUPS[key]) if key in search_values.FORMAT_GROUPS
+                 else None)
         if hit is not None and names is None:
             return hit, True
         if names is None:

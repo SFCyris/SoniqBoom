@@ -293,7 +293,8 @@ def _parse_advanced_query(q: str) -> str | None:
       track:3/12 reads track:3); a track without that number never matches,
       format:VALUE (also type:VALUE) — the list's Type column: an exact
       format name; else a file extension (format:mod → ProTracker,
-      format:m4a → AAC and ALAC); else a family (tracker / trackers,
+      format:m4a → AAC and ALAC; format:dts → DTS and DTS-HD, format:dolby →
+      AC-3, E-AC-3 and TrueHD); else a family (tracker / trackers,
       chiptune, lossless, lossy, other — the library Galaxy's families),
       length:VALUE — the length in whole seconds, in the forms of year:,
       each length written 90, 90s, 5m, 1h, 1:30 or 1:02:03 (length:>5:00,

@@ -1019,6 +1019,9 @@ _EXT_MIME = {
     "aif": "audio/aiff", "aiff": "audio/aiff", "aifc": "audio/aiff",
     "dsf": "audio/x-dsd", "dff": "audio/x-dsd", "wsd": "audio/x-dsd",
     "mpc": "audio/x-musepack", "wv": "audio/x-wavpack", "ape": "audio/x-ape",
+    "ac3": "audio/ac3", "eac3": "audio/eac3", "ec3": "audio/eac3", "dts": "audio/vnd.dts",
+    "dtshd": "audio/vnd.dts.hd", "thd": "audio/vnd.dolby.mlp", "truehd": "audio/vnd.dolby.mlp",
+    "mlp": "audio/vnd.dolby.mlp",
     "wma": "audio/x-ms-wma", "mid": "audio/midi", "midi": "audio/midi", "kar": "audio/midi",
     "sid": "audio/prs.sid", "psid": "audio/prs.sid", "rsid": "audio/prs.sid",
     "mod": "audio/x-mod", "xm": "audio/x-mod", "s3m": "audio/x-mod", "it": "audio/x-mod",
@@ -1030,6 +1033,9 @@ _EXT_MIME = {
 _DIRECT_EXTS = frozenset({"mp3", "flac", "wav", "ogg", "opus",
                           "m4a", "mp4", "m4b", "m4r", "aac", "3gp"})
 _MP4_EXTS = frozenset({"m4a", "mp4", "m4b", "m4r", "aac", "3gp"})
+# MP4-family codecs /rest/stream converts to WAV (ALAC: unless the client
+# plays it; Dolby Digital (Plus) always): labels the scanner gives them.
+_MP4_CONVERTED = ("ALAC", "AC-3", "E-AC-3")
 _SUFFIX_JUNK = re.compile(r"[^a-z0-9]")
 _DELIVERY_MEMO: dict[str, tuple[str, str, str | None, str | None]] = {}
 _UADE_PREFIX_MEMO: dict[str, bool] = {}
@@ -1072,7 +1078,7 @@ def _delivery(t: dict) -> tuple[str, str, str | None, str | None]:
         if len(_DELIVERY_MEMO) > 4096:
             _DELIVERY_MEMO.clear()
         _DELIVERY_MEMO[ext] = hit
-    if ext in _MP4_EXTS and (t.get("format") or "").upper().startswith("ALAC"):
+    if ext in _MP4_EXTS and (t.get("format") or "").upper().startswith(_MP4_CONVERTED):
         return (ext, hit[1], "wav", "audio/wav")
     return hit
 
@@ -4156,7 +4162,8 @@ def _normalise_codec(name: str) -> str:
     n = (name or "").lower().strip()
     return {"vorbis": "ogg", "ogg vorbis": "ogg", "m4a": "aac",
             "alac/aac": "alac", "alac": "alac", "wavpack": "wv",
-            "musepack": "mpc"}.get(n, n)
+            "musepack": "mpc", "ac-3": "ac3", "e-ac-3": "eac3",
+            "dts-hd": "dts", "dts-hd ma": "dts", "dts-hd hra": "dts"}.get(n, n)
 
 
 # Targets the stream handler produces on request (``format=``); WAV is what it
@@ -4213,7 +4220,7 @@ def _http_ok(prof: dict) -> bool:
 def _source_codec(track: dict, suffix: str) -> str:
     label = _codec_key((track.get("format") or "").split("/", 1)[0])
     if suffix in _MP4_EXTS:
-        return label if label in ("aac", "alac") else "aac"
+        return label if label in ("aac", "alac", "ac3", "eac3") else "aac"
     if suffix in _DIRECT_EXTS:
         return "opus" if label == "opus" else _codec_key(suffix)
     return label or suffix

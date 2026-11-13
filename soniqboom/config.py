@@ -660,6 +660,36 @@ class Settings(BaseSettings):
     # kssrender (libkss) — MSX / Sega Master System KSS, built from source by
     # install.sh (soniqboom/native/kssrender); without it KSS plays through libgme.
     kssrender_path:     str = _local_conf.get("renderers", {}).get("kssrender_path", "")
+    # dsfrender (Highly Theoretical) — Dreamcast / Naomi DSF, built from source by
+    # install.sh (soniqboom/native/dsfrender); without it DSF plays through zxtune123.
+    dsfrender_path:     str = _local_conf.get("renderers", {}).get("dsfrender_path", "")
+    # milkyrender (MilkyPlay) — early DSIK modules ("DSM\x10" .dsm), built from
+    # source by install.sh (soniqboom/native/milkyrender); without it they
+    # don't play (a RIFF DSMF .dsm plays through libopenmpt either way).
+    milkyrender_path:   str = _local_conf.get("renderers", {}).get("milkyrender_path", "")
+    # mlrender (musicline_playback) — Musicline Editor tunes uade renders only
+    # as silence, built from source by install.sh (soniqboom/native/mlrender).
+    mlrender_path:      str = _local_conf.get("renderers", {}).get("mlrender_path", "")
+    # mdxrender (portable_mdx: MXDRV + X68Sound) — Sharp X68000 MDX songs and
+    # their PDX samples, built from source by install.sh (soniqboom/native/mdxrender).
+    mdxrender_path:     str = _local_conf.get("renderers", {}).get("mdxrender_path", "")
+    # gt2reloc (GoatTracker 2) — converts a GoatTracker song to a C64 .sid
+    # that sidplayfp plays; built from source by install.sh
+    # (soniqboom/native/goattracker).
+    gt2reloc_path:      str = _local_conf.get("renderers", {}).get("gt2reloc_path", "")
+    # sunvoxrender (the SunVox Library) — SunVox projects, built from source by
+    # install.sh (soniqboom/native/sunvoxrender).
+    sunvoxrender_path:  str = _local_conf.get("renderers", {}).get("sunvoxrender_path", "")
+    # furnace (Furnace's headless player) — FamiTracker modules, built from
+    # source by install.sh (soniqboom/native/furnace).
+    furnace_path:       str = _local_conf.get("renderers", {}).get("furnace_path", "")
+    # xmprender (libxmp) — the modules only libxmp plays (Archimedes Tracker,
+    # Coconizer, FlexTrax, Funktracker, Liquid Tracker, Megatracker, packed
+    # Amiga modules), built from source by install.sh (soniqboom/native/xmprender).
+    xmprender_path:     str = _local_conf.get("renderers", {}).get("xmprender_path", "")
+    # sawteethrender (NostalgicPlayer's Sawteeth player, ported to C) — Sawteeth
+    # songs, built from source by install.sh (soniqboom/native/sawteethrender).
+    sawteethrender_path: str = _local_conf.get("renderers", {}).get("sawteethrender_path", "")
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
@@ -747,7 +777,8 @@ class Settings(BaseSettings):
     # sending the ICY artist/title to MusicBrainz/Discogs to find a cover (on
     # by default; turn off for strict privacy).  ``discogs_token`` (optional
     # personal access token) enables the Discogs source, tried before
-    # MusicBrainz when present.
+    # MusicBrainz when present; the web page saves it encrypted, as
+    # ``discogs_token_enc`` (``_discogs_token_from_conf``).
     radio_art_lookup: bool = bool(_local_conf.get("radio_art_lookup", True))
     discogs_token: str = _local_conf.get("discogs_token", "")
 
@@ -786,6 +817,23 @@ def save_prefs(data: dict) -> None:
 
 
 settings = Settings()
+
+
+def _discogs_token_from_conf() -> None:
+    """The Discogs token the web page saved — encrypted, as
+    ``discogs_token_enc`` (``core.credentials``) — when neither the
+    environment nor a plain ``discogs_token`` in the conf sets one."""
+    if settings.discogs_token or not _local_conf.get("discogs_token_enc"):
+        return
+    try:
+        from soniqboom.core.credentials import decrypt
+        settings.discogs_token = decrypt(str(_local_conf["discogs_token_enc"])) or ""
+    except Exception:                                   # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("the saved Discogs token couldn't be read")
+
+
+_discogs_token_from_conf()
 
 
 def get_soundfonts_dir() -> Path:

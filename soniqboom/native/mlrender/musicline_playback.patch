@@ -1,0 +1,376 @@
+diff --git a/arpeggio.cpp b/arpeggio.cpp
+index c426658..d5b9e35 100755
+--- a/arpeggio.cpp
++++ b/arpeggio.cpp
+@@ -92,7 +92,7 @@ void CPlayInst::PlayArpg(MLModule* data) {
+                     m_Arp |= (1 << 1);
+ 
+                     if ((m_Arp & (1 << 2)) == 0) {
+-                        arpg = data->m_ArpgList[inst->Arp.Table]; // !!!
++                        arpg = inst->Arp.Table < 256 ? data->m_ArpgList[inst->Arp.Table] : NULL; // !!!
+                     } else {
+                         arpg = data->m_ArpgList[m_ArpTab];
+                     }
+@@ -104,10 +104,16 @@ void CPlayInst::PlayArpg(MLModule* data) {
+                         m_ArpPchSld = 0;
+                         m_ArpPchSldNote = 0;
+                         m_ArpSpdCnt = inst->Arp.Speed;
++                        int steps = 0;   // a table of jumps alone ends
+ 
+                         while (1) {
+                             unsigned char pos;
+ 
++                            if (++steps > 256) {
++                                m_Effects[inst_ARPEGGIO] = false;
++                                return;
++                            }
++
+                             pos = m_ArpPos;
+ 
+                             m_ArpPos += 1;
+diff --git a/module.cpp b/module.cpp
+index 1c075bc..549247c 100755
+--- a/module.cpp
++++ b/module.cpp
+@@ -1,4 +1,5 @@
+ #include "file.h"
++#include "ml_bounds.h"
+ #include "musicline.h"
+ #include "sfx.h"
+ #include <cstdint>
+@@ -14,6 +15,19 @@
+ // #include <windows.h>
+ // #include "stdafx.h"
+ 
++// Add (or drop) a channel's effect wave buffers to (from) ml_bounds.
++static void WaveBuffers(Channel* c, bool add) {
++    for (CPlayInst& in : c->m_Instrument) {
++        for (float* b : {in.m_TraWaveBuffer, in.m_PhaWaveBuffer, in.m_MixWaveBuffer,
++                         in.m_ResWaveBuffer, in.m_FilWaveBuffer}) {
++            if (add)
++                ml_bounds::add(b, 4096);
++            else
++                ml_bounds::drop(b);
++        }
++    }
++}
++
+ MLModule::MLModule() {
+     int i = 0;
+     for (i = 0; i < 256; i++) {
+@@ -35,7 +49,9 @@ MLModule::MLModule() {
+ 
+     for (int i = 0; i < MAXCHANS; ++i) {
+         m_ChannelBuf[i] = new Channel;
++        WaveBuffers(m_ChannelBuf[i], true);
+     }
++    ml_bounds::add(ZeroSample, 2);
+ 
+     for (i = 0; i < MAXCHANS; i++) {
+         m_pChannel[i] = new CMLineSfx(0);
+@@ -115,6 +131,7 @@ MLModule::~MLModule() {
+ 
+     // Free persistent channel state (only here, NOT in FreeMod — see FreeMod comment).
+     for (int i = 0; i < MAXCHANS; ++i) {
++        WaveBuffers(m_ChannelBuf[i], false);
+         delete m_ChannelBuf[i];
+         m_ChannelBuf[i] = nullptr;
+     }
+@@ -743,9 +760,10 @@ bool MLModule::LoadMod(u8* mod, u32 len) {
+                     }
+ 
+                     // float is the internal sample type
+-                    float* pSamp = new float[samplen];
++                    float* pSamp = new float[samplen]();   // (zeros past a cut-short end)
+                     if (pSamp != NULL) {
+                         smpl->fData = pSamp;
++                        ml_bounds::add(pSamp, samplen);
+                     } else {
+                         return false; // error
+                     }
+@@ -971,7 +989,8 @@ void MLModule::FreeMod(void) {
+ 
+         if (smpl) {
+             if (smpl->fData) {
+-                delete smpl->fData;
++                ml_bounds::drop(smpl->fData);
++                delete[] smpl->fData;
+             }
+             delete smpl;
+             m_SmplList[i] = 0;
+@@ -1443,7 +1462,7 @@ void MLModule::softMixResample(int ch, int mixLen, bool add) {
+     // ch_WsRepPointer on waveform wrap (.wsloop).
+     float* waveform = state.mixWsPtr;
+ 
+-    if (!waveform || sfx->m_nPeriod == 0) {
++    if (!waveform || sfx->m_nPeriod == 0 || !ml_bounds::ok(waveform, state.mixWsLen)) {
+         if (!add) {
+             memset(dest, 0, mixLen * sizeof(float));
+         }
+@@ -1482,7 +1501,8 @@ void MLModule::softMixResample(int ch, int mixLen, bool add) {
+     for (int i = 0; i < mixLen; i++) {
+         // Check end of waveform — ASM .wsloop (Mline116.asm:12062)
+         if (pos >= waveLen) {
+-            if (pi->m_WsRepLength > 1) {
++            if (pi->m_WsRepLength > 1
++                && ml_bounds::ok(pi->m_WsRepPointer, (uint32_t)pi->m_WsRepLength << 1)) {
+                 // ASM .wsloop: switch to repeat pointer/length and reset pos to 0.
+                 // This reads the CURRENT tick's WsRepPointer (which may be
+                 // effect-modified), matching the ASM behavior where .wsloop
+diff --git a/playinst.cpp b/playinst.cpp
+index 296e6e0..3da2333 100755
+--- a/playinst.cpp
++++ b/playinst.cpp
+@@ -303,6 +303,12 @@ void CPlayInst::InstPlay(MLModule* data, Inst* inst) {
+                         struct Smpl* smpl;
+ 
+                         smpl = data->m_SmplList[inst->Smpl.Number];
++                        static Smpl none;   // no such sample: loop ZeroSample
++                        if (!smpl) {
++                            none.fPointer = ZeroSample;
++                            none.Length = 1;
++                            smpl = &none;
++                        }
+ 
+                         m_LooWsPointer = smpl->fPointer;
+                         m_LooCounter = inst->Loo.Start;
+@@ -639,7 +645,7 @@ unsigned short CPlayInst::GetPeriod(MLModule* data, short note) {
+         note = (5 * 12 + 6) * 32;
+     }
+ 
+-    return (PalPitchTable[note]);
++    return (PalPitchWord(note));
+ }
+ 
+ void CPlayInst::SlideArpNote(MLModule* data) {
+@@ -875,15 +881,22 @@ void CPlayInst::ArpeggioPlay(MLModule* data) {
+             m_ArpSpdCnt = spd;
+ 
+             if ((m_Arp & (1 << 2)) == 0) {
+-                arpg = data->m_ArpgList[inst->Arp.Table];
++                arpg = inst->Arp.Table < 256 ? data->m_ArpgList[inst->Arp.Table] : NULL;
+             } else {
+                 arpg = data->m_ArpgList[m_ArpTab];
+             }
+ 
+             if (arpg) {
++                int steps = 0;   // jumps that never reach a step end the arpeggio
+                 while (1) {
+                     unsigned char pos;
+ 
++                    if (++steps > 256) {
++                        m_Arp = 0;
++                        m_Note = m_ArpNote;
++                        return;
++                    }
++
+                     pos = m_ArpPos;
+ 
+                     m_ArpPos += 1;
+@@ -908,7 +921,7 @@ void CPlayInst::ArpeggioPlay(MLModule* data) {
+                     if (nte == 62) {
+                         // jump
+                         if (aline->Smpl != pos) {
+-                            m_ArpPos = aline->Smpl;
++                            m_ArpPos = aline->Smpl & 0x7f;   // within the 128 steps
+                         }
+                         continue;
+                     }
+diff --git a/playinst_256_effects.cpp b/playinst_256_effects.cpp
+index b3385d8..f4a7625 100755
+--- a/playinst_256_effects.cpp
++++ b/playinst_256_effects.cpp
+@@ -2,6 +2,7 @@
+ #include "module.h"
+ #include "structs.h"
+ #include "tables.h"
++#include "ml_bounds.h"
+ 
+ void CPlayInst::PhasePlay(MLModule* data) {
+     struct Counter* count;
+@@ -95,6 +96,13 @@ void CPlayInst::PhasePlay(MLModule* data) {
+         m_WsRepPointer = dsamp;
+         if (!data->m_bPlay)
+             return;
++        // Within the wave buffers and the sizer tables: at most 4096 samples,
++        // at most 255 phase lookups.
++        if (len > ml_bounds::kZeros)
++            len = ml_bounds::kZeros;
++        if (len > 256 && cnt < len && cnt > 255)
++            cnt = 255;
++        ssamp = ml_bounds::src(ssamp, len > 256 ? len : len > 128 ? 256 : len > 64 ? 128 : len > 32 ? 64 : len > 16 ? 32 : 16);
+ 
+         if (m_Effects[inst_LOOP] || m_WaveOrSample) {
+             m_WsPointer = dsamp;
+@@ -376,7 +384,8 @@ void CPlayInst::MixPlay(MLModule* data) {
+             ssamp2 = ssamp1;
+ 
+             if (m_MixWaveNum != 0) {
+-                ssamp2 = data->m_SmplList[m_MixWaveNum]->fRepPointer + off;
++                Smpl* w = m_MixWaveNum < 256 ? data->m_SmplList[m_MixWaveNum] : NULL;
++                ssamp2 = w ? w->fRepPointer + off : NULL;
+             }
+         }
+ 
+@@ -389,6 +398,12 @@ void CPlayInst::MixPlay(MLModule* data) {
+         if (!data->m_bPlay)
+             return;
+ 
++        if (len > ml_bounds::kZeros)
++            len = ml_bounds::kZeros;
++        if (cnt > len)
++            cnt = len;
++        ssamp1 = ml_bounds::src(ssamp1, len);
++        ssamp2 = ml_bounds::src(ssamp2, len);
+         if ((data->m_PlayBits & (1 << 1)) == 0) {
+             // ASM: d4=1 (normal, shift right by 1 = average), d4=0 (boost, no shift)
+             float scale = (m_MixResFilBoost & (1 << 2)) ? 1.0f : 0.5f;
+@@ -492,17 +507,21 @@ void CPlayInst::TransformPlay(MLModule* data) {
+             tra += 1;
+         }
+ 
++        if (len > ml_bounds::kZeros)
++            len = ml_bounds::kZeros;
+         if (m_TraWsPtrs[tra + 0] != 0) {
+             if (tra != 0) {
+-                ssamp1 = data->m_SmplList[m_TraWsPtrs[tra + 0]]->fRepPointer + off;
++                Smpl* w = m_TraWsPtrs[tra + 0] < 256 ? data->m_SmplList[m_TraWsPtrs[tra + 0]] : NULL;
++                ssamp1 = ml_bounds::src(w ? w->fRepPointer + off : NULL, len);
+             } else {
+-                ssamp1 = m_WsRepPointer;
++                ssamp1 = ml_bounds::src(m_WsRepPointer, len);
+             }
+             if (!data->m_bPlay)
+                 return;
+ 
+-            if (m_TraWsPtrs[tra + 1] != 0) {
+-                ssamp2 = data->m_SmplList[m_TraWsPtrs[tra + 1]]->fRepPointer + off;
++            if (tra + 1 < 6 && m_TraWsPtrs[tra + 1] != 0) {   // (no 7th wave)
++                Smpl* w = m_TraWsPtrs[tra + 1] < 256 ? data->m_SmplList[m_TraWsPtrs[tra + 1]] : NULL;
++                ssamp2 = ml_bounds::src(w ? w->fRepPointer + off : NULL, len);
+ 
+                 dsamp = &m_TraWaveBuffer[0];
+ 
+diff --git a/playinst_filter.cpp b/playinst_filter.cpp
+index da0a1ae..e8dfda8 100755
+--- a/playinst_filter.cpp
++++ b/playinst_filter.cpp
+@@ -1,6 +1,7 @@
+ #include "enums.h"
+ #include "structs.h"
+ #include "tables.h"
++#include "ml_bounds.h"
+ 
+ // Float filter implementation matching MusiclineEditor.asm:5467-5596.
+ // Reads from ssamp (float -1..1), does all math in float.
+@@ -61,6 +62,13 @@ void CPlayInst::FilterPlay(MLModule* data) {
+         return;
+ 
+     int len = m_WsRepLength << 1; // words to samples (ASM: add d7,d7)
++    if (len == 0)
++        return;
++    if (len > (int)ml_bounds::kZeros)
++        len = ml_bounds::kZeros;
++    ssamp = ml_bounds::src(ssamp, len);
++    if (cnt > 511)
++        cnt = 511;   // within the 256-entry filter lists
+ 
+     if (m_FilType != 0) {
+         // === Resonance filter === (ASM lines 5519-5556)
+diff --git a/playinst_render.cpp b/playinst_render.cpp
+index 616602b..19b6467 100755
+--- a/playinst_render.cpp
++++ b/playinst_render.cpp
+@@ -384,7 +384,7 @@ void CPlayInst::PerCalc() {
+         nte = 5 * 12 * 32; // ASM uses 5*12*32=1920, not 6*12*32
+     }
+ 
+-    per = PalPitchTable[nte];
++    per = PalPitchWord(nte);
+     per += m_PTPchSldNote;
+     per += m_PTVibNote;
+     per += m_PTPchAdd;
+diff --git a/playinst_resonance.cpp b/playinst_resonance.cpp
+index 254d8f9..19a3f1a 100755
+--- a/playinst_resonance.cpp
++++ b/playinst_resonance.cpp
+@@ -1,6 +1,7 @@
+ #include "enums.h"
+ #include "structs.h"
+ #include "tables.h"
++#include "ml_bounds.h"
+ #include <cstdint>
+ 
+ // Resonance filter implementation matching Mline116.asm:13530-13575
+@@ -76,6 +77,13 @@ void CPlayInst::ResonancePlay(MLModule* data) {
+         if ((data->m_PlayBits & (1 << 1)) == 0) {
+             // ASM uses waveform length (WsRepLength * 2 for samples)
+             len = m_WsRepLength << 1;
++            if (len == 0)
++                return;
++            if (len > (int)ml_bounds::kZeros)
++                len = ml_bounds::kZeros;
++            ssamp = ml_bounds::src(ssamp, len);
++            if (cnt > 511)
++                cnt = 511;   // within the 256-entry resonance list
+ 
+             // Initialize oldsmp from last sample or cross-tick state
+             float oldsmp_f;
+diff --git a/sfx.cpp b/sfx.cpp
+index 7291c03..6869624 100755
+--- a/sfx.cpp
++++ b/sfx.cpp
+@@ -1,4 +1,5 @@
+ #include "sfx.h"
++#include "ml_bounds.h"
+ #include <cstring>
+ 
+ // #include <memory.h>
+@@ -202,6 +203,8 @@ bool CMLineSfx::UpdateNormalAndReverb(CMLineSfx* pSfx, int size) {
+ bool CMLineSfx::StoreMix(CMLineSfx* pSfx, int size) {
+     if (!m_bMix || m_nSize == 0 || !m_pData || !pSfx->m_pMixBuf)
+         return false;
++    if (!ml_bounds::dma_ok(m_pData, m_nSize, m_nLoopStart))
++        return false;
+ 
+     float* dest = pSfx->m_pMixBuf;
+     float vol = (float)pSfx->m_nVolumeInt / 64.0f;
+@@ -240,6 +243,8 @@ bool CMLineSfx::StoreMix(CMLineSfx* pSfx, int size) {
+ bool CMLineSfx::NormalMix(CMLineSfx* pSfx, int size) {
+     if (!m_bMix || m_nSize == 0 || !m_pData || !pSfx->m_pMixBuf)
+         return false;
++    if (!ml_bounds::dma_ok(m_pData, m_nSize, m_nLoopStart))
++        return false;
+ 
+     float* dest = pSfx->m_pMixBuf;
+     float vol = (float)pSfx->m_nVolumeInt / 64.0f;
+diff --git a/tables.cpp b/tables.cpp
+index 40c0073..9f0691c 100755
+--- a/tables.cpp
++++ b/tables.cpp
+@@ -50,7 +50,7 @@ char Square[] = {
+     64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+ };
+ 
+-unsigned short PalPitchTable[] = {
++unsigned short PalPitchTable[1952] = {
+     0x0E07, 0x0E00, 0x0DFA, 0x0DF3, 0x0DED, 0x0DE7, 0x0DE0, 0x0DDA, 0x0DD3, 0x0DCD, 0x0DC7, 0x0DC0, 0x0DBA, 0x0DB4,
+     0x0DAD, 0x0DA7, 0x0DA1, 0x0D9A, 0x0D94, 0x0D8E, 0x0D88, 0x0D81, 0x0D7B, 0x0D75, 0x0D6F, 0x0D68, 0x0D62, 0x0D5C,
+     0x0D56, 0x0D50, 0x0D4A, 0x0D43, 0x0D3D, 0x0D37, 0x0D31, 0x0D2B, 0x0D25, 0x0D1F, 0x0D19, 0x0D13, 0x0D0D, 0x0D07,
+diff --git a/tables.h b/tables.h
+index 2083a51..56a3881 100755
+--- a/tables.h
++++ b/tables.h
+@@ -26,6 +26,12 @@ extern char SawTooth[];
+ extern char Square[];
+ 
+ extern unsigned short PalPitchTable[];
++// PalPitchTable's word for pitch `note`: below the table (-32 to -1) the
++// replayer reads the end of the Square wave stored before it (0x4040); past
++// the table's last entry (1951), that entry.
++static inline unsigned short PalPitchWord(int note) {
++    return note < 0 ? 0x4040 : PalPitchTable[note > 1951 ? 1951 : note];
++}
+ extern struct Chnl ZeroChannel;
+ extern unsigned char ZeroBuffer[2048];
+ extern float ZeroSample[2];

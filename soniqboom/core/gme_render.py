@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import re
 import ctypes.util
 import logging
 import os
@@ -111,6 +112,32 @@ def is_available() -> bool:
     return _lib is not None
 
 
+def sap_header(data: bytes) -> dict:
+    """The text header of a SAP file (``SAP`` CR LF, then ``KEY value``
+    lines up to the binary part's FF FF): ``name`` / ``author`` / ``date``
+    (their quotes dropped, "<?>" none), ``times`` — each tune's TIME in
+    seconds, in tune order — and ``loops``: whether each TIME is marked
+    ``LOOP`` (the tune goes on after it; without, it ends there).  Pure."""
+    out: dict = {"times": [], "loops": []}
+    if data[:4] != b"SAP\r":
+        return out
+    head = data[:data.find(b"\xff\xff")] if b"\xff\xff" in data else data[:8192]
+    for line in head.decode("latin-1", "replace").splitlines():
+        key, _, val = line.strip().partition(" ")
+        val = val.strip()
+        if key in ("NAME", "AUTHOR", "DATE"):
+            v = val[1:-1] if len(val) >= 2 and val[0] == val[-1] == '"' else val
+            if v and v != "<?>":
+                out[key.lower()] = v
+        elif key == "TIME":
+            # (one entry per TIME line — an unreadable one 0, unknown — so
+            # the later tunes keep their own)
+            m = re.match(r"(?:(\d+):)?(\d+(?:\.\d+)?)", val)
+            out["times"].append(int(m.group(1) or 0) * 60 + float(m.group(2)) if m else 0.0)
+            out["loops"].append(bool(m) and "LOOP" in val[m.end():].upper())
+    return out
+
+
 def play_seconds(data: bytes, subsong: int = 0) -> float | None:
     """How long track ``subsong`` of GME ``data`` plays before its fade, from
     the lengths the file states (libgme ``gme_track_info``): its own length
@@ -118,6 +145,14 @@ def play_seconds(data: bytes, subsong: int = 0) -> float | None:
     (VGM, as libgme's own ``play_length``).  None when the file states none
     (most NSF / GBS / AY) — the caller keeps the default.  Never raises;
     blocking."""
+    if data[:4] == b"SAP\r":
+        # (libgme reads no SAP TIME: the header states each tune's length)
+        times = sap_header(data)["times"]
+        track = subsong if subsong and subsong > 0 else 0
+        if track < len(times):
+            secs = round(times[track], 2)
+            return secs if _MIN_STATED_S <= secs <= _MAX_STATED_S else None
+        return None
     if _lib is None or not _have_info or not data:
         return None
     emu = ctypes.c_void_p()
@@ -378,14 +413,36 @@ def tune_lengths(data: bytes, count: int) -> "list[float] | None":
 
 def render_plan(data: bytes, subsong: int, default_s: float) -> tuple[float, float | None]:
     """``(seconds to render, fade start or None)`` for track ``subsong``: the
-    stated length (``play_seconds``) plus the ``FADE_S`` fade after it, or
-    ``default_s`` with the default fade over its last seconds.  The scan
-    stores the same total (``metadata._extract_gme``), so a list shows what
-    plays.  Blocking."""
+    stated length (``play_seconds``) plus the fade after it (``tune_fade``:
+    ``FADE_S``, none for a SAP tune that ends there), or ``default_s`` with
+    the default fade over its last seconds.  The scan stores the same total
+    (``metadata._extract_gme``), so a list shows what plays.  Blocking."""
     secs = play_seconds(data, subsong)
     if secs is None:
         return float(default_s), None
-    return min(_MAX_STATED_S, secs + FADE_S), secs
+    return min(_MAX_STATED_S, secs + tune_fade(data, subsong)), secs
+
+
+def tune_fade(data: bytes, subsong: int) -> float:
+    """Seconds of fade-out played after track ``subsong``'s stated length:
+    ``FADE_S``, or 0 for a SAP tune whose TIME isn't marked ``LOOP`` (it ends
+    there — what follows is silence, then the tune again).  Pure."""
+    if data[:4] == b"SAP\r":
+        loops = sap_header(data)["loops"]
+        k = subsong if subsong and subsong > 0 else 0
+        if k < len(loops) and not loops[k]:
+            return 0.0
+    return float(FADE_S)
+
+
+def tune_fades(data: bytes, count: int) -> "list[float] | None":
+    """Each of the ``count`` tunes' fade (``tune_fade``) when they differ from
+    ``FADE_S`` for some tune — a SAP file whose tunes end — else None (the
+    fixed fade, known by the format).  Pure."""
+    if data[:4] != b"SAP\r":
+        return None
+    out = [tune_fade(data, k) for k in range(max(0, min(int(count or 0), _MAX_TUNES)))]
+    return out if any(f != FADE_S for f in out) else None
 
 
 def render_wav(data: bytes, subsong: int = 0, duration_s: float = 180,

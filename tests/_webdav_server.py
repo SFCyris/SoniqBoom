@@ -192,8 +192,16 @@ class DavServer:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        self._httpd = ThreadingHTTPServer((host, port), Handler)
-        self._httpd.daemon_threads = True
+        class Server(ThreadingHTTPServer):
+            # socketserver's default listen backlog is 5.  A remote scan runs
+            # up to 8 downloads at once (_REMOTE_INFLIGHT in
+            # scanner.start_remote_scan), each able to open a connection, and
+            # macOS answers a connect beyond the backlog with a reset (Linux
+            # drops the SYN and the client retries), so a download failed
+            # with ECONNRESET at random.  128 = macOS somaxconn.
+            request_queue_size = 128
+
+        self._httpd = Server((host, port), Handler)
         self.scheme = "http"
         if tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

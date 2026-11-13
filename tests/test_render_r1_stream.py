@@ -52,6 +52,8 @@ class _T:
 
     def __init__(self, tid, path, duration=0.0, fmt="David Whittaker", **kw):
         self.id, self.path, self.duration = tid, str(path), duration
+        # (a stored length from a render of the current uade revision)
+        self.duration_rev = kw.pop("duration_rev", stream._uade_render_rev())
         self.format, self.genre, self.title = fmt, ["Amiga", "Module"], "t"
         self.bitrate = kw.pop("bitrate", None)
         self.scan_root_hash = kw.pop("scan_root_hash", "")
@@ -138,7 +140,7 @@ async def _ref_render(src: Path, subsong: int = 0) -> tuple[float, bytes]:
 # ── r1-ren-1: a stored length describes the DEFAULT tune only ───────────────
 
 def test_expected_seconds_only_for_the_default_tune():
-    t = types.SimpleNamespace(duration=24.62)
+    t = types.SimpleNamespace(duration=24.62, duration_rev=stream._uade_render_rev())
     assert stream._uade_expected_seconds(t, 0) == 24.62
     assert stream._uade_expected_seconds(t, 5) == 0.0
     assert stream._uade_expected_seconds(types.SimpleNamespace(duration=0), 0) == 0.0
@@ -793,3 +795,29 @@ async def test_progressive_responses_ask_proxies_not_to_buffer(monkeypatch, tmp_
         r2 = await c.get("/api/stream/ax2", cookies={"sb_session": "x"},
                          headers={"Range": "bytes=1000-"})
         assert r2.headers["x-accel-buffering"] == "no"
+
+
+@needs_uade
+@pytest.mark.asyncio
+async def test_a_length_stored_by_an_older_uade_revision_never_cuts_the_first_play(
+        monkeypatch, tmp_path):
+    """A stored length from before the current uade render revision (here 5 s
+    for a ~2 minute tune, no ``duration_rev``) is not promised: the first play
+    streams the whole render and the real length replaces the stale one,
+    with the revision recorded."""
+    if not BD.exists():
+        pytest.skip("long test module missing")
+    _real, ref = await _ref_render(BD)
+    t = _T("stale1", BD, 5.0, fmt="Ben Daglish", duration_rev=None)
+    app, fs = _app(monkeypatch, tmp_path, {"stale1": t})
+    async with _client(app) as c:
+        r = await c.get("/api/stream/stale1", cookies={"sb_session": "x"})
+        assert r.status_code == 200
+        assert r.headers.get("x-render-length") == "unknown"
+        assert r.content[44:] == ref                     # every sample, not 5 s of it
+    for _ in range(200):                                 # (the length is written after the stream)
+        if fs.updates:
+            break
+        await asyncio.sleep(0.05)
+    assert fs.updates and fs.updates[-1] == ("stale1", {
+        "duration": round(len(ref) / 176400, 2), "duration_rev": stream._uade_render_rev()})

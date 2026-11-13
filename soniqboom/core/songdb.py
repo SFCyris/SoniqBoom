@@ -107,11 +107,13 @@ _NO_AUTHOR = frozenset({"unknown", "unknown artist", "anonymous"})
 # a silence end differs by the silence tail (+0.9 / +3.7 s), and errors,
 # timeouts and "no sound" are no length at all.  (A stored length is promised
 # to a listener up front — ``stream._uade_expected_seconds`` — so a wrong one
-# would cut the first play short.)
+# would cut the first play short; it is written with the current uade render
+# revision, ``duration_rev``, which that promise requires.)
 _GOOD_ENDS = frozenset({"p"})
-# Our uade123 render stops every tune at uade's default subsong timeout
-# (~512 s; ``_render_uade`` passes no ``-w``), so a longer database length is
-# never the length we play.
+# Our uade123 render stops a tune at uade's default subsong timeout (~512 s;
+# ``_render_uade`` passes ``-w`` only with a length it worked out itself, e.g.
+# a Delta Music 2 song's), so a longer database length is never the length we
+# play.
 _MAX_LENGTH_MS = 511_000
 
 _status: dict = {
@@ -681,7 +683,9 @@ def patch_for(t: dict, *, key: str, meta: tuple | None,
     if dur <= 0 and _uade_served(t):
         secs = default_tune_seconds(lengths, t)
         if secs:
+            from soniqboom.core.conversion_cache import _RENDER_REVS
             upd["duration"] = secs
+            upd["duration_rev"] = int(_RENDER_REVS.get("uade", 0))
 
     if new_ours != ours:
         upd["songdb_fields"] = sorted(new_ours) or None

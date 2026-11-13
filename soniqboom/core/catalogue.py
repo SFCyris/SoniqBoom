@@ -448,18 +448,30 @@ def revoke(path) -> None:
             del _prewarm_grants[o]
 
 
+# Sample folders a player loads from (``uade_formats.companion_dirs``): a
+# NON-music file in one of these, inside the tune's folder or one of the
+# folders above it (``_COMPANION_PARENT_LEVELS``, the root included), is a
+# companion too (Sonix ``Instruments/``, ZoundMonitor ``Samples/``).
+_COMPANION_FOLDERS = frozenset({"instruments", "samples"})
+
+
 def _allows(g: _Grant, root: str, rel: str, now: float) -> bool:
     if g.expiry <= now or g.root != root:
         return False
     if rel == g.rel:
         return True
-    return rel.rpartition("/")[0] in g.dirs
+    parent = rel.rpartition("/")[0]
+    if parent in g.dirs:
+        return True
+    up, _, folder = parent.rpartition("/")
+    return folder.lower() in _COMPANION_FOLDERS and up in g.dirs
 
 
 def allowed(root: str, rel: str) -> bool:
     """The catalogue file source's gate: may ``rel`` be fetched from the
     archive now?  Inside a play's / prewarm's window: the tune itself, and any
-    NON-music file (a companion) in its folder or the few above it."""
+    NON-music file (a companion) in its folder or the few above it, or in a
+    sample folder (``_COMPANION_FOLDERS``) in one of those."""
     root = _norm_root(root)
     rel = (rel or "").lstrip("/").split("::", 1)[0]      # a package member: its archive
     now = time.monotonic()

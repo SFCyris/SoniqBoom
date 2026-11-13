@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -2540,8 +2541,28 @@ _PROBE_RENDERER_SPECS = (
     ("openmpt123", "openmpt123_path"), ("uade123", "uade123_path"),
     ("adplay", "adplay_path"), ("psgplay", "psgplay_path"),
     ("sc68", "sc68_path"), ("zxtune123", "zxtune123_path"),
-    ("kssrender", "kssrender_path"),
+    ("kssrender", "kssrender_path"), ("dsfrender", "dsfrender_path"),
+    ("milkyrender", "milkyrender_path"), ("mlrender", "mlrender_path"),
+    ("mdxrender", "mdxrender_path"), ("gt2reloc", "gt2reloc_path"),
+    ("sunvoxrender", "sunvoxrender_path"), ("furnace", "furnace_path"),
+    ("xmprender", "xmprender_path"), ("sawteethrender", "sawteethrender_path"),
 )
+
+
+# Renderer keys whose program goes by another name on PATH: the names looked
+# up, in order (install.sh and the image install Furnace's headless build as
+# furnace-headless; a "furnace" on PATH is Furnace the tracker, which plays
+# FamiTracker modules too).
+_RENDERER_BINARIES = {"furnace": ("furnace-headless", "furnace")}
+
+
+def which_renderer(key: str) -> "str | None":
+    """The program of renderer ``key`` on PATH (``_RENDERER_BINARIES``)."""
+    for name in _RENDERER_BINARIES.get(key, (key,)):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 async def probe_renderer_runs(path: str) -> bool | None:
@@ -2565,12 +2586,36 @@ async def probe_renderer(path: str) -> "tuple[bool | None, str]":
     Core-Foundation process on macOS (see the ffmpeg probe below)."""
     if not path:
         return None, ""
+    # Furnace writes a config folder under HOME even for --version: it runs
+    # with a temp HOME of its own (removed after).
+    home = (tempfile.mkdtemp(prefix="sbfurnace") if Path(path).name.startswith("furnace")
+            else None)
+    try:
+        return await _probe_renderer_in(path, home)
+    finally:
+        if home:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+def _furnace_env(home: str) -> dict:
+    """The environment Furnace runs in with the temp home ``home``: HOME
+    there and no XDG_CONFIG_HOME (Furnace puts its config folder there
+    before HOME)."""
+    env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
+    env["HOME"] = home
+    return env
+
+
+async def _probe_renderer_in(path: str, home: "str | None") -> "tuple[bool | None, str]":
+    """``probe_renderer``'s run of ``path --version`` (with HOME ``home``
+    when given)."""
     try:
         proc = await forksafe.spawn(
             path, "--version",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **({"env": _furnace_env(home)} if home else {}),
         )
     except (FileNotFoundError, PermissionError, OSError):
         return False, ""
@@ -2607,6 +2652,14 @@ _VERSION_PATTERNS = {
     "sc68": r"version\s+v?(\d[\w.\-]*)",
     "zxtune123": r"zxtune123\s+(r\d\w*)",
     "kssrender": r"kssrender\s+v?(\d[\w.\-]*)",
+    "dsfrender": r"dsfrender\s+v?(\d[\w.\-]*)",
+    "milkyrender": r"milkyrender\s+v?(\d[\w.\-]*)",
+    "mlrender": r"mlrender\s+v?(\d[\w.\-]*)",
+    "mdxrender": r"mdxrender\s+v?(\d[\w.\-]*)",
+    "sunvoxrender": r"sunvoxrender\s+v?(\d[\w.\-]*)",
+    "furnace": r"Furnace version\s+v?(\d+(?:\.\d+)*)",
+    "xmprender": r"xmprender\s+v?(\d[\w.\-]*)",
+    "sawteethrender": r"sawteethrender\s+v?(\d[\w.\-]*)",
 }
 _VERSION_ANY = r"(?<![\w.])v?(\d+(?:\.\d+)+[\w.\-+]*|r\d+\w*)"
 
@@ -2616,8 +2669,12 @@ def renderer_version(name: str, text: str) -> "tuple[str, str]":
     version it states ("" when none is found) and the lines that state it
     (the line with the version and any other naming a library), for a
     tooltip.  Pure."""
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    lines = [ln for ln in lines if not ln.lower().startswith("warning")][:8]
+    # (Furnace logs its start — "[debug] …", "[trace] …", in ANSI colour —
+    # before it states its version: colours stripped, log lines skipped)
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not ln.lower().startswith("warning")
+             and not re.match(r"\[(trace|debug|info|warning|error)\]", ln, re.IGNORECASE)][:8]
     # Any version-like token only on the first two lines, and never in usage
     # or option text (a default value is no version).
     head = [ln for ln in lines[:2]
@@ -2670,7 +2727,7 @@ async def validate_renderers() -> "dict[str, dict]":
         configured = getattr(settings, attr, "") or ""
         if name == "ffmpeg" and configured == "ffmpeg":
             configured = ""                       # the literal default means "use PATH"
-        path = configured if (configured and Path(configured).is_file()) else shutil.which(name)
+        path = configured if (configured and Path(configured).is_file()) else which_renderer(name)
         resolved[name] = path or ""
     names = list(resolved)
     results = await asyncio.gather(
@@ -2701,7 +2758,7 @@ async def renderer_label(key: "str | None") -> "str | None":
     if not attr:
         return key
     configured = getattr(settings, attr, "") or ""
-    path = configured if (configured and Path(configured).is_file()) else shutil.which(key)
+    path = configured if (configured and Path(configured).is_file()) else which_renderer(key)
     if not path:
         return key
     runs, text = await probe_renderer(path)
@@ -2880,7 +2937,10 @@ async def check_renderers(_tok: str = Depends(_require_token)):
     # path (``_ensure_hvl2wav``/``_ensure_ym2wav`` in api/stream.py), which uses
     # ``shutil.which`` first; without it the slim Docker image (pre-built binary,
     # no compiler) wrongly reported these as missing while they play fine.
-    def _bundled(binary_name: str) -> dict:
+    def _bundled(binary_name: str, compilers: tuple, kind: str) -> dict:
+        """A bundled engine: on the PATH, built in the data folder, or built on
+        first use with one of ``compilers`` (a ``kind`` compiler: hvl2wav is C,
+        ym2wav C++)."""
         from soniqboom.config import get_data_dir
         import shutil as _sh
         pre = _sh.which(binary_name)
@@ -2889,9 +2949,9 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         built = get_data_dir() / "native" / binary_name
         if built.exists():
             return {"installed": True, "path": str(built), "version": "bundled"}
-        cxx = _sh.which("c++") or _sh.which("clang++") or _sh.which("g++")
-        return {"installed": bool(cxx), **({"version": "bundled"} if cxx else {}),
-                "path": f"(builds on first use{'' if cxx else ' — NO C++ compiler found'})"}
+        cc = next((c for c in compilers if _sh.which(c)), None)
+        return {"installed": bool(cc), **({"version": "bundled"} if cc else {}),
+                "path": f"(builds on first use{'' if cc else f' — NO {kind} compiler found'})"}
 
     _status = {
         "ffmpeg": ff_check,
@@ -2910,10 +2970,23 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         "sc68": _check(settings.sc68_path, "sc68"),
         "zxtune123": _check(settings.zxtune123_path, "zxtune123"),
         "kssrender": _check(settings.kssrender_path, "kssrender"),
+        "dsfrender": _check(settings.dsfrender_path, "dsfrender"),
+        "milkyrender": _check(settings.milkyrender_path, "milkyrender"),
+        "mlrender": _check(settings.mlrender_path, "mlrender"),
+        "mdxrender": _check(settings.mdxrender_path, "mdxrender"),
+        "gt2reloc": _check(settings.gt2reloc_path, "gt2reloc"),
+        "sunvoxrender": _check(settings.sunvoxrender_path, "sunvoxrender"),
+        # (``which_renderer``: furnace-headless, else a "furnace" on PATH)
+        "furnace": (_check(settings.furnace_path, "furnace")
+                    if settings.furnace_path else
+                    {"installed": bool(which_renderer("furnace")),
+                     "path": which_renderer("furnace") or ""}),
+        "xmprender": _check(settings.xmprender_path, "xmprender"),
+        "sawteethrender": _check(settings.sawteethrender_path, "sawteethrender"),
         # Clean keys — they double as the frontend's element-id suffixes
         # (renderer-icon-<key>); the "bundled" note lives in the label.
-        "ym2wav": _bundled("ym2wav"),
-        "hvl2wav": _bundled("hvl2wav"),
+        "ym2wav": _bundled("ym2wav", ("c++", "clang++", "g++"), "C++"),
+        "hvl2wav": _bundled("hvl2wav", ("cc", "clang", "gcc"), "C"),
     }
     # ``installed`` only means the file exists.  Actually EXEC the plain-binary
     # renderers so a present-but-broken one (dyld/loader failure — e.g. a
@@ -2925,7 +2998,9 @@ async def check_renderers(_tok: str = Depends(_require_token)):
     # latency is one slow probe, not their sum.
     _probe_keys = [
         k for k in ("sidplayfp", "fluidsynth", "openmpt123", "uade123",
-                    "adplay", "psgplay", "sc68", "zxtune123", "kssrender")
+                    "adplay", "psgplay", "sc68", "zxtune123", "kssrender",
+                    "dsfrender", "milkyrender", "mlrender", "mdxrender",
+                    "gt2reloc", "sunvoxrender", "furnace", "xmprender", "sawteethrender")
         if _status[k].get("installed") and _status[k].get("path")
     ]
     if _probe_keys:
@@ -3727,6 +3802,15 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "sc68_path": settings.sc68_path,
             "zxtune123_path": settings.zxtune123_path,
             "kssrender_path": settings.kssrender_path,
+            "dsfrender_path": settings.dsfrender_path,
+            "milkyrender_path": settings.milkyrender_path,
+            "mlrender_path": settings.mlrender_path,
+            "mdxrender_path": settings.mdxrender_path,
+            "gt2reloc_path": settings.gt2reloc_path,
+            "sunvoxrender_path": settings.sunvoxrender_path,
+            "furnace_path": settings.furnace_path,
+            "xmprender_path": settings.xmprender_path,
+            "sawteethrender_path": settings.sawteethrender_path,
             "uade123_path": settings.uade123_path,
             "gme_path": settings.gme_path,
             "adplay_path": settings.adplay_path,
@@ -3818,6 +3902,91 @@ async def get_settings(_tok: str = Depends(_require_token)):
     }
 
 
+# ── Discogs personal access token (radio now-playing covers) ────────────────
+# Saved encrypted in SoniqBoom.conf as ``discogs_token_enc``
+# (``core.credentials``; read at start by ``config._discogs_token_from_conf``);
+# ``core/nowplaying_art`` reads ``settings.discogs_token``.  The token itself
+# is never sent back.
+
+def _discogs_env_override() -> bool:
+    """Does SONIQBOOM_DISCOGS_TOKEN (the environment, or ~/.soniqboom.env)
+    set the token — which then wins over SoniqBoom.conf?"""
+    key = "SONIQBOOM_DISCOGS_TOKEN"
+    if any(k.upper() == key for k in os.environ):
+        return True
+    try:
+        for line in (Path.home() / ".soniqboom.env").read_text(encoding="utf-8").splitlines():
+            name = line.strip().removeprefix("export ").split("=", 1)[0].strip()
+            if name.upper() == key and "=" in line:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _discogs_state() -> dict:
+    from soniqboom.core import netpolicy
+    token = (settings.discogs_token or "").strip()
+    return {"set": bool(token), "ends_with": token[-4:] if len(token) >= 8 else "",
+            "from_env": _discogs_env_override(),
+            "lookup_off": not settings.radio_art_lookup, "offline": netpolicy.offline()}
+
+
+@router.get("/discogs")
+async def get_discogs(_tok: str = Depends(_require_token)):
+    """Whether a Discogs token is set (its last four characters), whether the
+    environment sets it, and whether radio cover lookups run at all."""
+    return _discogs_state()
+
+
+@router.put("/discogs")
+async def put_discogs(body: dict, _tok: str = Depends(_require_token)):
+    """Save (``{"token": "…"}``) or remove (``{"token": ""}``) the Discogs
+    personal access token, encrypted in SoniqBoom.conf; it applies at once,
+    and the songs no cover was found for are looked up again.  A token set
+    by the environment can't be changed here (409)."""
+    from soniqboom.config import ConfUnreadable, update_local_conf
+    from soniqboom.core import nowplaying_art
+    from soniqboom.core.credentials import encrypt
+    if not isinstance(body, dict) or not isinstance(body.get("token"), str):
+        raise HTTPException(400, 'Send {"token": "…"} — an empty one removes it.')
+    token = body["token"].strip()
+    if _discogs_env_override():
+        raise HTTPException(409, "SONIQBOOM_DISCOGS_TOKEN sets the Discogs token — change it there.")
+    if token and not nowplaying_art.discogs_token_ok(token):
+        raise HTTPException(400, "That isn't a Discogs personal access token "
+                                 "(8–128 letters and digits).")
+    enc = encrypt(token) if token else ""
+
+    def _apply(conf: dict) -> dict:
+        conf.pop("discogs_token", None)
+        if enc:
+            conf["discogs_token_enc"] = enc
+        else:
+            conf.pop("discogs_token_enc", None)
+        settings.discogs_token = token          # (under the conf lock: in step with the file)
+        return conf
+    try:
+        await asyncio.to_thread(update_local_conf, _apply)
+    except ConfUnreadable as exc:
+        raise HTTPException(409, f"SoniqBoom.conf couldn't be read, so nothing was saved: {exc}")
+    if token:
+        await asyncio.to_thread(nowplaying_art.forget_misses)
+    return _discogs_state()
+
+
+@router.post("/discogs/test")
+async def test_discogs(body: dict | None = None, _tok: str = Depends(_require_token)):
+    """Check a Discogs token with Discogs: the one in ``{"token": …}`` (typed,
+    not saved yet), else the saved one."""
+    from soniqboom.core import nowplaying_art
+    typed = (body or {}).get("token") if isinstance(body, dict) else None
+    token = (typed.strip() if isinstance(typed, str) else "") or (settings.discogs_token or "").strip()
+    if not token:
+        return {"ok": False, "error": "No Discogs token is set."}
+    return await nowplaying_art.discogs_identity(token)
+
+
 @router.put("/settings")
 async def update_settings(body: dict, _tok: str = Depends(_require_token)):
     """Update application settings (persisted to SoniqBoom.conf)."""
@@ -3834,7 +4003,10 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                    "sid_model", "sid_model_force", "sid_filter",
                    "sid_filter_curve", "sid_digiboost",
                    "psgplay_path", "sc68_path", "zxtune123_path",
-                   "uade123_path", "gme_path", "adplay_path", "kssrender_path"):
+                   "uade123_path", "gme_path", "adplay_path", "kssrender_path",
+                   "dsfrender_path", "milkyrender_path", "mlrender_path",
+                   "mdxrender_path", "gt2reloc_path", "sunvoxrender_path",
+                   "furnace_path", "xmprender_path", "sawteethrender_path"):
             if k in body["renderers"]:
                 val = body["renderers"][k]
                 if k in ("hvsc_autodetect", "sid_model_force", "sid_filter",

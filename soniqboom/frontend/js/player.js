@@ -6,7 +6,7 @@
  * Exports: Player singleton
  */
 // version bump needed in index.html for player.js (queue/race/EQ chain fixes)
-import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, Toast, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
+import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, XMP_FORMAT_NAMES, Toast, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
 // Experimental, flag-gated in-browser SID playback (see sid-wasm-player.js).
 // Remove the feature by deleting this import + the one branch it guards below.
 import { sidWasmPlaybackEnabled, isC64SidTrack, renderSidForPlayback,
@@ -444,8 +444,9 @@ export const Player = (() => {
   const SERVER_RENDERED_FORMATS = new Set(
     ['SID', 'PSID', 'MIDI', 'MID',
      'SNDH', 'YM', 'SC68',
-     'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (DREAMCAST)', 'NCSF',
-     ...TRACKER_FORMAT_NAMES, ...CHIP_FORMAT_NAMES,
+     'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (DREAMCAST)', 'NCSF', 'S98', 'V2M', 'MDX',
+     'SUNVOX', 'MGSDRV', 'GOATTRACKER', 'FAMITRACKER', 'DEFLEMASK', 'C64 SIDPLAYER', 'SAWTEETH',
+     ...TRACKER_FORMAT_NAMES, ...CHIP_FORMAT_NAMES, ...XMP_FORMAT_NAMES,
     ].map(s => s.toUpperCase())
   );
   // The ~175 exotic-Amiga uade formats carry dynamic names ("TFMX Pro", …);
@@ -583,8 +584,10 @@ export const Player = (() => {
   // audio, never a placeholder).
   const _AUDIO_EXTS = new Set(['.mp3', '.flac', '.m4a', '.mp4', '.m4b', '.aac', '.alac', '.ogg',
     '.oga', '.opus', '.wav', '.wave', '.aif', '.aiff', '.aifc', '.wma', '.ape', '.wv', '.mpc',
-    '.dff', '.wsd', '.caf', '.mka', '.webm']);
-  const _GME_FADED_EXTS = new Set(['.spc', '.vgm', '.vgz', '.nsfe', '.ay']);
+    '.dff', '.wsd', '.caf', '.mka', '.webm',
+    '.ac3', '.eac3', '.ec3', '.dts', '.dtshd', '.thd', '.truehd', '.mlp',
+    '.mp1', '.mp2', '.m2a', '.8svx', '.16sv']);
+  const _GME_FADED_EXTS = new Set(['.spc', '.vgm', '.vgz', '.nsfe', '.ay', '.sap']);
   function _suffixOf(t) {
     const tail = String(t.path || '').split('::').pop();
     const dot = tail.lastIndexOf('.');
@@ -594,7 +597,10 @@ export const Player = (() => {
   // length the file states — ``stated`` — a libgme rip's fixed 8 s) — a tune
   // is judged before it.  (A played libgme file's ``duration`` is its render's
   // length: no fade in it when the tune ended by itself.)
-  function _fadeOf(t, stated = false) {
+  function _fadeOf(t, stated = false, k = -1) {
+    // (a SAP file whose tunes end at their TIME: each tune's own — ``tune_fades``)
+    const tf = Array.isArray(t.tune_fades) ? Number(t.tune_fades[k]) : NaN;
+    if (stated && k >= 0 && Number.isFinite(tf)) return Math.max(0, tf);
     const f = Number(t.fade_s);
     if (t.fade_s !== null && t.fade_s !== undefined && Number.isFinite(f)) return Math.max(0, f);
     return stated && _GME_FADED_EXTS.has(_suffixOf(t)) ? 8 : 0;
@@ -620,7 +626,7 @@ export const Player = (() => {
       }
       const v = Number(lens[k]);
       if (v > 0 && v <= 3600) {
-        const own = v - (kind === 'file' ? _fadeOf(t, true) : 0);
+        const own = v - (kind === 'file' ? _fadeOf(t, true, k) : 0);
         return own > 0 ? own : 0;
       }
     }
@@ -1590,7 +1596,7 @@ export const Player = (() => {
   const QUALITY_KEY = 'sb_stream_quality';
   const QUALITY_KBPS = new Set([320, 192, 128, 96]);
   // The ordinary audio formats (core/metadata.py labels: "Ogg Vorbis", "DSD64" …).
-  const _CAPPABLE_FORMAT_RE = /^(MP3|FLAC|WAV|WAVE|AIFF?|ALAC|AAC|M4A|MP4|OGG|OGG VORBIS|VORBIS|OPUS|DSD\d*|DSF|DFF|APE|MONKEY'?S AUDIO|WV|WAVPACK|WMA|MPC|MUSEPACK|TTA|TAK)$/;
+  const _CAPPABLE_FORMAT_RE = /^(MP3|FLAC|WAV|WAVE|AIFF?|ALAC|AAC|M4A|MP4|OGG|OGG VORBIS|VORBIS|OPUS|DSD\d*|DSF|DFF|APE|MONKEY'?S AUDIO|WV|WAVPACK|WMA|WMA PRO|WMA LOSSLESS|MP1|MP2|MPC|MUSEPACK|TTA|TAK|AC-3|E-AC-3|DTS|DTS-HD|DTS-HD MA|DTS-HD HRA|TRUEHD|MLP)$/;
   let _qualityOff = false;
   // The cap the current track's stream was asked with (null: the original) —
   // a setting changed meanwhile applies from the next track, also to seeks.

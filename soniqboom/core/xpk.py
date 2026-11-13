@@ -1,9 +1,12 @@
-"""XPK unpacking for Amiga modules packed with the XPK-SQSH cruncher.
+"""Unpacking for Amiga modules packed with the XPK-SQSH cruncher or with
+PowerPacker ("PP20").
 
 uade refuses an XPK-packed module ("The file is SQSH packed. Please depack
-first"), so a packed module is unpacked before it is read or rendered
-(``unpack``).  SQSH is the method modules were usually packed with; any other
-XPK method raises :class:`XpkUnsupported`.
+first") and fails a PowerPacker-packed one ("module check failed"), so a
+packed module is unpacked before it is read or rendered (``unpack``).  SQSH is
+the XPK method modules were usually packed with; any other XPK method raises
+:class:`XpkUnsupported`.  The PowerPacker decoder (``_unpp20``) follows the
+PowerPacker 2.0 data format as Stuart Caie's public-domain decruncher reads it.
 
 The SQSH decoder is a port of libxmp's ``src/depackers/unsqsh.c``:
 
@@ -66,15 +69,19 @@ class XpkUnsupported(XpkError):
 
 
 def xpk_method(data: bytes) -> str | None:
-    """The XPK method of ``data`` ("SQSH", "NUKE", …), or None when it is no
-    XPK file (it doesn't start with "XPKF")."""
+    """How ``data`` is packed: its XPK method ("SQSH", "NUKE", …), "PP20"
+    for a PowerPacker file, or None when it is neither (it starts with
+    neither "XPKF" nor "PP20")."""
+    if len(data) >= 4 and data[:4] == b"PP20":
+        return "PP20"
     if len(data) < 12 or data[:4] != b"XPKF":
         return None
     return data[8:12].decode("latin-1").strip() or "?"
 
 
 def unpack(data: bytes) -> bytes:
-    """``data`` unpacked when it is XPK-packed, else ``data`` unchanged.
+    """``data`` unpacked when it is XPK-SQSH or PowerPacker packed, else
+    ``data`` unchanged.
 
     Raises :class:`XpkUnsupported` for an XPK method other than SQSH and
     :class:`XpkError` for damaged or truncated packed data (a block checksum
@@ -82,6 +89,8 @@ def unpack(data: bytes) -> bytes:
     method = xpk_method(data)
     if method is None:
         return data
+    if method == "PP20":
+        return _unpp20(data)
     if method != "SQSH":
         raise XpkUnsupported(method)
     try:
@@ -91,13 +100,20 @@ def unpack(data: bytes) -> bytes:
 
 
 def unpack_file(path: Path) -> bytes:
-    """``path``'s content, unpacked when it is XPK-packed (``unpack``) — only
-    the bytes the XPK header accounts for are read, after its size bounds are
-    checked.  OSError when the file can't be read."""
+    """``path``'s content, unpacked when it is packed (``unpack``) — only
+    the bytes an XPK header accounts for are read, after its size bounds are
+    checked; a PowerPacker file of at most ``_PP20_MAX_IN`` bytes is read whole.
+    OSError when the file can't be read."""
     with open(path, "rb") as fh:
         head = fh.read(16)
-        if xpk_method(head) is None:
+        method = xpk_method(head)
+        if method is None:
             return head + fh.read()
+        if method == "PP20":
+            data = head + fh.read(_PP20_MAX_IN + 1 - len(head))
+            if len(data) > _PP20_MAX_IN:
+                raise XpkUnsupported("PP20 over 4 MB")
+            return unpack(data)
         if len(head) < 16:
             raise XpkError("truncated XPK header")
         srclen = _be32(head, 4)
@@ -135,12 +151,208 @@ def write_unpacked(path: Path, data: bytes, companion_names=()) -> Path:
     return out
 
 
+_WHOLE_READ_MAX = 4_000_000            # a Sonix score / PumaTracker module read whole
+
+
+def _find_dir(start: Path, name: str, up: int) -> "Path | None":
+    """The folder called ``name`` (ignoring case) in ``start`` or one of the
+    ``up`` folders above it, nearest first."""
+    d = start
+    for _ in range(up + 1):
+        try:
+            for entry in os.scandir(d):
+                if entry.name.lower() == name.lower() and entry.is_dir():
+                    return Path(entry.path)
+        except OSError:
+            pass
+        if d.parent == d:
+            break
+        d = d.parent
+    return None
+
+
+def stage_for_uade(path: Path, binary: "str | None" = None) -> "Path | None":
+    """A copy of ``path`` in a new temp folder that uade plays, or None when
+    ``path`` plays as it is.  The copy is unpacked when the module is packed
+    (``unpack_file``), repaired when it is a known damaged rip
+    (``rip_repairs.repaired``; its companion halves then too), given the
+    instruments of the shared file beside it when it is a Hippel COSO song
+    without its own (``rip_repairs.coso_bank_attached``), padded when it
+    is a PumaTracker module cut short
+    (``uade_formats.puma_padded``), named as ``uade_formats.play_name`` says
+    (``binary`` is uade123, for its choice), and has links beside it to the
+    module's companion halves, to a companion the module names inside itself
+    (a YM-ST replay routine) that is spelled otherwise beside it, and to the
+    sample folder its player loads from (``uade_formats.companion_dirs``: a
+    Sonix score's ``Instruments``, ZoundMonitor's ``Samples`` up to two
+    folders above).  The caller removes the folder; ``path``'s own folder is
+    never written to.  Raises what ``unpack_file`` raises."""
+    from soniqboom.core import rip_repairs, uade_formats as uf
+    path = Path(path)
+    here = path.absolute().parent
+    with open(path, "rb") as fh:
+        head = fh.read(uf._EMBEDDED_SCAN)
+        packed = xpk_method(head) is not None
+        whole = None
+        if not packed and ((head[:4] == b"FORM" and head[8:12] == b"SMUS")
+                           or path.name.lower().endswith(".puma")
+                           or path.name.lower().startswith("puma.")):
+            whole = head + fh.read(_WHOLE_READ_MAX)
+    data = unpack_file(path) if packed else None
+    if data is None:
+        data = rip_repairs.repaired(path)       # a known damaged rip, repaired
+    if uf.coso_bank_for(path.name):             # a COSO song with a shared instrument file
+        data = rip_repairs.coso_bank_attached(path, data) or data
+    if data is None and whole is not None:
+        data = uf.puma_padded(path.name, whole)
+    body = data if data is not None else (whole if whole is not None else head)
+    name = uf.play_name(path, binary) if data is None else uf.play_name(path.name)
+    aliases: dict[str, str] = {}
+    named = uf.embedded_companions(body)
+    if named:
+        try:
+            beside = os.listdir(here)
+        except OSError:
+            beside = []
+        for want in named:
+            if want in beside:
+                continue
+            same = [b for b in beside if uf.companion_key(b) == uf.companion_key(want)]
+            if same:
+                aliases[want] = same[0]
+    dirs: dict[str, Path] = {}
+    for want, up, _stems in uf.companion_dirs(path.name, body):
+        found = _find_dir(here, want, up)
+        if found is not None:
+            dirs[want] = found
+    far = any(d.parent != here for d in dirs.values())
+    if data is None and name == path.name and not aliases and not far:
+        return None
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sb-xpk-"))
+    out = tmp_dir / name
+    try:
+        if data is not None:
+            out.write_bytes(data)
+        else:
+            out.symlink_to(path.absolute())
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    links = {n.lower(): n for n in uf.companion_sibling_names(path.name)}
+    # (a TFMX ``X.tfx`` plays as ``mdat.X``: its ``X.sam`` beside it as ``smpl.X``)
+    sam = uf.tfx_sample_name(path.name)
+    sam_as = f"smpl.{name[5:]}" if sam and name.lower().startswith("mdat.") else None
+    try:
+        entries = list(os.scandir(here))
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.name.lower() in links and entry.name != out.name:
+            as_name = sam_as if sam_as and entry.name.lower() == sam.lower() else entry.name
+            try:
+                fixed = rip_repairs.repaired(entry.path)
+                if fixed is not None:
+                    (tmp_dir / as_name).write_bytes(fixed)
+                else:
+                    (tmp_dir / as_name).symlink_to(entry.path)
+            except OSError:
+                pass                     # e.g. two names differing in case only
+    for want, have in aliases.items():
+        try:
+            (tmp_dir / want).symlink_to(here / have)
+        except OSError:
+            pass
+    for want, found in dirs.items():
+        try:
+            (tmp_dir / want).symlink_to(found)
+        except OSError:
+            pass
+    return out
+
+
 def _be16(b, i: int) -> int:
     return (b[i] << 8) | b[i + 1]
 
 
 def _be32(b, i: int) -> int:
     return (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]
+
+
+_PP20_MAX_OUT = 0x800000           # 8 MB: far above any module (the field allows 16)
+_PP20_MAX_IN = 0x400000            # 4 MB packed
+
+
+def _unpp20(data: bytes) -> bytes:
+    """Unpack a PowerPacker 2.0 file: "PP20", four offset bit-widths, the
+    packed stream, then the 24-bit unpacked length and the number of bits to
+    skip.  The stream is read backwards from its end, its bits low first,
+    and the output is written backwards from its end."""
+    if len(data) < 12:
+        raise XpkError("truncated PowerPacker data")
+    widths = data[4:8]
+    if any(w > 16 for w in widths):
+        raise XpkError("bad PowerPacker header")
+    src = data[8:-4]
+    destlen = (data[-4] << 16) | (data[-3] << 8) | data[-2]
+    if destlen == 0 or destlen > _PP20_MAX_OUT:
+        raise XpkError("bad PowerPacker length")
+    out = bytearray(destlen)
+    o = destlen
+    pos = len(src)
+    buf = 0
+    left = 0
+
+    def bits(n: int) -> int:
+        nonlocal buf, left, pos
+        while left < n:
+            if pos <= 0:
+                raise XpkError("truncated PowerPacker data")
+            pos -= 1
+            buf |= src[pos] << left
+            left += 8
+        v = 0
+        for _ in range(n):
+            v = (v << 1) | (buf & 1)
+            buf >>= 1
+        left -= n
+        return v
+
+    bits(data[-1])
+    while o > 0:
+        if bits(1) == 0:                        # a run of literal bytes
+            n = 1
+            while True:
+                x = bits(2)
+                n += x
+                if x != 3:
+                    break
+            if n > o:
+                raise XpkError("damaged PowerPacker data")
+            for _ in range(n):
+                o -= 1
+                out[o] = bits(8)
+            if o == 0:
+                break
+        x = bits(2)                              # a copy of earlier output
+        width = widths[x]
+        n = x + 2
+        if x == 3:
+            if bits(1) == 0:
+                width = 7
+            offset = bits(width)
+            while True:
+                y = bits(3)
+                n += y
+                if y != 7:
+                    break
+        else:
+            offset = bits(width)
+        if n > o or o + offset >= destlen:
+            raise XpkError("damaged PowerPacker data")
+        for _ in range(n):
+            o -= 1
+            out[o] = out[o + 1 + offset]
+    return bytes(out)
 
 
 def _unsqsh_file(data: bytes) -> bytes:

@@ -92,8 +92,10 @@ async function _loadChapters(track) {
 // ── Signal-path viz (#4) ──────────────────────────────────────────────────
 let _signalChain = null;     // handle from mountSignalChain
 let _sigTrack = null;        // the track the chain is currently rendering
+let _sigRenderer = null;     // /extended's renderer key for _sigTrack (null: not known yet)
 
 function _mountSignalChainFor(track) {
+  if (!_sigTrack || !track || _sigTrack.id !== track.id) _sigRenderer = null;
   _sigTrack = track;
   const section = document.getElementById('ti-section-signal');
   const host = document.getElementById('ti-signal-chain');
@@ -110,12 +112,29 @@ function _mountSignalChainFor(track) {
   if (!_signalChain) {
     _signalChain = mountSignalChain(host, () => ({
       format: _sigTrack?.format || '',
+      renderer: _sigRenderer || '',
+      ext: _sigSuffix(_sigTrack),
       playing: !!(Player && Player.playing),
     }));
   } else {
     _signalChain.rebuild();
   }
   host.querySelector('ol')?.setAttribute('role', 'list');   // (shown as a list in Retro, unbulleted)
+}
+
+// The file's suffix (an archive member's, an online collection tune's).
+function _sigSuffix(track) {
+  const tail = String(track?.path || '').split('::').pop().split('/').pop();
+  const dot = tail.lastIndexOf('.');
+  return dot > 0 ? tail.slice(dot) : '';
+}
+
+// The engine /extended names for the open track: the signal path draws it
+// (the chain's own guess from the format name only before it is known).
+function _setSigRenderer(trackId, renderer) {
+  if (!_sigTrack || _sigTrack.id !== trackId || (renderer || null) === _sigRenderer) return;
+  _sigRenderer = renderer || null;
+  _signalChain?.rebuild();
 }
 
 // Retro: the signal path sits in the left column under the VFD strip (the
@@ -1872,6 +1891,7 @@ async function _loadExtendedInfo(track) {
         _renderStil(data.stil);
         _renderSidChip(data.sid_model);
         _vfdSpec('renderer', data.renderer);
+        _setSigRenderer(track.id, data.renderer);
 
         // Instruments
         const instField = document.getElementById('ti-field-instruments');
@@ -1908,6 +1928,7 @@ async function _loadChipTunes(track) {
         const data = await res.json();
         if (_extendedFor !== track.id) return;
         _vfdSpec('renderer', data.renderer);
+        _setSigRenderer(track.id, data.renderer);
         const count = (data.subsongs > 1) ? data.subsongs
             : (track.subsongs > 1 ? track.subsongs : 0);
         const defaultTrack = data.default_track ?? subsongStartOf(track);
@@ -1934,6 +1955,9 @@ const _PATTERN_FORMATS = new Set([
   'DigiBooster Pro', 'UltraTracker', 'Farandole', 'ASYLUM/DMP',
   'General DigiMusic', 'Imago Orpheus', 'Oktalyzer', 'SoundFX',
   'Grave Composer', 'DSIK', 'Face The Music',
+  'Astroidea XMF', 'Digital Symphony', 'Digital Tracker', 'X-Tracker', 'DSMI Compact', 'Software Visions',
+  'Digitrakker', 'Unreal Music', 'Epic MegaGames MASI', 'Galaxy Music System', 'MO3', 'OggMod',
+  'OpenMPT MPTM', 'Real Tracker', 'STMIK', 'Poly Tracker', 'ProTracker IFF', 'ChipTracker',
 ]);
 
 const _patSection   = document.getElementById('ti-section-patterns');

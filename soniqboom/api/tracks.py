@@ -1922,6 +1922,11 @@ _PATTERN_FORMAT_NAMES = frozenset({
     "DigiBooster Pro", "UltraTracker", "Farandole", "ASYLUM/DMP",
     "General DigiMusic", "Imago Orpheus", "Oktalyzer", "SoundFX",
     "Grave Composer", "DSIK", "Face The Music",
+    # (libopenmpt, also under other names)
+    "Astroidea XMF", "Digital Symphony", "Digital Tracker", "X-Tracker", "DSMI Compact", "Software Visions",
+    "Digitrakker", "Unreal Music", "Epic MegaGames MASI", "Galaxy Music System", "MO3",
+    "OggMod", "OpenMPT MPTM", "Real Tracker", "STMIK", "Poly Tracker", "ProTracker IFF",
+    "ChipTracker",
 })
 
 
@@ -2467,14 +2472,78 @@ async def upload_sid_audio(
     return Response(status_code=204)
 
 
-# Tracker-only formats — gating the lazy backfill so we don't try to
-# open a FLAC with libopenmpt.  Matches stream.py's _TRACKER_EXTS but
-# imported lazily to avoid a cycle.
-_VU_BACKFILL_EXTS = {
-    ".mod", ".s3m", ".xm", ".it", ".mptm", ".med", ".oct",
-    ".669", ".dbm", ".dsm", ".far", ".gdm", ".imf", ".mtm",
-    ".okt", ".sfx", ".stm", ".ult", ".wow",
-} | {".ftm"}
+def _vu_backfill_route(track) -> bool:
+    """Does ``track`` play through libopenmpt, or as a ProTracker module
+    ``core.prowizard`` converts a packed module to — the formats the lazy VU
+    backfill reads (never a FLAC)?  The stream's own routing decides
+    (``stream._render_ident`` against its tracker set: every libopenmpt
+    format this host reads, by the record — a DefleMask ``.dmf``, a
+    FamiTracker ``.ftm`` or a uade prefix-named ``mod.x`` is not one)."""
+    from soniqboom.api import stream as _stream
+    from soniqboom.core.metadata import PW_EXTS
+    try:
+        ext, uade_named = _stream._render_ident(getattr(track, "path", "") or "", track)
+    except Exception:                                   # noqa: BLE001
+        return False
+    return not uade_named and (ext in _stream._TRACKER_EXTS or ext in PW_EXTS
+                               or ext == _stream._SAWTEETH_ROUTE)
+
+
+def _is_sawteeth(track) -> bool:
+    from soniqboom.api import stream as _stream
+    try:
+        return _stream._render_ident(getattr(track, "path", "") or "", track)[0] \
+            == _stream._SAWTEETH_ROUTE
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+_SAWTEETH_VU_TIMEOUT_S = 60
+
+
+def _sawteeth_vumr(src_bytes: bytes) -> "bytes | None":
+    """The per-channel levels of the Sawteeth song ``src_bytes`` as
+    sawteethrender writes them (``-i -v``, with the options its render uses —
+    the same song length, so the meter follows the render), validated; None
+    without sawteethrender or when it fails.  Blocking (a short subprocess
+    in a temp folder of the render temp dir)."""
+    import shutil
+    import tempfile
+    from soniqboom.core import forksafe, metadata as md, openmpt_vu, render_tmp
+    binary = md._find_atari_binary("sawteethrender_path", "sawteethrender")
+    if not binary:
+        return None
+    work = tempfile.mkdtemp(prefix="sbswvu", dir=str(render_tmp.tmp_dir()))
+    try:
+        song, vu = Path(work) / "s.st", Path(work) / "s.vu"
+        song.write_bytes(src_bytes)
+        r = forksafe.run([binary, "-i", "-v", str(vu), *md.sawteeth_render_args(), str(song)],
+                         capture_output=True, timeout=_SAWTEETH_VU_TIMEOUT_S)
+        if r.returncode != 0 or not vu.is_file():
+            return None
+        raw = vu.read_bytes()
+        openmpt_vu.parse_and_validate_vumr(raw)
+        return raw
+    except Exception:                                   # noqa: BLE001
+        return None
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _vu_backfill_dest(track_id: str, subsong: int) -> Path:
+    """Where a backfilled sidecar goes: next to this subsong's cached tracker
+    WAV (so eviction is uniform), else a sidecar-only slot keyed per subsong
+    (``__novubackfill`` keeps it from colliding with a real render slot) in
+    the same cache dir."""
+    from soniqboom.core.conversion_cache import _cache_key, _cache_path, _meta, _state_lock
+    want = _cache_key(track_id, "tracker", subsong)
+    with _state_lock:
+        for cache_key, entry in _meta.items():
+            # Exact match (not startswith) so subsong 3's backfill doesn't land
+            # on subsong 0's WAV.
+            if cache_key == want and entry.get("format_type") == "tracker":
+                return Path(entry["path"]).with_suffix(".vu")
+    return _cache_path(f"{track_id}__sub{subsong}__novubackfill", "tracker").with_suffix(".vu")
 
 
 async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
@@ -2496,17 +2565,14 @@ async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
     from soniqboom.core.conversion_cache import _cache_path
 
     log = logging.getLogger(__name__)
-    if not openmpt_vu.is_available():
+    sawteeth = _is_sawteeth(track)              # (sawteethrender writes its levels)
+    if not sawteeth and not openmpt_vu.is_available():
         log.debug("VU backfill skipped — libopenmpt unavailable")
         return None
-    # Tracker path can be a ZIP-virtual like ``foo.zip::inner.xm``
-    # where ``Path().suffix`` walks the LAST component (".xm" — good).
-    # For raw nested virtuals like ``a.zip::b.zip::c.xm`` it's the
-    # same — Path() ignores the ``::`` separator and treats the whole
-    # thing as one name; suffix is still ``.xm``.
-    ext = (Path(track.path).suffix or "").lower()
-    if ext not in _VU_BACKFILL_EXTS:
-        log.debug("VU backfill skipped — ext %r not in tracker set", ext)
+    # (``_render_ident`` reads an archive member's own name —
+    # ``foo.zip::inner.xm`` — and the record's format.)
+    if not _vu_backfill_route(track):
+        log.debug("VU backfill skipped — %s doesn't play through libopenmpt", track.path)
         return None
     # Resolve raw module bytes via the shared resolver, the SAME helper the
     # SID-bytes endpoint uses.  It partitions the ``::`` archive tail FIRST,
@@ -2527,6 +2593,35 @@ async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
     if not src_bytes:
         log.debug("VU backfill found no bytes for %s", path_str)
         return None
+    if sawteeth:
+        raw = await asyncio.to_thread(_sawteeth_vumr, src_bytes)
+        if raw is None:
+            log.debug("VU backfill: no Sawteeth levels for %s", path_str)
+            return None
+        candidate = _vu_backfill_dest(track_id, subsong)
+        try:
+            await asyncio.to_thread(openmpt_vu.write_sidecar_bytes, candidate, raw)
+        except Exception:                                   # noqa: BLE001
+            log.warning("VU backfill write failed for %s", track_id, exc_info=True)
+            return None
+        return candidate
+    if src_bytes[:4] == b"DSM\x10":
+        # An early DSIK module: milkyrender plays it, libopenmpt can't read it.
+        log.debug("VU backfill skipped — early DSIK module %s", path_str)
+        return None
+    from soniqboom.core.metadata import PW_EXTS
+    if Path(path_str.split("::")[-1]).suffix.lower() in PW_EXTS:
+        # A packed module: the meters of the ProTracker module it is
+        # converted to and played as (``stream._render_xmp``).
+        from soniqboom.core import prowizard
+        try:
+            src_bytes = (prowizard.convert(src_bytes)
+                         if prowizard.identify(src_bytes) else b"")
+        except ValueError:
+            src_bytes = b""
+        if not src_bytes:
+            log.debug("VU backfill: %s isn't a packed module this server converts", path_str)
+            return None
 
     loop = asyncio.get_event_loop()
     # extract_vu takes -1 = "libopenmpt default subsong" (what _render_tracker
@@ -2544,28 +2639,8 @@ async def _try_backfill_vu_sidecar(track, track_id: str, subsong: int = 0):
         log.warning("VU backfill: 0 frames for %s", path_str)
         return None
 
-    # Pick a destination path.  Prefer next to the existing cached
-    # WAV (so eviction is uniform); fall back to a freshly-keyed
-    # cache slot if no audio cache exists for this track yet.
     try:
-        from soniqboom.core.conversion_cache import _cache_key, _meta, _state_lock
-        candidate: Path | None = None
-        want = _cache_key(track_id, "tracker", subsong)
-        with _state_lock:
-            for cache_key, entry in _meta.items():
-                # This subsong's cached WAV specifically — write the .vu next to
-                # it so eviction stays uniform.  Exact match (not startswith) so
-                # subsong 3's backfill doesn't land on subsong 0's WAV.
-                if cache_key == want and entry.get("format_type") == "tracker":
-                    candidate = Path(entry["path"]).with_suffix(".vu")
-                    break
-        if candidate is None:
-            # No cached WAV for this subsong yet — synthesize a sidecar-only slot
-            # keyed per-subsong (the ``__novubackfill`` suffix keeps it from
-            # colliding with a real render slot).  Lives in the same cache dir so
-            # it gets evicted alongside other tracker assets.
-            base = _cache_path(f"{track_id}__sub{subsong}__novubackfill", "tracker")
-            candidate = base.with_suffix(".vu")
+        candidate = _vu_backfill_dest(track_id, subsong)
         await loop.run_in_executor(
             None, openmpt_vu.write_sidecar, candidate, result,
         )
@@ -3097,11 +3172,18 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     else:
         cands = [("tracker", None, None)]
     # MIDI / PSF / YM render one tune only — always keyed as subsong 0.
-    from soniqboom.api.stream import _gme_variant, uade_cache_key
+    from soniqboom.api.stream import _gme_variant, _psf_variants_known, uade_cache_key
+    # (a Dreamcast rip: the render a play of it makes now — dsfrender's or
+    # zxtune123's)
+    psf_vars = (await _psf_variants_known(
+        ext, path_str, not (is_remote_path(path_str) or "::" in path_str))
+        if any(c[0] == "psf" for c in cands) else (None,))
     keys = [uade_cache_key(track_id, subsong, uade_base) if fmt == "uade" else
             _cache_key(track_id, fmt, subsong if fmt not in ("midi", "psf", "ym") else 0,
-                       sf, duration=dur, variant=_gme_variant(ext) if fmt == "gme" else None)
-            for fmt, sf, dur in cands]
+                       sf, duration=dur,
+                       variant=(_gme_variant(ext) if fmt == "gme" else var))
+            for fmt, sf, dur in cands
+            for var in (psf_vars if fmt == "psf" else (None,))]
 
     async def _hit():
         for k in keys:
@@ -3371,6 +3453,7 @@ async def get_track_waveform(track_id: str, response: Response,
     from soniqboom.api.stream import _DSD_EXTS, _inflight_cache_key
     _TRANSCODED_WAVEFORM_EXTS = _DSD_EXTS | {
         ".m4a", ".aac", ".aiff", ".aif", ".wv", ".mpc",
+        ".ac3", ".eac3", ".ec3", ".dts", ".dtshd", ".thd", ".truehd", ".mlp",
     }
     if ext in _TRANSCODED_WAVEFORM_EXTS:
         # Prefer the final cached WAV when it exists — fastest path

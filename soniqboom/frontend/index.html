@@ -137,7 +137,7 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=144">
+  <link rel="stylesheet" href="/assets/css/app.css?v=146">
   <link rel="stylesheet" href="/assets/css/stations-styles.css?v=5">
   <link rel="stylesheet" href="/assets/css/playlist-styles.css?v=2">
   <link rel="stylesheet" href="/assets/css/player-styles.css?v=6">
@@ -982,13 +982,58 @@
               </div>
               <div class="renderer-item" id="renderer-zxtune123">
                 <span class="renderer-icon" id="renderer-icon-zxtune123">&#8943;</span>
-                <span class="renderer-name">PSF Consoles (zxtune123)</span>
+                <span class="renderer-name">PSF Consoles, S98, V2 (zxtune123)</span>
                 <span class="renderer-version" id="renderer-version-zxtune123"></span>
               </div>
               <div class="renderer-item" id="renderer-kssrender">
                 <span class="renderer-icon" id="renderer-icon-kssrender">&#8943;</span>
-                <span class="renderer-name">MSX / Master System KSS (kssrender)</span>
+                <span class="renderer-name">MSX / Master System KSS, MGSDRV (kssrender)</span>
                 <span class="renderer-version" id="renderer-version-kssrender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-dsfrender">
+                <span class="renderer-icon" id="renderer-icon-dsfrender">&#8943;</span>
+                <span class="renderer-name">Dreamcast / Naomi DSF (dsfrender)</span>
+                <span class="renderer-version" id="renderer-version-dsfrender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-milkyrender">
+                <span class="renderer-icon" id="renderer-icon-milkyrender">&#8943;</span>
+                <span class="renderer-name">Early DSIK modules (milkyrender)</span>
+                <span class="renderer-version" id="renderer-version-milkyrender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-mlrender">
+                <span class="renderer-icon" id="renderer-icon-mlrender">&#8943;</span>
+                <span class="renderer-name">Musicline Editor (mlrender)</span>
+                <span class="renderer-version" id="renderer-version-mlrender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-mdxrender">
+                <span class="renderer-icon" id="renderer-icon-mdxrender">&#8943;</span>
+                <span class="renderer-name">X68000 MDX (mdxrender)</span>
+                <span class="renderer-version" id="renderer-version-mdxrender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-gt2reloc">
+                <span class="renderer-icon" id="renderer-icon-gt2reloc">&#8943;</span>
+                <span class="renderer-name">GoatTracker 2 (gt2reloc)</span>
+                <span class="renderer-version" id="renderer-version-gt2reloc"></span>
+              </div>
+              <div class="renderer-item" id="renderer-sunvoxrender">
+                <span class="renderer-icon" id="renderer-icon-sunvoxrender">&#8943;</span>
+                <span class="renderer-name">SunVox (sunvoxrender)</span>
+                <span class="renderer-version" id="renderer-version-sunvoxrender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-furnace">
+                <span class="renderer-icon" id="renderer-icon-furnace">&#8943;</span>
+                <span class="renderer-name">FamiTracker / DefleMask (Furnace)</span>
+                <span class="renderer-version" id="renderer-version-furnace"></span>
+              </div>
+              <div class="renderer-item" id="renderer-xmprender">
+                <span class="renderer-icon" id="renderer-icon-xmprender">&#8943;</span>
+                <span class="renderer-name">libxmp modules (xmprender)</span>
+                <span class="renderer-version" id="renderer-version-xmprender"></span>
+              </div>
+              <div class="renderer-item" id="renderer-sawteethrender">
+                <span class="renderer-icon" id="renderer-icon-sawteethrender">&#8943;</span>
+                <span class="renderer-name">Sawteeth (sawteethrender)</span>
+                <span class="renderer-version" id="renderer-version-sawteethrender"></span>
               </div>
             </div>
             <!-- ffmpeg-incomplete banner — populated by _renderFfmpegBanner
@@ -1255,15 +1300,78 @@
                      style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
             </div>
             <div class="admin-setting">
-              <label for="setting-path-zxtune123">zxtune123 (PSF consoles)</label>
+              <label for="setting-path-zxtune123">zxtune123 (PSF consoles, S98, V2)</label>
               <input id="setting-path-zxtune123" type="text"
                      autocapitalize="off" autocorrect="off" spellcheck="false"
                      placeholder="auto-discover"
                      style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
             </div>
             <div class="admin-setting">
-              <label for="setting-path-kssrender">kssrender (MSX / Master System KSS)</label>
+              <label for="setting-path-kssrender">kssrender (MSX / Master System KSS, MGSDRV)</label>
               <input id="setting-path-kssrender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-dsfrender">dsfrender (Dreamcast / Naomi DSF)</label>
+              <input id="setting-path-dsfrender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-milkyrender">milkyrender (early DSIK modules)</label>
+              <input id="setting-path-milkyrender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-mlrender">mlrender (Musicline Editor)</label>
+              <input id="setting-path-mlrender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-mdxrender">mdxrender (X68000 MDX)</label>
+              <input id="setting-path-mdxrender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-gt2reloc">gt2reloc (GoatTracker 2)</label>
+              <input id="setting-path-gt2reloc" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-sunvoxrender">sunvoxrender (SunVox)</label>
+              <input id="setting-path-sunvoxrender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-furnace">furnace (FamiTracker, DefleMask)</label>
+              <input id="setting-path-furnace" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-xmprender">xmprender (libxmp modules)</label>
+              <input id="setting-path-xmprender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-path-sawteethrender">sawteethrender (Sawteeth)</label>
+              <input id="setting-path-sawteethrender" type="text"
                      autocapitalize="off" autocorrect="off" spellcheck="false"
                      placeholder="auto-discover"
                      style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
@@ -1873,6 +1981,32 @@
               <input id="setting-lyrics-writeback" type="checkbox">
             </div>
             <div id="md-lyrics-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- Discogs (radio now-playing covers) -->
+          <div class="admin-section" id="md-discogs-section">
+            <h3>&#128191; Discogs</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              With a Discogs personal access token, the cover of the song a radio
+              station is playing is looked up on Discogs first (after your own
+              library), then on MusicBrainz. Create a token while signed in to Discogs, on
+              its Developer Settings page (discogs.com/settings/developers).
+            </p>
+            <div id="md-discogs-status" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Status: &mdash;</div>
+            <div class="admin-setting">
+              <label for="setting-discogs-token">Personal access token</label>
+              <input id="setting-discogs-token" class="admin-token-input" type="text"
+                     autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                     data-1p-ignore data-lpignore="true" data-bwignore="true"
+                     maxlength="128" placeholder="Paste a token">
+            </div>
+            <div class="admin-io-row" style="gap:8px;flex-wrap:wrap">
+              <button id="btn-discogs-save">Save token</button>
+              <button id="btn-discogs-test" class="btn-secondary">Test token</button>
+              <button id="btn-discogs-remove" class="btn-secondary">Remove token</button>
+            </div>
+            <div id="md-discogs-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- HVSC (SID song-lengths + STIL) -->

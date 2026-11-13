@@ -564,7 +564,24 @@ class CastSession:
                 # main stream handler use.  If the entry is already
                 # cached (or in-flight), _start_gated_render is a fast
                 # no-op.
-                if src_ext in _SID_EXTS:
+                from soniqboom.core.cast_render import one_tune_route
+                _one = one_tune_route(item.track_id, track.path, track)
+                if _one is not None:
+                    # MDX, SunVox, MGSDRV, GoatTracker, FamiTracker — their own
+                    # renderer, under the key a play renders to (cast_render).
+                    from soniqboom.api.stream import (
+                        _own_engine, _own_variant, _render_psf,
+                    )
+                    ck = _ck(track_id=item.track_id, format_type="psf", subsong=0,
+                             variant=_own_variant(_own_engine(_one)[0]))
+                    if await is_cache_ready(ck):
+                        continue
+                    path = await _local_src()
+                    if path is None:
+                        continue
+                    await _start_gated_render(
+                        prio, ck, "psf", lambda p=path: _render_psf(p))
+                elif src_ext in _SID_EXTS:
                     target_dur = int(getattr(_settings, "sid_default_duration", 180))
                     ck = _ck(
                         track_id=item.track_id, format_type="sid",

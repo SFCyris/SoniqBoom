@@ -403,6 +403,7 @@ _FORMAT_PLATFORMS: dict[str, tuple[str, ...]] = {
     "PSF": ("psx",), "PSF2": ("ps2",), "USF": ("n64",), "GSF": ("gba",), "2SF": ("nds",),
     "NCSF": ("nds",), "SSF": ("saturn",), "DSF (Dreamcast)": ("dreamcast",),
     "KSS": ("msx", "sms", "gamegear"), "AY": ("zx", "cpc"), "Amiga": ("amiga",),
+    "MDX": ("x68000",), "MGSDRV": ("msx",),
 }
 _TRACKER_PLATFORMS = ("amiga", "dos")
 # uade players of Atari ST music ("Jochen Hippel ST", "TFMX ST", "Quartet PSG",
@@ -462,7 +463,8 @@ _STOP_KEYS = frozenset({
 _MUSIC_EXT_RE = re.compile(
     r"\.(mod|xm|it|s3m|mtm|669|med|ahx|hvl|sid|ym|sndh|sc68|spc|nsf|nsfe|gbs|vgm|vgz|kss|hes"
     r"|ay|sap|gym|minipsf|psf|psf2|gsf|minigsf|usf|miniusf|2sf|mini2sf|ssf|minissf|dsf|minidsf"
-    r"|ncsf|minincsf|mid|midi)$", re.IGNORECASE)
+    r"|ncsf|minincsf|s98|v2m|mdx|sunvox|mgs|ftm|sng|mid|midi"
+    r"|dsym|dtm|mdl|psm|j2b|mo3|mptm|rtm|stx|umx|ptm|musx|coco|fnk|liq|mgt)$", re.IGNORECASE)
 # A one-word name shorter than this needs two lists.
 _SHORT_WORD = 8
 # Only this many innermost archives of a path are looked at (real nesting is

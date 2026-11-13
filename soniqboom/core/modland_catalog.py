@@ -143,8 +143,14 @@ PC_TRACKER_DIRS = ("Fasttracker 2", "Impulsetracker", "Screamtracker 3", "Fasttr
 # Bump when the derivation of a catalogue track from its index line changes:
 # the next build re-derives every catalogue track (user edits and enrichment
 # carried, ``store._carry_enrichment``).
-RULES_VERSION = 3          # 2: the format family genre (Amiga / Tracker …); fill-only credit
+RULES_VERSION = 8          # 2: the format family genre (Amiga / Tracker …); fill-only credit
                            # 3: denylisted uade suffixes in their player's folder are music
+                           # 4: YM-ST replay routines (ym.*_replay) are companions, not music;
+                           #    Aero Studio and Monotone folders are not uade music
+                           # 5: YM-ST replay routines named "<tune>-replay.ymst" too
+                           # 6: shared Hippel COSO instrument files are companions
+                           # 7: the "_unknown" author folder is no composer credit
+                           # 8: GoatTracker, FamiTracker, SunVox and MGSDRV files are music
 
 # How often the index is refreshed: the setting's value → seconds, and the
 # wording the settings show.
@@ -445,11 +451,16 @@ def _all_rels(con: sqlite3.Connection, kind: int | None = None, *, seen: bool = 
 
 # Modland format dirs whose music SoniqBoom has no engine for, though some of
 # their file names collide with an Amiga replayer's name token (uade claims
-# ``.mus``, ``.sng``, ``.sqt``, ``sm1`` …): C64 Sidplayer / GoatTracker, MSX,
-# ZX Spectrum, Sam Coupé, X68000, PC-98, FM Towns, NES / tracker sources,
-# AdLib trackers.  A uade-named file there is not listed (its core-extension
-# files — an AdLib ``.rad``, a ``.vgz`` — still are).  From Modland's index
-# (2026-10): the dirs whose uade-classified files are foreign formats.
+# ``.mus``, ``.sng``, ``.sqt``, ``sm1`` …): C64 Sidplayer (sidplayfp plays a
+# local Sidplayer song, but a catalogue row is routed by its index name before
+# the file is read, and a stereo song needs its ``.str`` fetched too), MSX, ZX Spectrum,
+# Sam Coupé, X68000 (its MDX songs play — mdxrender), PC-98, FM Towns, NES /
+# tracker sources, AdLib trackers.  A uade-named file there is not listed (its
+# core-extension files — an AdLib ``.rad``, a ``.vgz``, the ``.s98`` / ``.v2m``
+# songs of "S98" / "V2" (zxtune123), the SunVox / MGSDRV / FamiTracker files
+# of those dirs — still are).  GoatTracker's ``.sng`` songs (``_GOAT_DIRS``)
+# play too (gt2reloc + sidplayfp).  From Modland's index (2026-10): the dirs
+# whose uade-classified files are foreign formats.
 _UADE_FOREIGN_DIRS = frozenset({
     "Ad Lib", "Spectrum", "Sidplayer", "Stereo Sidplayer", "FAC SoundTracker", "MDX",
     "MVS Tracker", "GoatTracker", "GoatTracker 2", "SCC-Musixx", "Synder SNG-Player",
@@ -463,7 +474,24 @@ _UADE_FOREIGN_DIRS = frozenset({
     "Face The Music", "Epic Megagames MASI", "MaxTrax", "TFM Music Maker",
     "Digital Tracker DTM", "SPU", "Capcom Q-Sound Format", "Super Nintendo Sound Format",
     "Sam Coupe E-Tracker",
+    # (no installed engine plays these; their names only collide with a uade
+    # token — Aero Studio ``one.aero`` with onEscapee, PC-speaker Monotone
+    # ``.mon`` with Maniacs of Noise)
+    "Aero Studio", "Monotone",
 })
+# Modland format dirs → the built-in-engine extensions their files carry while
+# being another format no installed engine plays: ZX Spectrum Pro Sound Maker
+# ``.psm`` (Epic MegaGames MASI's suffix), DeFy AdLib Tracker ``.dtm``
+# (Digital Tracker's).  (FamiTracker's ``.ftm`` modules play — Furnace —,
+# told from Face The Music's by content; so do DefleMask's ``.dmf`` ones,
+# ``_DEFLE_DIR``.)
+_CORE_FOREIGN_DIRS: "dict[str, tuple[str, ...]]" = {"Spectrum": (".psm",), "Ad Lib": (".dtm",)}
+# Modland's DefleMask dir: its ``.dmf`` files are DefleMask modules (Furnace),
+# not libopenmpt's X-Tracker / DSMI / Software Visions modules.
+_DEFLE_DIR = "Deflemask"
+# GoatTracker's Modland dirs (1.x and 2.x songs): their ``.sng`` files are
+# GoatTracker songs (gt2reloc + sidplayfp), not uade's ZoundMonitor / RJP.
+_GOAT_DIRS = frozenset({"GoatTracker", "GoatTracker 2"})
 # Support files whose names an Amiga replayer token can still match
 # (``pn.<x>.info``, IFF ``Instruments/<x>.instr``): never music.
 _NEVER_MUSIC_EXTS = (".info", ".instr", ".txt", ".nfo", ".diz", ".doc", ".readme")
@@ -525,6 +553,29 @@ def _classify(rel: str, majority: dict | None = None) -> int:
         return KIND_ARCHIVE
     if low.endswith(_NEVER_MUSIC_EXTS):
         return KIND_OTHER
+    top = rel.split("/", 1)[0]
+    if low.endswith(".sng") and top in _GOAT_DIRS:
+        return KIND_MUSIC
+    if low.endswith(".ftm") and top == "FamiTracker":
+        return KIND_MUSIC
+    if low.endswith(".dmf") and top == _DEFLE_DIR:
+        return KIND_MUSIC
+    if low.endswith(".st"):
+        # (Sawteeth's suffix, told by content — Modland has no Sawteeth
+        # folder; a ``.st`` there is an Amiga module where its folder names
+        # the player, else not music)
+        return KIND_MUSIC if folder_player_token(rel) else KIND_OTHER
+    # ``.sng`` / ``.ftm`` are listed for GoatTracker / FamiTracker everywhere;
+    # elsewhere in Modland they are the Amiga formats sharing the suffix —
+    # music only where an engine here plays them (uade's ``.sng``; Face The
+    # Music where libopenmpt reads it).
+    from soniqboom.core import metadata as _md
+    if low.endswith(".sng") and ".sng" not in _md._UADE_SUFFIX_EXTS:
+        return KIND_MUSIC if folder_player_token(rel) else KIND_OTHER
+    if low.endswith(".ftm") and ".ftm" not in _md.OPENMPT_EXTRA_EXTS:
+        return KIND_OTHER
+    if low.endswith(".dmf") and ".dmf" not in _md.OPENMPT_EXTRA_EXTS:
+        return KIND_OTHER
     eng = _engine(name)
     if eng is None:
         return KIND_MUSIC if folder_player_token(rel) else KIND_OTHER
@@ -533,6 +584,8 @@ def _classify(rel: str, majority: dict | None = None) -> int:
             return KIND_OTHER
         if majority is not None and majority.get(_dir_key(rel)) == "core":
             return KIND_OTHER
+    elif low.endswith(_CORE_FOREIGN_DIRS.get(rel.split("/", 1)[0], ())):
+        return KIND_OTHER
     return KIND_MUSIC
 
 
@@ -544,7 +597,11 @@ def _fingerprint() -> str:
         fp = _listing_fingerprint()
     except Exception:                                   # noqa: BLE001
         fp = "?"
-    return f"{fp}:{RULES_VERSION}:i{_INDEX_SCHEMA}"
+    foreign = repr((sorted(_UADE_FOREIGN_DIRS), sorted(_CORE_FOREIGN_DIRS.items()),
+                    sorted(_GOAT_DIRS), _DEFLE_DIR))
+    import hashlib
+    fd = hashlib.sha1(foreign.encode()).hexdigest()[:8]
+    return f"{fp}:{RULES_VERSION}:i{_INDEX_SCHEMA}:d{fd}"
 
 
 def _index_lines(zf: zipfile.ZipFile, member: str):
@@ -1770,7 +1827,14 @@ def format_for(rel: str) -> str:
         return "DSF (Dreamcast)"                           # Modland's .dsf are Dreamcast rips
     if ext == ".imf" and top != "Imago Orpheus":
         return "AdLib IMF"
-    if ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS:
+    if ext == ".sng" and top in _GOAT_DIRS:
+        return metadata.GOATTRACKER_FORMAT
+    if ext == ".ftm" and top == "FamiTracker":
+        return metadata.FAMITRACKER_FORMAT
+    if ext == ".dmf" and top == _DEFLE_DIR:
+        return metadata.DEFLEMASK_FORMAT
+    if (ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS
+            and ext != ".st"):
         return metadata.FORMAT_NAMES.get(ext, ext.lstrip(".").upper())
     cls = uf.classify(name)
     if cls:
@@ -1778,7 +1842,7 @@ def format_for(rel: str) -> str:
     tok = folder_player_token(rel)
     if tok:
         return uf.display_name(uf.player_map()[tok])
-    return metadata.FORMAT_NAMES.get(ext, "")
+    return "" if ext == ".st" else metadata.FORMAT_NAMES.get(ext, "")
 
 
 def title_for(rel: str) -> str:
@@ -1796,7 +1860,7 @@ def title_for(rel: str) -> str:
 
 def credit_for(rel: str, fmt: str | None) -> str:
     """The composer credit of a catalogue file: Modland's author dir
-    (``scene_metadata.modland_credit`` — "- unknown" gives none); for the
+    (``scene_metadata.modland_credit`` — "_unknown" gives none); for the
     mirrored HVSC tree its MUSICIANS folder, as HVSC spells it
     ("Bayliss_Richard" → "Bayliss Richard")."""
     from soniqboom.core import scene_metadata as sm
@@ -1878,13 +1942,26 @@ def family_genre(rel: str) -> list[str] | None:
         return ["Chiptune", "Game Rip"]                    # Modland's .dsf: Dreamcast rips
     if ext == ".imf" and top != "Imago Orpheus":
         return None                                        # AdLib IMF
-    if ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS:
+    if ext == ".sng" and top in _GOAT_DIRS:
+        return ["Chiptune", "C64"]                         # GoatTracker (gt2reloc + sidplayfp)
+    if ext == ".ftm" and top == "FamiTracker":
+        return ["Chiptune"]                                # FamiTracker (Furnace), not a module
+    if ext == ".dmf" and top == _DEFLE_DIR:
+        return ["Chiptune"]                                # DefleMask (Furnace), not a module
+    if (ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS
+            and ext != ".st"):
         if ext in metadata._TRACKER_EXTS:
             return ["Tracker", "Module"]
         if ext in metadata._ATARI_EXTS:
             return ["Chiptune", "Atari ST"]
         if ext in metadata._PSF_EXTS:
             return ["Chiptune", "Game Rip"]
+        if ext in metadata._ZXTUNE_EXTS:
+            return ["Chiptune", "Game Rip"] if ext == ".s98" else ["Chiptune"]
+        if ext in metadata._MDX_EXTS or ext in metadata._MGS_EXTS:
+            return ["Chiptune"]
+        if ext in metadata._SUNVOX_EXTS:
+            return ["Tracker"]
         if ext in metadata._GME_EXTS:
             return ["Chiptune"]
         if ext in metadata._MIDI_EXTS:
@@ -2259,6 +2336,7 @@ async def refill_tune_counts() -> int:
     a play, as a scanned file has it.  Run after a build / refresh, at start
     and when the checksum list, song database or HVSC changes.  Returns the
     number of tunes updated."""
+    from soniqboom.core import uade_formats
     store = _store()
     if not enabled():
         return 0
@@ -2280,6 +2358,8 @@ async def refill_tune_counts() -> int:
         # tracker shows none.
         if not (amiga or rel.startswith("HVSC/")):
             continue
+        if uade_formats.coso_bank_for(rel):
+            continue                        # (its tunes are counted from the song on its first play)
         want[rel] = (amiga, tid, t.get("subsongs"), t.get("subsong_base"))
     if not want:
         return 0
@@ -2429,6 +2509,12 @@ def _rederive_merged(old: dict, fresh: dict) -> dict:
         # An HVSC SID merged when HVSC's folder name ("Turner Steve") replaced
         # the author its header names: read it again on its next play — it
         # stays a played tune meanwhile (kept on switch-off and rebuilds).
+        d[REREAD] = True
+    from soniqboom.core import uade_formats
+    if uade_formats.coso_bank_for(rel):
+        # A Hippel COSO song played with a shared instrument file (rules 6):
+        # its first play read it without the file — read it again on its
+        # next play for its tune count and "partial" mark.
         d[REREAD] = True
     if old.get("added_at"):
         d["added_at"] = old["added_at"]
@@ -3500,13 +3586,21 @@ def merged_track(old: dict, meta: dict, local_stem: str) -> dict:
     # placeholder (the catalogue row had none before).
     if (old.get("duration") or 0) > 0 and not (d.get("duration") or 0) > 0:
         d["duration"] = old["duration"]
+        d["duration_rev"] = old.get("duration_rev")
     elif (old.get("duration") or 0) > 0 and (meta.get("duration") or 0) in (180, 180.0):
         d["duration"] = old["duration"]
+        d["duration_rev"] = old.get("duration_rev")
     # The file's own author stays the artist, as for a scanned file
     # ("Steve Turner", not HVSC's folder "Turner Steve"); Modland's credit
     # fills an empty / placeholder one (``apply_path_fields``).
     apply_path_fields(d, rel, siblings=_siblings_map(),
                       use_filename=sm.filename_game_enabled())
+    if rel.startswith("HVSC/"):
+        # (a group's folder holding a member's tune: the group as album
+        # artist — ``online_hvsc.group_album_artist``)
+        from soniqboom.core import online_hvsc
+        hrel = rel[len("HVSC/"):]
+        online_hvsc.group_album_artist(d, online_hvsc.folder_credit(hrel))
     _finish_genres(d, genre_derive.names_enabled())
     return d
 

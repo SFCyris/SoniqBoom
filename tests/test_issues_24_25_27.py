@@ -54,7 +54,10 @@ def test_an_octamed_file_without_a_song_name_is_named_after_its_file(tmp_path, d
 def test_format_magic_never_becomes_a_title(tmp_path, ext, head):
     p = tmp_path / f"tune{ext}"
     p.write_bytes(head.ljust(0x400, b"\0"))
-    assert metadata._extract_tracker(p, "x")["title"] == "tune"
+    # (the file name, or — where libopenmpt opens the stub — the song name
+    # in the format's title field: "MAS_UTrack_V004" + a 32-byte title)
+    assert metadata._extract_tracker(p, "x")["title"] in (
+        "tune", {".ult": "Ult Title"}.get(ext))
 
 
 def test_a_stand_in_song_name_is_no_title(tmp_path):
@@ -95,7 +98,8 @@ def test_an_archived_prefix_named_module_gets_a_clean_title(tmp_path):
     z = tmp_path / "pack.zip"
     with zipfile.ZipFile(z, "w") as zf:
         zf.writestr("MED.Dying_Forest", _mmd(name=b""))
-        zf.writestr("MOD.Space_Debris", b"\0" * 20 + b"\0" * 1064 + b"M.K." + b"\0" * 64)
+        zf.writestr("MOD.Space_Debris", b"\0" * 20 + b"\0" * 930 + bytes([1, 127])
+                    + b"\0" * 128 + b"M.K." + b"\0" * 1024)     # (one order, one pattern)
     for member, want in (("MED.Dying_Forest.med", "Dying_Forest"),
                          ("MOD.Space_Debris.mod", "Space_Debris")):
         assert scanner._extract_from_zip(f"{z}::{member}", "t").title == want

@@ -171,6 +171,16 @@ def is_relative(spec) -> bool:
 
 # Family words ``format:`` takes → the ``retro.coarse_family`` bucket (the
 # library Galaxy's family filter).
+# ``format:`` words that name a group of formats as well as (or instead of) a
+# format: ``format:dts`` is DTS and both DTS-HD kinds, ``format:dolby`` the
+# Dolby codecs (lower case, as ``TrackStore._tag_format`` keys them).  The
+# format's own name inside a group stays exact (``format:"DTS-HD MA"``).
+FORMAT_GROUPS = {
+    "dts": ("dts", "dts-hd", "dts-hd ma", "dts-hd hra"),
+    "dts-hd": ("dts-hd", "dts-hd ma", "dts-hd hra"),
+    "dolby": ("ac-3", "e-ac-3", "truehd"),
+}
+
 FAMILIES = {
     "tracker": "trackers", "trackers": "trackers",
     "chiptune": "chiptune", "chiptunes": "chiptune",
@@ -182,7 +192,13 @@ FAMILIES = {
 # Dreamcast ``.dsf`` and an id / Apogee ``.imf`` by their magic.  (The DSD
 # quality tiers — DSD64, DSD128, … — follow "DSD": ``TrackStore._format_ids``.)
 _EXT_EXTRA = {
-    "m4a": ("AAC", "ALAC"),
+    "m4a": ("AAC", "ALAC", "AC-3", "E-AC-3"),
+    "ogg": ("Opus",),
+    "dts": ("DTS-HD MA", "DTS-HD HRA"),
+    "dtshd": ("DTS", "DTS-HD MA", "DTS-HD HRA"),
+    # (a raw Dolby stream is labelled by what it holds, whatever its suffix)
+    "ac3": ("E-AC-3",), "eac3": ("AC-3",), "ec3": ("AC-3",),
+    "thd": ("MLP",), "truehd": ("MLP",), "mlp": ("TrueHD",),
     "dsf": ("DSF (Dreamcast)",),
     "imf": ("AdLib IMF",),
 }

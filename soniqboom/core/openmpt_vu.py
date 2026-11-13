@@ -404,6 +404,71 @@ def module_duration(file_bytes: bytes) -> float | None:
         lib.openmpt_module_destroy(mod)
 
 
+def _bind_meta(lib) -> None:
+    if getattr(lib, "_sb_meta_bound", False):
+        return
+    lib.openmpt_module_get_metadata.argtypes = [_Module, ctypes.c_char_p]
+    lib.openmpt_module_get_metadata.restype = ctypes.c_void_p      # (freed by us)
+    for fn in ("openmpt_module_get_num_instruments", "openmpt_module_get_num_samples",
+               "openmpt_module_get_num_patterns"):
+        getattr(lib, fn).argtypes = [_Module]
+        getattr(lib, fn).restype = ctypes.c_int32
+    for fn in ("openmpt_module_get_instrument_name", "openmpt_module_get_sample_name"):
+        getattr(lib, fn).argtypes = [_Module, ctypes.c_int32]
+        getattr(lib, fn).restype = ctypes.c_void_p                 # (freed by us)
+    lib._sb_meta_bound = True
+
+
+def _take_string(lib, ptr) -> str:
+    """The text of a string libopenmpt handed over (UTF-8), freed."""
+    if not ptr:
+        return ""
+    try:
+        return ctypes.string_at(ptr).decode("utf-8", "replace")
+    finally:
+        lib.openmpt_free_string(ptr)
+
+
+_META_MAX_NAMES = 256
+
+
+def module_meta(file_bytes: bytes) -> "dict | None":
+    """What libopenmpt reads of the module in *file_bytes*: ``title``,
+    ``artist``, ``type`` (its short format name, ``type_long`` its long one),
+    ``channels``, ``patterns`` and ``instruments`` (the instrument names, else the sample
+    names; empty ones left out, at most ``_META_MAX_NAMES``).  ``None`` when
+    libopenmpt can't be loaded on this host or can't open the bytes.  Nothing
+    is logged to stderr."""
+    if not _bind():
+        return None
+    lib = _load()
+    assert lib is not None
+    mod = _open_silent(lib, file_bytes)
+    if not mod:
+        return None
+    try:
+        _bind_meta(lib)
+        meta = {key: _take_string(lib, lib.openmpt_module_get_metadata(mod, key.encode()))
+                .strip() for key in ("title", "artist", "type", "type_long")}
+        meta["channels"] = int(lib.openmpt_module_get_num_channels(mod))
+        meta["patterns"] = int(lib.openmpt_module_get_num_patterns(mod))
+        names: list[str] = []
+        for count, get in ((lib.openmpt_module_get_num_instruments,
+                            lib.openmpt_module_get_instrument_name),
+                           (lib.openmpt_module_get_num_samples,
+                            lib.openmpt_module_get_sample_name)):
+            for i in range(min(int(count(mod)), _META_MAX_NAMES)):
+                n = _take_string(lib, get(mod, i)).strip()
+                if n:
+                    names.append(n)
+            if names:
+                break
+        meta["instruments"] = names
+        return meta
+    finally:
+        lib.openmpt_module_destroy(mod)
+
+
 # ── Song-end loops written as a repeat count ────────────────────────────────
 #
 # libopenmpt plays a module until it would repeat itself — a jump back to an

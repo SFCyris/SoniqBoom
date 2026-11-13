@@ -697,6 +697,8 @@ _FAMILY_LABELS = {
     "atari": "Atari ST", "adlib": "AdLib", "psf": "PSF", "midi": "MIDI",
     "nes": "NES", "snes": "SNES", "gameboy": "Game Boy", "ay": "AY",
     "pokey": "Atari 8-bit", "genesis": "Mega Drive", "pce": "PC Engine", "vgm": "VGM",
+    "s98": "S98", "v2": "V2", "x68000": "X68000", "sunvox": "SunVox",
+    "sawteeth": "Sawteeth", "deflemask": "DefleMask",
 }
 
 

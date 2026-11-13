@@ -283,6 +283,8 @@ class HVSCOnline(OnlineCatalogue):
         return (old.get("stil") or None) != (stil.get("text") or None)
 
     def merged_fields(self, d: dict, old: dict, rel: str) -> dict:
+        cdir = composer_dir(rel)
+        group_album_artist(d, (self._credits().get(cdir) if cdir else None) or folder_credit(rel))
         for f in ("hvsc_lengths", "stil"):
             if old.get(f) and not d.get(f):
                 d[f] = old[f]
@@ -328,6 +330,50 @@ class HVSCOnline(OnlineCatalogue):
         except OSError:
             log.debug("HVSC: learned credits not saved", exc_info=True)
         self._learned = cr
+
+    async def startup(self) -> None:
+        await super().startup()
+        if self.enabled():
+            self._spawn(self.fill_group_album_artists(), "group-credits")
+
+    async def fill_group_album_artists(self) -> int:
+        """The played tunes whose file names another author than their
+        folder's composer, merged before ``group_album_artist`` existed:
+        their folder's name as album artist now; a folder name an earlier
+        rule set where this one gives none taken back.  One pass over the rows, the
+        event loop served in between.  Returns the tunes changed."""
+        from soniqboom.core.store import get_store
+        st = get_store()
+        upd: list = []
+        for i, tid in enumerate(list(st._tag_scan_root_hash.get(self.root_hash()) or ())):
+            t = st._tracks.get(tid)
+            if (t is not None and (t.get("mtime") or 0) > 0
+                    and "album_artist" not in (t.get("user_edited") or ())):
+                rel = self.rel_of(t.get("path") or "")
+                cdir = composer_dir(rel)
+                folder = (self._credits().get(cdir) if cdir else None) or folder_credit(rel)
+                d = {"artist": t.get("artist")}
+                group_album_artist(d, folder)
+                have = t.get("album_artist") or None
+                if not have and d.get("album_artist"):
+                    upd.append((tid, {"album_artist": d["album_artist"]}))
+                elif have and have == folder and not d.get("album_artist"):
+                    # (one an earlier rule set — the folder's name — that this
+                    # rule no longer gives: the composer's own tune)
+                    upd.append((tid, {"album_artist": None}))
+            if i % 5000 == 4999:
+                await asyncio.sleep(0)
+        for i in range(0, len(upd), 2000):
+            st.update_track_fields_batch(upd[i:i + 2000])
+            await asyncio.sleep(0)
+        if upd:
+            log.info("HVSC: the album artist of %d played tune(s) set from their folder's group",
+                     len(upd))
+            try:
+                await self._after_library_change()
+            except Exception:                           # noqa: BLE001
+                pass
+        return len(upd)
 
     async def learn_from_library(self) -> int:
         """The credits tunes played before could teach (read before learning
@@ -479,6 +525,44 @@ def folder_credit(rel: str) -> str | None:
 
 
 _COLLAB_RE = re.compile(r"\s(?:&|and|vs\.?|feat\.?|with)\s|[/,+]", re.I)
+
+
+# What an author field holds when nobody is named (HVSC writes "<?>").
+_NO_AUTHOR = frozenset({"<?>", "?", "??", "???", "unknown", "n/a", "-"})
+
+
+def composer_among(folder: str, author: str) -> bool:
+    """Is the composer HVSC's folder names (``folder``) the SID's author, or
+    one of its authors — a collaboration ("Rob Hubbard & Ben Daglish") or a
+    remark beside the name ("Rob Hubbard (remix)") included?"""
+    if not folder or not author:
+        return False
+    if folder.casefold() == author.casefold() or same_composer(folder, author):
+        return True
+    fw = _words(folder)
+    for inside in re.findall(r"\(([^()]*)\)", author):
+        # (the composer's handle beside the name — two words too: "J.
+        # Wassermann (Spider Jerusalem)" in Spider_Jerusalem's folder)
+        if fw and fw in _spellings(inside):
+            return True
+    outside = re.sub(r"\([^()]*\)", " ", author).strip()
+    parts = [p.strip() for p in _COLLAB_RE.split(outside) if p and p.strip()]
+    return any(same_composer(folder, p) or p.casefold() == folder.casefold()
+               for p in [outside, *parts] if p)
+
+
+def group_album_artist(d: dict, folder: "str | None") -> None:
+    """An HVSC tune whose own author is someone else than the composer its
+    folder names — a group's folder (``MUSICIANS/A/Art_of_Noise``) holding a
+    member's tune (author "ESM"): the member stays the artist, the folder's
+    name becomes the album artist (when the tune has none), so the group's
+    tunes stay together and ``artist:`` finds them by the group (it reads the
+    album artist too).  Changes ``d`` (a merged row) in place."""
+    author = (d.get("artist") or "").strip()
+    if (not folder or not author or d.get("album_artist")
+            or author.casefold() in _NO_AUTHOR or composer_among(folder, author)):
+        return
+    d["album_artist"] = folder
 # HVSC's folder names spell ASCII what the SID's author field may not:
 # "Huelsbeck_Chris" / "Chris Hülsbeck", "Oeie_Karl_Bjoernar" / "Karl Bjørnar
 # Øie", "Haard_Lars" / "Lars Hård" — or with the accents just dropped.

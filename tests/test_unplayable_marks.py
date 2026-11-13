@@ -440,6 +440,26 @@ async def test_a_soniqboom_release_retries_the_mark(tmp_path, store, uade, monke
     assert await unplayable.sweep_stale(store) == 1
 
 
+async def test_new_rules_retry_every_mark(tmp_path, store, uade):
+    # A mark made under the previous rules (rules1: before dsfrender,
+    # milkyrender, mlrender and the uade player fixes) is cleared by the sweep
+    # even with the same renderer version and the same SoniqBoom version.
+    assert unplayable.RULES >= 2
+    f = _module(tmp_path)
+    _track(store, f)
+    uade.plan("crash")
+    with pytest.raises(unplayable.RenderRefusal):
+        await _play("t1", f)
+    assert await unplayable.sweep_stale(store) == 0       # current rules: kept
+    t = store.get_track("t1")
+    ev = dict(t["defect_evidence"])
+    assert f"|rules{unplayable.RULES}|" in ev["fp"]
+    ev["fp"] = ev["fp"].replace(f"|rules{unplayable.RULES}|", "|rules1|")
+    store.update_track_fields("t1", {"defect_evidence": ev})
+    assert await unplayable.sweep_stale(store) == 1
+    assert store.get_track("t1").get("defect") is None
+
+
 # ── the mark across rescans ──────────────────────────────────────────────────
 
 def _marked(**kw):

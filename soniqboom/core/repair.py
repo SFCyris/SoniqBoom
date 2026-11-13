@@ -1746,6 +1746,45 @@ async def repair_multi_values_once(store=None, *, force: bool = False) -> dict:
     return {"repaired": repaired, "seconds": secs}
 
 
+# ── Format labels stored under an old spelling ──────────────────────────────
+
+FORMAT_RENAMES_KEY = "format_renames_version"
+FORMAT_RENAMES_VERSION = 1
+
+
+async def rename_formats_once(store=None) -> dict:
+    """Relabel the tracks stored under a uade player name the scan now spells
+    otherwise (``metadata.UADE_FORMAT_RENAMES``: "Benn Daglish" → "Ben
+    Daglish") — an unchanged file is never read again, so its old label
+    would stay.  Once per ``FORMAT_RENAMES_VERSION`` (config
+    ``FORMAT_RENAMES_KEY``).  Returns ``{"renamed": n}`` or
+    ``{"skipped": True}``."""
+    from soniqboom.core.metadata import UADE_FORMAT_RENAMES
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    if store.get_config(FORMAT_RENAMES_KEY) == FORMAT_RENAMES_VERSION:
+        return {"skipped": True}
+    ids = list(store._tracks)
+    get = store._tracks.get
+    items = []
+    for i in range(0, len(ids), 20_000):
+        for tid in ids[i:i + 20_000]:
+            t = get(tid)
+            new = UADE_FORMAT_RENAMES.get(t.get("format")) if t is not None else None
+            if new:
+                items.append((tid, {"format": new}))
+        await asyncio.sleep(0)
+    renamed = 0
+    for i in range(0, len(items), 500):
+        renamed += store.update_track_fields_batch(items[i:i + 500])
+        await asyncio.sleep(0)
+    store.set_config(FORMAT_RENAMES_KEY, FORMAT_RENAMES_VERSION)
+    if renamed:
+        log.info("Format labels: relabelled %d track(s)", renamed)
+    return {"renamed": renamed}
+
+
 # ── Render lengths (GitHub #38) ─────────────────────────────────────────────
 # Libraries scanned before SNDH (FRMS), libgme (stated lengths) and AHX (song
 # end) lengths were honoured hold the defaults those tunes were played at: a
@@ -1987,9 +2026,17 @@ def _read_tune_lengths(kind: str, data: bytes, count: int) -> "dict | None":
         if kind == "gme1":
             # A single tune: its stated length is its whole length (as played).
             total, fade = gme_render.render_plan(data, 0, 0.0)
-            return ({"duration": round(total, 2), "tune_lengths": [round(total, 2)]}
-                    if fade is not None else {"tune_lengths": []})
-        return {"tune_lengths": gme_render.tune_lengths(data, count) or []}
+            out = ({"duration": round(total, 2), "tune_lengths": [round(total, 2)]}
+                   if fade is not None else {"tune_lengths": []})
+            fades = gme_render.tune_fades(data, 1) if fade is not None else None
+            if fades:
+                out["tune_fades"] = fades
+            return out
+        out = {"tune_lengths": gme_render.tune_lengths(data, count) or []}
+        fades = gme_render.tune_fades(data, count) if out["tune_lengths"] else None
+        if fades:
+            out["tune_fades"] = fades               # (a SAP file whose tunes end)
+        return out
     from soniqboom.core.metadata import sndh_info, sndh_tune_lengths
     fd, tmp = tempfile.mkstemp(suffix=".sndh", prefix="sq_tl_")
     try:

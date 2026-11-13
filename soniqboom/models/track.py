@@ -68,6 +68,12 @@ class TrackMeta(BaseModel):
     # probed yet (tune 1).  Unlike ``start_subsong`` it never changes the
     # wire mapping — ``?subsong=N`` / ``<id>~N`` stay tune N.
     default_subsong: int | None = None
+    # The uade render revision (``conversion_cache._RENDER_REVS["uade"]``) the
+    # stored ``duration`` was read from — a uade render or the scan's own
+    # computed length; None ⇒ from before revisions were recorded.  A cold
+    # uade play promises the stored length up front only when it is the
+    # current revision's (api/stream.py ``_uade_expected_seconds``).
+    duration_rev: int | None = None
 
     # Track health — a known playback defect detected at scan time, surfaced as
     # a badge in listings + the info panel.  ``defect`` is a coarse class the UI
@@ -117,6 +123,10 @@ class TrackMeta(BaseModel):
     # before the fade.  None: none recorded (a libgme rip's fixed fade is
     # known by its format).
     fade_s: float | None = None
+    # Per-tune fade-out included in ``tune_lengths`` when it isn't the same
+    # for every tune: a SAP file's tunes that end at their TIME (0) beside
+    # those marked LOOP (8 s).  None: ``fade_s`` / the format's fixed fade.
+    tune_fades: list[float] | None = None
     stil: str | None = None
 
     # Scene-metadata enrichment.  MD5 of the whole module file, cached at

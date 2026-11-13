@@ -30,7 +30,17 @@ _TRACKER = {
     "DigiBooster Pro", "UltraTracker", "Farandole", "ASYLUM/DMP",
     "General DigiMusic", "Imago Orpheus", "Oktalyzer", "SoundFX",
     "Grave Composer", "DSIK", "Face The Music",
+    # (libopenmpt, also under other names)
+    "Astroidea XMF", "Digital Symphony", "Digital Tracker", "X-Tracker", "DSMI Compact", "Software Visions",
+    "Digitrakker", "Unreal Music", "Epic MegaGames MASI", "Galaxy Music System", "MO3",
+    "OggMod", "OpenMPT MPTM", "Real Tracker", "STMIK", "Poly Tracker", "ProTracker IFF",
+    "ChipTracker",
+    # (xmprender: libxmp, and the packed modules core.prowizard converts)
+    "Archimedes Tracker", "Coconizer", "FlexTrax", "Funktracker", "Liquid Tracker",
+    "Megatracker", "Titanics Player", "STIM", "The Dark Demon", "Eureka Packer",
 }
+from soniqboom.core import prowizard as _prowizard  # noqa: E402  (pure: no package imports)
+_TRACKER |= set(_prowizard.FORMATS)
 _AHX = {"AHX", "HivelyTracker"}                       # Amiga synth (not sample)
 _ADLIB = {
     "AdLib IMF", "AdLib ROL", "Creative Music", "EdLib", "Reality AdLib",
@@ -39,13 +49,24 @@ _ADLIB = {
 }
 _ATARI = {"SNDH", "YM", "SC68"}                       # Atari ST YM2149
 _PSF = {"PSF", "PSF2", "USF", "GSF", "2SF", "SSF", "DSF (Dreamcast)", "NCSF"}
-_SID = {"SID"}
+_SID = {"SID", "GoatTracker", "C64 Sidplayer"}   # (GoatTracker 2 songs play as SID tunes)
 _MIDI = {"MIDI", "General MIDI"}
 # Distinct single-chip console/computer formats — each its OWN family.
 _SINGLE = {
     "NSF": "nes", "NSFe": "nes", "SPC": "snes", "GBS": "gameboy",
     "AY": "ay", "KSS": "ay", "SAP": "pokey", "GYM": "genesis",
     "HES": "pce", "VGM": "vgm", "VGZ": "vgm",
+    # zxtune123: S98 FM / PSG register dumps (PC-98, X68000 …), Farbrausch V2
+    # (a software synth)
+    "S98": "s98", "V2M": "v2",
+    # mdxrender: Sharp X68000 (YM2151 OPM + MSM6258 ADPCM)
+    "MDX": "x68000",
+    # Furnace: FamiTracker (NES 2A03 + expansion chips), DefleMask (the chips
+    # of several consoles: a family of its own); kssrender: MGSDRV (MSX PSG / FM
+    # / SCC, as KSS); sunvoxrender: SunVox (a software synth)
+    "FamiTracker": "nes", "DefleMask": "deflemask", "MGSDRV": "ay", "SunVox": "sunvox",
+    # sawteethrender: Sawteeth (a software-synth tracker, no chip)
+    "Sawteeth": "sawteeth",
 }
 
 
@@ -90,7 +111,7 @@ _AMIGA_EXOTICA = frozenset({
     "Tronic", "Amiga Custom", "Sonix Music Driver", "Forgotten Worlds Game",
     "Speedy System", "Jochen Hippel", "Jochen Hippel ST", "Hippel-COSO",
     "Sonic Arranger", "Mike Davies", "AMOS", "Ashley Hogg", "Ben Daglish",
-    "Benn Daglish", "David Whittaker", "Rob Hubbard", "TFMX Pro", "SoundMon 2.0",
+    "Benn Daglish", "Ben Daglish SID", "Benn Daglish SID", "David Whittaker", "Rob Hubbard", "TFMX Pro", "SoundMon 2.0",
     "DeltaMusic 2.0", "FredMonitor", "Amiga",
     # Amiga Paula formats whose scanner NAME matches neither uade's runtime label
     # table nor the list above (observed in a real library falling through to
@@ -143,8 +164,9 @@ def chip_family(fmt: str | None) -> str | None:
 # — covers the DSD quality tiers DSD64/128/256/512, WavPack, TTA — imported
 # lazily in coarse_family so this never re-declares/drifts from it).  Every other
 # chip_family==None format the scanner can stamp is recorded LOSSY audio.
-_LOSSY_NAMES = frozenset({"MP3", "AAC", "Ogg Vorbis", "Opus", "Musepack", "M4A", "WMA",
-                          "MP2", "MP1", "MPEG audio"})       # (Aminet's .mpg uploads)
+_LOSSY_NAMES = frozenset({"MP3", "AAC", "Ogg Vorbis", "Opus", "Musepack", "M4A", "WMA", "WMA Pro",
+                          "MP2", "MP1", "MPEG audio",      # (Aminet's .mpg uploads)
+                          "AC-3", "E-AC-3", "DTS", "DTS-HD HRA"})
 # fine chip_family -> coarse family.  Anything chip-ish not listed defaults to
 # chiptune (a new console chip should read as chiptune, never leak to "other").
 _COARSE_BY_CHIP = {
@@ -156,6 +178,8 @@ _COARSE_BY_CHIP = {
     "atari": "chiptune",            # Atari ST YM2149 PSG (YM/SNDH/SC68)
     "sid": "chiptune",              # C64 MOS 6581/8580
     "psf": "chiptune",              # sequenced console rips (PS1/N64/GBA/DS/…)
+    "sunvox": "trackers",           # SunVox: a modular-synth tracker (patterns of
+                                    # synth and sampler modules), no chip
     "midi": "other",                # no fixed sound source
 }
 
@@ -167,7 +191,7 @@ def coarse_family(fmt: str | None) -> str:
     Derived purely from the format NAME (via :func:`chip_family` plus a PCM
     compression name set), so ``/api/library/formats`` can label every format
     without touching individual tracks.  trackers = classic sample-based module
-    trackers; chiptune = every synth/chip/console/Amiga-exotica format; lossless
+    trackers, and SunVox (a modular-synth tracker with no chip); chiptune = every synth/chip/console/Amiga-exotica format; lossless
     / lossy = modern PCM split by compression; other = MIDI and anything with no
     fixed sound source.  A retro/chip family not in the table still resolves to
     chiptune (never "other")."""

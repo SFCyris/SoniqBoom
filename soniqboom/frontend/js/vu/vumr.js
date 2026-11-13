@@ -186,7 +186,7 @@ export function fftColumnLevels(bins, n, out) {
 export function vuFallbackText(format, reason, isAdmin = false) {
   if (reason === 'off') {
     return isAdmin
-      ? 'Spectrum — per-voice meters are turned off (Settings → Renderers)'
+      ? 'Spectrum — per-voice meters are turned off (gear → Renderers → Playback preparation)'
       : 'Spectrum — per-voice meters are turned off on this server';
   }
   if (reason === 'skipped') return 'Spectrum — per-voice meters not available for this tune';

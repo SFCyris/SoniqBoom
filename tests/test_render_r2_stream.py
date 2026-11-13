@@ -72,7 +72,8 @@ def _unregister(*keys: str) -> None:
 # ── r2-ren-1: exact lengths up to an hour; render-status length fields ──────
 
 def test_expected_seconds_are_capped_by_audio_length_not_the_render_timeout():
-    t = types.SimpleNamespace
+    def t(**kw):
+        return types.SimpleNamespace(duration_rev=stream._uade_render_rev(), **kw)
     assert stream._uade_expected_seconds(t(duration=512.0), 0) == 512.0   # uade's loop cap
     assert stream._uade_expected_seconds(t(duration=3600.0), 0) == 3600.0
     assert stream._uade_expected_seconds(t(duration=3601.0), 0) == 0.0
@@ -103,7 +104,7 @@ async def test_a_512s_tune_streams_with_an_exact_length(monkeypatch, tmp_path):
 async def test_render_status_reports_provisional_and_the_exact_length(monkeypatch, tmp_path):
     app, _ = _app(monkeypatch, tmp_path, {"rsp": _T("rsp", "/x/a.dw", 0.0)})
     ev = asyncio.Event()
-    stream._UADE_LIVE["rsp__sub0"] = {"complete": ev, "expected_size": 0,
+    stream._UADE_LIVE["rsp__sub0__r2"] = {"complete": ev, "expected_size": 0,
                                       "bytes": stream._UADE_BYTES_PER_SEC * 2,
                                       "audible": True}
     try:
@@ -114,20 +115,20 @@ async def test_render_status_reports_provisional_and_the_exact_length(monkeypatc
             # tune 2 is not the one rendering
             j2 = (await c.get("/api/stream/rsp/render-status?subsong=2")).json()
             assert j2["provisional"] is False
-            stream._UADE_LIVE["rsp__sub0"]["expected_size"] = 1000   # known length
+            stream._UADE_LIVE["rsp__sub0__r2"]["expected_size"] = 1000   # known length
             assert (await c.get("/api/stream/rsp/render-status")).json()["provisional"] is False
             ev.set()
-            stream._UADE_LIVE.pop("rsp__sub0")
+            stream._UADE_LIVE.pop("rsp__sub0__r2")
             wav = _wav(tmp_path / "rsp.wav", 123.4)
-            _register("rsp__sub0", wav)
+            _register("rsp__sub0__r2", wav)
             j = (await c.get("/api/stream/rsp/render-status")).json()
             assert j["state"] == "complete" and j["provisional"] is False
             assert abs(j["duration_seconds"] - 123.4) < 1e-3
             assert "duration_seconds" not in (
                 await c.get("/api/stream/rsp/render-status?subsong=1")).json()
     finally:
-        stream._UADE_LIVE.pop("rsp__sub0", None)
-        _unregister("rsp__sub0")
+        stream._UADE_LIVE.pop("rsp__sub0__r2", None)
+        _unregister("rsp__sub0__r2")
 
 
 # ── r2-ren-2: Subsonic codec / bitrate requests answer at once ──────────────
@@ -849,12 +850,13 @@ def test_subsong_index_maps_onto_the_modules_numbering():
     assert stream._uade_subsong_arg(1, 1) == ["--subsong=2"]
     assert stream._uade_subsong_arg(2, 1) == ["--subsong=3"]
     assert stream._uade_subsong_arg(3, 0) == ["--subsong=3"]
-    # keys change only for tune N > 0 of a module numbered from 1
-    assert stream.uade_cache_key("x", 0, 1) == "x__sub0"
-    assert stream.uade_cache_key("x", 2, 0) == "x__sub2"
-    assert stream.uade_cache_key("x", 2, 1) == "x__sub2__vb1"
-    assert conversion_cache.key_matches("x__sub2__vb1", "x", 2)
-    assert not conversion_cache.key_matches("x__sub2__vb1", "x", 1)
+    # keys change only for tune N > 0 of a module numbered from 1 (after the
+    # uade render revision, ``r2``)
+    assert stream.uade_cache_key("x", 0, 1) == "x__sub0__r2"
+    assert stream.uade_cache_key("x", 2, 0) == "x__sub2__r2"
+    assert stream.uade_cache_key("x", 2, 1) == "x__sub2__r2__vb1"
+    assert conversion_cache.key_matches("x__sub2__r2__vb1", "x", 2)
+    assert not conversion_cache.key_matches("x__sub2__r2__vb1", "x", 1)
 
 
 @needs_uade
@@ -903,12 +905,12 @@ async def test_serve_uses_the_base_in_the_key_and_the_render(monkeypatch, tmp_pa
         async with _client(app) as c:
             r = await c.get("/api/stream/sb1?subsong=2&u=a&p=b")
         assert r.status_code == 200
-        assert seen == {"key": "sb1__sub2__vb1", "base": 1}
-        assert "sb1__sub2__vb1" in conversion_cache._meta
-        assert stream._UADE_VU_WANTED["sb1__sub2"][4] == "sb1__sub2__vb1"
+        assert seen == {"key": "sb1__sub2__r2__vb1", "base": 1}
+        assert "sb1__sub2__r2__vb1" in conversion_cache._meta
+        assert stream._UADE_VU_WANTED["sb1__sub2__r2"][4] == "sb1__sub2__r2__vb1"
     finally:
-        _unregister("sb1__sub2__vb1")
-        stream._UADE_VU_WANTED.pop("sb1__sub2", None)
+        _unregister("sb1__sub2__r2__vb1")
+        stream._UADE_VU_WANTED.pop("sb1__sub2__r2", None)
 
 
 # ── r2-ren-15: per-page prewarm owners ──────────────────────────────────────

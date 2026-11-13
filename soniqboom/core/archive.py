@@ -33,7 +33,7 @@ import zipfile
 
 from soniqboom.core import forksafe
 from soniqboom.core import lha as _lha
-from soniqboom.core.metadata import SUPPORTED_EXTENSIONS
+from soniqboom.core.metadata import OPENMPT_EXTRA_EXTS, SUPPORTED_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,10 @@ def _extend_amiga_prefix_map() -> None:
 
 _extend_amiga_prefix_map()
 _EXT_SET = {e.lower() for e in SUPPORTED_EXTENSIONS}
-if ".ftm" in _EXT_SET:                 # Face The Music, where libopenmpt reads it
+# ``.ftm`` is always listed (FamiTracker modules play — Furnace); Face The
+# Music only where libopenmpt reads it.
+_FTM_OPENMPT = ".ftm" in OPENMPT_EXTRA_EXTS
+if _FTM_OPENMPT:                       # Face The Music's prefix naming (FTM.title)
     _AMIGA_PREFIX_EXT.setdefault("ftm", ".ftm")
 
 # Documentation/text suffixes that never hold music even under a music prefix
@@ -130,9 +133,14 @@ class _LhaCliArchive:
             shutil.rmtree(self._dir, ignore_errors=True)
             raise
         self._files: dict[str, str] = {}
+        root = os.path.realpath(self._dir)
         for dp, _dirs, fns in os.walk(self._dir):
             for fn in fns:
                 full = os.path.join(dp, fn)
+                # (lhasa extracts an archive's symlinks too — never a member:
+                # one would read whatever file it points at)
+                if os.path.islink(full) or not os.path.realpath(full).startswith(root + os.sep):
+                    continue
                 self._files[os.path.relpath(full, self._dir)] = full
 
     def namelist(self):
@@ -270,7 +278,7 @@ _PREFIX_SIGNATURE = {
     ".mtm": lambda h: h[:3] == b"MTM",
     ".stm": lambda h: h[20:28] in (b"!Scream!", b"BMOD2STM", b"WUZAMOD!"),
     ".sid": lambda h: h[:4] in (b"PSID", b"RSID"),
-    ".ftm": lambda h: _ftm_with_samples(h),
+    ".ftm": lambda h: _FTM_OPENMPT and _ftm_with_samples(h),
 }
 # Signatures of the suffix formats (a member that carries one keeps its name
 # reading even when a prefix signature matched by chance).
@@ -377,6 +385,12 @@ def _display_name(real: str) -> str | None:
     if not base:
         return None
     ext = os.path.splitext(base)[1].lower()
+    if ext in _PREFIX_FIRST_EXTS and "." in base[:-len(ext)]:
+        # (a uade prefix name ending in a suffix only a newer format uses —
+        # ``jam.title.st``: named as it was before that format, by its prefix)
+        amap = _AMIGA_PREFIX_EXT.get(base.split(".", 1)[0].lower())
+        if amap:
+            return real + amap
     if ext in _EXT_SET:
         return real                        # already suffix-named
     if "." in base and ext not in _NON_MUSIC_EXTS:
@@ -477,14 +491,53 @@ def _cached_open(key, local_path):
 # member already has (a name-recognised member keeps its name).
 _SNIFF_ORDER = (".mod", ".med", ".okt", ".ftm", ".xm", ".s3m", ".it", ".dbm", ".stm",
                 ".ahx", ".hvl", ".sid")
+def _ftm_plays(head: bytes) -> bool:
+    """Is ``head`` a ``.ftm`` module this host plays: a FamiTracker module
+    (Furnace), or a Face The Music module with its samples where libopenmpt
+    reads the format?"""
+    return head[:18] == b"FamiTracker Module" or (_FTM_OPENMPT and _ftm_with_samples(head))
+
+
 _SNIFF_EXTRA = {                       # (stricter than the prefix check)
     ".ahx": lambda h: h[:3] == b"THX" and h[3:4] in (b"\0", b"\1"),
     ".hvl": lambda h: h[:3] == b"HVL" and h[3:4] in (b"\0", b"\1"),
+    ".ftm": _ftm_plays,
 }
-# Suffix-named members whose extension another format shares: listed only
-# when their bytes (where readable) are the format SoniqBoom plays —
-# FamiTracker saves ``.ftm`` too.
-_SUFFIX_VERIFY = {".ftm": lambda h: _ftm_with_samples(h)}
+def _dmf_plays(head: bytes) -> bool:
+    """Is ``head`` a ``.dmf`` module this host plays: a DefleMask module
+    (Furnace), or any other where libopenmpt reads the suffix (X-Tracker,
+    DSMI, Software Visions — told apart by libopenmpt)?"""
+    from soniqboom.core.metadata import is_deflemask_module
+    return ".dmf" in OPENMPT_EXTRA_EXTS or is_deflemask_module(head)
+
+
+def _st_plays(head: bytes) -> bool:
+    """Is ``head`` a ``.st`` file this host plays: a Sawteeth song?"""
+    from soniqboom.core.metadata import is_sawteeth_song
+    return is_sawteeth_song(head)
+
+
+# Suffix-named members whose extension two formats share: listed only when
+# their bytes (where readable) are one SoniqBoom plays here (``_ftm_plays``,
+# ``_dmf_plays``, ``_st_plays``).
+_SUFFIX_VERIFY = {".ftm": _ftm_plays, ".dmf": _dmf_plays, ".st": _st_plays}
+
+
+# Suffixes newly supported (Sawteeth's ``.st``; DefleMask's ``.dmf`` where
+# libopenmpt doesn't read it) that a member already listed by its uade prefix
+# name keeps being listed by (``_display_name``).
+_PREFIX_FIRST_EXTS = frozenset({".st"} | ({".dmf"} if ".dmf" not in OPENMPT_EXTRA_EXTS else set()))
+# Shared suffixes a uade PREFIX-named Amiga module may also end in
+# (``jam.title.st``, SynTracker's ``st.title`` listed as ``st.title.st``,
+# ``bp.title.dmf``): such a member is uade's to check, never refused for not
+# being a Sawteeth song / DefleMask module.
+_PREFIX_NAMES_EXEMPT = frozenset({".st", ".dmf"})
+
+
+def _uade_prefix_named(base: str) -> bool:
+    """Does the member name ``base`` name an Amiga player by its prefix?"""
+    from soniqboom.core import uade_formats as _uf
+    return _uf.classify(base) is not None
 
 
 def _base_of(real: str) -> str:
@@ -516,7 +569,8 @@ def sniff_ext(head: bytes) -> str | None:
 def rejected_by_bytes(real: str, display: str, head_of) -> bool:
     """Is member ``real``, listed as ``display``, one no reading of it plays,
     by its readable first bytes?  A name whose format another one shares
-    (``_SUFFIX_VERIFY``: FamiTracker's ``.ftm``) holding the other format; or
+    (``_SUFFIX_VERIFY``: FamiTracker's ``.ftm``, DefleMask's ``.dmf``)
+    holding the other format; or
     any reading of a Face The Music module saved without its samples
     (``FTM.title`` read as ``.ftm`` — or as the uade format its suffix
     names, ``FTM.One``): libopenmpt loads no such module."""
@@ -536,6 +590,8 @@ def rejected_by_bytes(real: str, display: str, head_of) -> bool:
         return False
     if head[:4] == b"FTMN" and not _ftm_with_samples(head):
         return True
+    if check is not None and ext in _PREFIX_NAMES_EXEMPT and _uade_prefix_named(base):
+        return False                       # (an Amiga module's name: uade's content check)
     return check is not None and not check(head)
 
 
@@ -823,8 +879,7 @@ _PICTURE_EXTS = {".iff", ".ilbm", ".lbm", ".gif", ".png", ".jpg", ".jpeg", ".bmp
 # (test, key, extension that would make it playable here or None).
 _FOREIGN_TUNES = (
     (lambda h: h[:4] == b"FTMN" and not _ftm_with_samples(h), "ftm_nosamples", None),
-    (lambda h: h[:4] == b"FTMN", "ftm", ".ftm"),
-    (lambda h: h[:18] == b"FamiTracker Module", "famitracker", None),
+    (lambda h: h[:4] == b"FTMN", "ftm", ".ftm" if _FTM_OPENMPT else None),
     (lambda h: h[:4] == b"SymM", "symphonie", None),
     (lambda h: h[:20] == b"DIGI Booster module\0", "digibooster", None),
 )
@@ -835,8 +890,6 @@ _FOREIGN_WORDS = {
                       "which libopenmpt doesn't load"),
     "ftm": ("a Face The Music module", "{n} Face The Music modules",
             "which this server's libopenmpt doesn't play"),
-    "famitracker": ("a FamiTracker module", "{n} FamiTracker modules",
-                    "a format SoniqBoom doesn't play"),
     "symphonie": ("a Symphonie module", "{n} Symphonie modules",
                   "a format SoniqBoom doesn't play"),
     "digibooster": ("a DigiBooster 2 module", "{n} DigiBooster 2 modules",

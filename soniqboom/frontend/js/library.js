@@ -2253,12 +2253,11 @@ tbody.addEventListener('dblclick', (e) => {
   if (Number.isFinite(i)) playFrom(i);
 });
 
-tbody.addEventListener('contextmenu', (e) => {
-  const tr = _rowFromEvent(e);
-  if (!tr) return;
+// Opens the track menu for row ``tr`` at (x, y) — a right-click, or a long
+// press on a touch screen (``touch``).  False when the row holds no track.
+function _openRowMenu(tr, x, y, touch = false) {
   const i = parseInt(tr.dataset.idx, 10);
-  if (!Number.isFinite(i)) return;
-  e.preventDefault();
+  if (!Number.isFinite(i)) return false;
   // Right-clicking an UNselected row selects just it; right-clicking a row
   // that's already part of a multi-selection keeps the whole selection so the
   // menu acts on all of them.
@@ -2266,8 +2265,86 @@ tbody.addEventListener('contextmenu', (e) => {
     _selected.clear(); _selected.add(i); _lastClickIdx = i;
     selectRow(tr, i); _refreshSelectionClasses(); _updateSelectionBar();
   }
-  _showTrackContextMenu(e.clientX, e.clientY, i);
+  _showTrackContextMenu(x, y, i, { touch });
+  return !!_ctxMenu;
+}
+
+tbody.addEventListener('contextmenu', (e) => {
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  if (!Number.isFinite(parseInt(tr.dataset.idx, 10))) return;
+  e.preventDefault();
+  // (Android and Windows send contextmenu for a long press as well — while
+  // the finger is down or as it lifts: whichever comes first opens the menu,
+  // the other is dropped.)
+  _lpCancel();
+  if (_lpEcho && (_lpDown || performance.now() - _lpEndAt < LP_ECHO_MS)) { _lpEcho = false; return; }
+  _lpEcho = false;
+  // (under a finger still down: its lift is not a tap on the menu)
+  if (_openRowMenu(tr, e.clientX, e.clientY, _lpDown) && _lpDown) _lpHeld = true;
 });
+
+// ── Touch: a long press on a row opens its menu ──────────────────────────────
+// iOS Safari sends no contextmenu for a long press, so a touch screen had no
+// way to the menu (Play next, Add to playlist, the rating, Get info).  One
+// finger held half a second without moving opens it at the finger; a moving
+// finger (a scroll) or a second finger before then calls it off.
+const LP_MS = 500, LP_SLOP = 10, LP_ECHO_MS = 1000;
+let _lpTimer = 0, _lpX = 0, _lpY = 0;
+let _lpDown = false;           // a finger is on the list
+let _lpEndAt = -Infinity;      // when it last lifted
+let _lpHeld = false;           // the finger that opened the menu is still down
+let _lpEcho = false;           // a long press opened the menu: its contextmenu, if one follows, is dropped
+let _lpRow = null;             // the touched row, not draggable while touched
+function _lpCancel() {
+  if (_lpTimer) { clearTimeout(_lpTimer); _lpTimer = 0; }
+}
+function _lpRelease() {
+  _lpCancel();
+  _lpDown = false;
+  _lpEndAt = performance.now();
+  // (rows are draggable for the mouse; see touchstart)
+  if (_lpRow) { _lpRow.setAttribute('draggable', 'true'); _lpRow = null; }
+}
+tbody.addEventListener('touchstart', (e) => {
+  _lpCancel();
+  if (e.touches.length !== 1) return;   // (a second finger: no menu, and the first one's lift stays guarded)
+  _lpHeld = false;
+  _lpEcho = false;
+  _lpDown = true;
+  const tr = _rowFromEvent(e);
+  if (!tr) return;
+  // iOS lifts a draggable element for drag-and-drop after about the same
+  // hold, and cancels the touch: under a finger the row is not draggable.
+  if (_lpRow && _lpRow !== tr) _lpRow.setAttribute('draggable', 'true');
+  _lpRow = tr;
+  tr.removeAttribute('draggable');
+  _lpX = e.touches[0].clientX;
+  _lpY = e.touches[0].clientY;
+  // (a pooled row can be handed another track while the finger rests on it)
+  const idx0 = tr.dataset.idx, id0 = tr.dataset.id;
+  _lpTimer = setTimeout(() => {
+    _lpTimer = 0;
+    if (!tr.isConnected || tr.dataset.idx !== idx0 || tr.dataset.id !== id0) return;
+    if (_openRowMenu(tr, _lpX, _lpY, true)) { _lpHeld = true; _lpEcho = true; }
+  }, LP_MS);
+}, { passive: true });
+tbody.addEventListener('touchmove', (e) => {
+  if (!_lpTimer) return;
+  const t = e.touches[0];
+  if (e.touches.length !== 1 || Math.abs(t.clientX - _lpX) > LP_SLOP || Math.abs(t.clientY - _lpY) > LP_SLOP) _lpCancel();
+}, { passive: true });
+tbody.addEventListener('touchend', (e) => {
+  if (e.touches.length) return;          // (another finger is still down)
+  _lpRelease();
+  // The lifted finger would be read as a tap: a mousedown that closes the menu
+  // just opened, and a click on the row or the menu item under it.
+  if (_lpHeld) { _lpHeld = false; if (e.cancelable) e.preventDefault(); }
+}, { passive: false });
+tbody.addEventListener('touchcancel', () => { _lpRelease(); _lpHeld = false; });
+// (a touch whose row left the page ends unseen: a mouse press starts afresh)
+tbody.addEventListener('mousedown', () => { _lpHeld = false; });
+_listWrap.addEventListener('scroll', _lpCancel, { passive: true });
 
 // ── Track context menu ────────────────────────────────────────────────────────
 let _ctxMenu = null;
@@ -2276,8 +2353,10 @@ function _closeCtxMenu() {
   _ctxMenu.remove();
   _ctxMenu = null;
   document.removeEventListener('mousedown', _onCtxOutside, true);
+  document.removeEventListener('touchstart', _onCtxOutside, true);
   document.removeEventListener('keydown', _onCtxKey, true);
   window.removeEventListener('resize', _closeCtxMenu);
+  _listWrap.removeEventListener('scroll', _closeCtxMenu);
 }
 function _onCtxOutside(e) {
   // Keep the menu open while interacting with the add-to-playlist dropdown it
@@ -2306,7 +2385,7 @@ function _ctxTargets(i) {
   return currentTracks[i] ? [currentTracks[i]] : [];
 }
 
-function _showTrackContextMenu(x, y, i) {
+function _showTrackContextMenu(x, y, i, { touch = false } = {}) {
   _closeCtxMenu();
   const t = currentTracks[i];
   if (!t) return;
@@ -2443,9 +2522,14 @@ function _showTrackContextMenu(x, y, i) {
   menu.style.visibility = 'visible';
   _ctxMenu = menu;
   document.addEventListener('mousedown', _onCtxOutside, true);
+  // (a tap elsewhere sends no mousedown on iOS unless it lands on something clickable)
+  document.addEventListener('touchstart', _onCtxOutside, { capture: true, passive: true });
   document.addEventListener('keydown', _onCtxKey, true);
   window.addEventListener('resize', _closeCtxMenu);
-  menu.querySelector('.ctx-item')?.focus();
+  // The menu is fixed: scrolled, the rows would move away under it.
+  _listWrap.addEventListener('scroll', _closeCtxMenu, { passive: true });
+  // (opened by a finger, no item is marked — focus paints it as if pressed)
+  if (!touch) menu.querySelector('.ctx-item')?.focus();
 }
 
 // Persist a rating with optimistic UI + revert-on-failure; repaints the
@@ -2571,6 +2655,9 @@ tbody.addEventListener('keydown', (e) => {
 tbody.addEventListener('dragstart', (e) => {
   const tr = _rowFromEvent(e);
   if (!tr) return;
+  // (a long press that opened the menu is not the start of a drag — iOS
+  // starts one from the same hold)
+  if (_lpHeld) { e.preventDefault(); return; }
   const i = parseInt(tr.dataset.idx, 10);
   if (!Number.isFinite(i)) return;
   e.dataTransfer.effectAllowed = 'copy';
@@ -3093,6 +3180,36 @@ function restoreFullHeader({ keepHeader = false } = {}) {
 }
 
 // ── Column visibility ──────────────────────────────────────────────────────────
+// Sets the spacer rows' span to the columns on screen; true when it changed.
+// The stylesheet hides columns too (the narrow-window @media rules), so the
+// count is read from the header cells' computed display — a span counting
+// those columns left empty ones that took their share of a phone's row.
+// ``fallback`` (the hide-col-* count) serves a header without column cells
+// (a group list's one-cell header).
+function _syncSpacerSpan(table, fallback) {
+  const ths = table.querySelectorAll('thead th[class*="col-"]');
+  let shown = 0;
+  for (const th of ths) if (getComputedStyle(th).display !== 'none') shown++;
+  if (!shown) shown = fallback;
+  if (shown === _spacerSpan) return false;
+  _spacerSpan = shown;
+  for (const td of table.querySelectorAll('tr.vs-spacer > td')) td.colSpan = shown;
+  return true;
+}
+// A window resize can cross a breakpoint that hides / shows columns.
+let _spanSyncRaf = 0;
+window.addEventListener('resize', () => {
+  if (_spanSyncRaf) return;
+  _spanSyncRaf = requestAnimationFrame(() => {
+    _spanSyncRaf = 0;
+    const table = document.getElementById('track-table');
+    if (!table || !_syncSpacerSpan(table, _spacerSpan)) return;
+    _measureThead();
+    _trackVL.remeasure();
+    _groupVL.remeasure();
+  });
+});
+
 function _applyColVisibility() {
   // Toggle ``hide-col-*`` classes on the table CONTAINER (12 class writes on one
   // element) instead of scanning + inline-styling every ``.col-*`` cell in the
@@ -3113,10 +3230,7 @@ function _applyColVisibility() {
       changed = true;
     }
   });
-  if (shown !== _spacerSpan) {
-    _spacerSpan = shown;
-    for (const td of table.querySelectorAll('tr.vs-spacer > td')) td.colSpan = shown;
-  }
+  if (_syncSpacerSpan(table, shown)) changed = true;
   // A hidden / shown column (the cover above all) changes the row height.
   if (changed) {
     _measureThead();

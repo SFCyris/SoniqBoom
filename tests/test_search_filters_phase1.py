@@ -242,7 +242,8 @@ def test_length_value_forms():
 def test_format_names_for_ext():
     assert search_values.format_names_for_ext("mod") == {"protracker"}
     assert search_values.format_names_for_ext(".XM") == {"fasttracker 2"}
-    assert search_values.format_names_for_ext("m4a") == {"m4a", "aac", "alac"}
+    assert search_values.format_names_for_ext("m4a") == {"m4a", "aac", "alac", "ac-3", "e-ac-3"}
+    assert search_values.format_names_for_ext("ogg") == {"ogg vorbis", "opus"}
     assert search_values.format_names_for_ext("dsf") == {"dsd", "dsf (dreamcast)"}
     assert search_values.format_names_for_ext("imf") == {"imago orpheus", "adlib imf"}
     assert search_values.format_names_for_ext("nosuchext") is None
@@ -454,6 +455,33 @@ def test_format_exact_name_wins():
     # the exact name is the live index set (as before); an alias builds a new one
     assert s._format_ids("sid") == (s._tag_format["sid"], True)
     assert s._format_ids("trackers")[1] is False
+
+
+def test_format_groups_dts_and_dolby():
+    s = TrackStore()
+    for i, (ext, fmt) in enumerate([("dts", "DTS"), ("dts", "DTS-HD MA"), ("dts", "DTS-HD HRA"),
+                                    ("dtshd", "DTS-HD"), ("ac3", "AC-3"), ("eac3", "E-AC-3"),
+                                    ("m4a", "E-AC-3"), ("thd", "TrueHD"), ("mlp", "MLP"),
+                                    ("flac", "FLAC")]):
+        s.upsert_track({"id": f"t{i}", "path": f"/m/{i}.{ext}", "format": fmt, "added_at": i + 1})
+    q = lambda text: s.result_ids(**search_predicates(text))
+    assert q("format:dts") == {"t0", "t1", "t2", "t3"}
+    assert q('format:"DTS-HD"') == {"t1", "t2", "t3"}
+    assert q('format:"DTS-HD MA"') == {"t1"}
+    assert q('format:"dts-hd hra"') == {"t2"}
+    assert q("format:dolby") == {"t4", "t5", "t6", "t7"}                  # (MLP is no Dolby format)
+    assert q('format:"E-AC-3"') == {"t5", "t6"}
+    assert q("type:dolby") == q("format:dolby")
+    assert q("format:dts,flac") == {"t0", "t1", "t2", "t3", "t9"}
+    assert not q("-format:dolby") & {"t4", "t5", "t6", "t7"}
+    # a group with none of its formats in the library: nothing, not everything
+    empty = TrackStore()
+    empty.upsert_track({"id": "f", "path": "/m/f.flac", "format": "FLAC", "added_at": 1})
+    assert empty.result_ids(**search_predicates("format:dolby")) == set()
+    # without a plain "DTS" track, format:dts still finds the DTS-HD ones
+    hd = TrackStore()
+    hd.upsert_track({"id": "h", "path": "/m/h.dts", "format": "DTS-HD MA", "added_at": 1})
+    assert hd.result_ids(**search_predicates("format:dts")) == {"h"}
 
 
 def test_album_page_stays_exact():

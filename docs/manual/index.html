@@ -84,7 +84,7 @@
     <figure>
       <div class="frame">
         <div class="chrome"><i></i><i></i><i></i></div>
-        <img src="img/01-library.png" alt="The SoniqBoom library view in the Modern style: All Tracks listing tunes of many formats with their format labels, and the player bar playing a 22-channel FastTracker 2 module with a level bar for each channel">
+        <img src="img/01-library.png" alt="The SoniqBoom library view in the Modern style: All Tracks listing tunes of many formats with their format labels, and the player bar playing a 20-channel FastTracker 2 module with a level bar for each channel">
       </div>
       <figcaption>The <b>library</b> — a six-figure collection, every track tagged with its true format.</figcaption>
     </figure>
@@ -100,7 +100,7 @@
       <div class="card"><span class="ico">💾</span><h4>Amiga &amp; Atari exotica</h4><p>About 175 UADE players — TFMX, Future Composer, Jochen Hippel, SidMon — plus AHX, HivelyTracker and Atari ST SNDH / YM / SC68.</p></div>
       <div class="card"><span class="ico">🕹️</span><h4>Portable &amp; console rips</h4><p>The PSF family in full — PSF, PSF2, GSF, USF, 2SF, SSF, DSF and NCSF — straight from the reference emulation cores.</p></div>
       <div class="card"><span class="ico">🟥</span><h4>AdLib / OPL FM</h4><p>The sound of DOS gaming — id Software IMF, ROL, CMF and more, played by AdPlug with the Nuked OPL3 emulator.</p></div>
-      <div class="card"><span class="ico">🎵</span><h4>Lossless &amp; DSD</h4><p>FLAC, ALAC, WAV, AIFF, WavPack — plus 1-bit DSD (DSF / DFF / WSD) and the common lossy codecs: MP3, AAC, Ogg Vorbis, Opus and Musepack.</p></div>
+      <div class="card"><span class="ico">🎵</span><h4>Lossless &amp; DSD</h4><p>FLAC, ALAC, WAV, AIFF, WavPack — plus 1-bit DSD (DSF / DFF / WSD), the common lossy codecs — MP3, AAC, Ogg Vorbis, Opus and Musepack — and Dolby Digital, DTS and Dolby TrueHD surround.</p></div>
       <div class="card"><span class="ico">🌌</span><h4>Visual library</h4><p>Per-channel VU meters, a live spectrum fallback, an animated decode signal-chain, and the Library Galaxy star-field.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Scene origins</h4><p>Retro modules matched by fingerprint against Modland fill in the original scene author and the tune's provenance path.</p></div>
       <div class="card"><span class="ico">🗄️</span><h4>Network libraries</h4><p>Attach FTP, SMB and WebDAV shares and web folders straight from the admin panel — no operating-system mount required.</p></div>
@@ -135,7 +135,7 @@ bash <span class="k">run.sh</span>            <span class="c"># starts the serve
     <div class="note"><b>The installer sets up every renderer for you.</b> One run of
       <code>install.sh</code> installs <code>sidplayfp</code> (SID), <code>fluidsynth</code> (MIDI),
       <code>libopenmpt</code> (trackers), <code>uade</code> (AHX + Amiga exotica), <code>libgme</code> (console
-      chiptunes), <code>adplay</code> (AdLib/OPL), the Atari ST renderers (<code>psgplay</code> and <code>sc68</code>), <code>zxtune123</code> (the PSF console-rip family, MED&nbsp;2–4 modules and VGM files that use a chip libgme lacks) and <code>kssrender</code> (MSX KSS music, built from the libkss sources on every system; it needs a C compiler and git) — Homebrew packages and source builds on macOS; on
+      chiptunes), <code>adplay</code> (AdLib/OPL), the Atari ST renderers (<code>psgplay</code> and <code>sc68</code>), <code>zxtune123</code> (the PSF console-rip family, S98 and Farbrausch V2 files, MED&nbsp;2–4 modules and VGM files that use a chip libgme lacks), <code>kssrender</code> (MSX KSS music and MGSDRV songs, built from the libkss sources and the MGSDRV driver on every system; it needs a C compiler, git and curl), <code>dsfrender</code> (Sega Dreamcast and Naomi DSF rips, built from the Highly Theoretical and psflib sources on every system; it needs a C compiler, git and zlib), <code>milkyrender</code> (early Digital Sound Interface Kit <code>.dsm</code> modules, built from the MilkyPlay sources on every system; it needs a C++ compiler and git), <code>mlrender</code> (Musicline Editor tunes uade renders only as silence, built from the musicline_playback sources on every system; it needs a C++ compiler and git), <code>mdxrender</code> (Sharp X68000 MDX songs, built from the portable_mdx sources on every system; it needs a C and C++ compiler and git), <code>gt2reloc</code> (GoatTracker songs, built from the GoatTracker sources on every system; it needs a C and C++ compiler and SDL&nbsp;1.2's headers), <code>sunvoxrender</code> (SunVox projects, built from the SunVox Library sources on every system; it needs make, a C and C++ compiler, curl and unzip, and on Linux the ALSA and JACK headers), <code>furnace-headless</code> (FamiTracker and DefleMask modules, built from the Furnace sources on every system; it needs CMake, a C and C++17 compiler, git and zlib's headers), <code>xmprender</code> (the modules only libxmp plays and the packed Amiga modules SoniqBoom converts, built from the libxmp sources on every system; it needs CMake, a C compiler and curl) and <code>sawteethrender</code> (Sawteeth songs, compiled from SoniqBoom's own source on every system; it needs a C compiler) — Homebrew packages and source builds on macOS; on
       Linux your distribution's packages (apt, dnf, pacman or zypper), the prebuilt <code>zxtune123</code> and
       source builds of <code>psgplay</code>, <code>uade</code> and <code>sc68</code> where the distribution has none, plus
       <code>lha</code> from lhasa for LHA archives where the distribution packages it. On Linux, <code>sidplayfp</code>
@@ -301,7 +301,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        reversed) and orders equal values the same way every time, so a list sorts the same whatever its size and
        wherever it was opened from. Year and Duration sort by the number, with tracks that have none last; Track sorts
        by disc and then track number, with tracks that have no track number last; Location sorts by the file's path.
-       Right-click the header row to choose the columns (#, Cover, Title, Album Artist, Artist, Album, Track, Year,
+       Right-click the header row to choose the columns (#, Cover, Title, Album Artist, Artist, Album, Compo, Track, Year,
        Duration, Type, Location and ★ — Location starts hidden), and drag a header's edge to change its width. A
        list of more than 5,000 tracks, such as All Tracks in a big library, sorts by Title, Album Artist, Artist,
        Album, Year, Duration or Type; a folder of more than 2,000 tracks, or one listing every track below it, keeps
@@ -389,7 +389,8 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        you are.
        <span class="kbd">Esc</span> closes the preview and <b>×</b> clears the box. The first time you click into the empty box, the common operators (<code>artist:</code>,
        <code>album:</code>, <code>game:</code>, <code>year:</code>, <code>format:</code>, <code>added:</code>,
-       <code>length:</code>, <code>rating:</code>) show as chips you can click. Narrow it with field operators — stack
+       <code>length:</code>, <code>rating:</code>, <code>folder:</code>, <code>status:</code>, <code>source:</code>,
+       <code>bpm:</code>, <code>has:</code>) show as chips you can click. Narrow it with field operators — stack
        as many as you like, and put <code>-</code> in front of one to leave its matches out:</p>
     <pre><span class="a">artist:</span>Ghost  <span class="a">album:</span>Impera  <span class="a">year:</span>&gt;2020  <span class="a">format:</span>FLAC  <span class="a">-</span>live</pre>
     <p>Every operator, with examples, is listed under <a href="#search-options">Search options</a> below.</p>
@@ -416,7 +417,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
         <tr><td><code>game:</code></td><td>A game: matches the start of any name of a track's game — for a retro tune the names its file header, Modland, Demozoo, the song database, a Modland file name, its archive's name and its folder name give it, or an album you set; for any other music file its GAME tag; or a game you typed — and, for a C64 SID or Atari ST tune whose game is unknown or only taken from its folder name or a Modland file name — not one you typed or cleared — the start of its title; case, accents, extra spaces and a leading “The” are ignored — <code>game:uridium</code> finds the game “Uridium” and a SID titled “Uridium 2”, <code>game:"last ninja"</code> also finds “The Last Ninja”, <code>game:"the last ninja"</code> also finds “Last Ninja 2”, and <code>game:pokemon</code> also finds “Pokémon Gold”.</td></tr>
         <tr><td><code>year:2003</code> · <code>year:&gt;2020</code> · <code>year:&lt;2000</code> · <code>year:&gt;=2020</code> · <code>year:&lt;=1999</code> · <code>year:1985-1990</code> · <code>year:2000-</code> · <code>year:-1990</code></td><td>Exact year, after a year, before a year (<code>year:&lt;2000</code> is up to 1999), from / up to and including a year, or a range — open at either end. Spaces around <code>&gt;</code> or the dash are fine (<code>year: 1990 - 2000</code>).</td></tr>
         <tr><td><code>track:3</code> · <code>track:1-5</code> · <code>track:&gt;10</code> · <code>track:&lt;=4</code> · <code>track:5-</code> · <code>disc:2</code></td><td>The track number or the disc number (<code>disk:</code> works the same as <code>disc:</code>), in the same forms as <code>year:</code> — <code>disc:2 track:3</code> finds track 3 of disc 2 of every album; <code>track:3/12</code> reads as <code>track:3</code>. A track without a track (or disc) number in its tags never matches.</td></tr>
-        <tr><td><code>format:FLAC</code> · <code>format:"FastTracker 2"</code> · <code>format:mod</code> · <code>format:chiptune</code></td><td>A format, named as in the Type column (case ignored; <code>type:</code> works the same). A value that is no format name is read as a file extension — <code>format:mod</code> finds ProTracker modules, <code>format:xm</code> FastTracker 2, <code>format:m4a</code> AAC and ALAC, <code>format:dsf</code> DSD files of every tier (<code>.dsf</code>, <code>.dff</code>, <code>.wsd</code>) and Dreamcast DSF — and otherwise as a family, as in the <a href="#library">Library Galaxy</a>: <code>format:tracker</code> (or <code>trackers</code>), <code>format:chiptune</code>, <code>format:lossless</code>, <code>format:lossy</code>, <code>format:other</code>. A format name always wins: <code>format:sid</code> is the SID format, <code>format:dsd64</code> one DSD tier, and <code>format:dsd</code> every DSD tier.</td></tr>
+        <tr><td><code>format:FLAC</code> · <code>format:"FastTracker 2"</code> · <code>format:mod</code> · <code>format:chiptune</code></td><td>A format, named as in the Type column (case ignored; <code>type:</code> works the same). A value that is no format name is read as a file extension — <code>format:mod</code> finds ProTracker modules, <code>format:xm</code> FastTracker 2, <code>format:m4a</code> AAC and ALAC, <code>format:dsf</code> DSD files of every tier (<code>.dsf</code>, <code>.dff</code>, <code>.wsd</code>) and Dreamcast DSF — and otherwise as a family, as in the <a href="#library">Library Galaxy</a>: <code>format:tracker</code> (or <code>trackers</code>), <code>format:chiptune</code>, <code>format:lossless</code>, <code>format:lossy</code>, <code>format:other</code>. A format name always wins: <code>format:sid</code> is the SID format, <code>format:dsd64</code> one DSD tier, and <code>format:dsd</code> every DSD tier. Likewise <code>format:dts</code> finds DTS and both DTS-HD kinds, <code>format:"DTS-HD"</code> DTS-HD MA and DTS-HD HRA, <code>format:"DTS-HD MA"</code> only that one, and <code>format:dolby</code> Dolby Digital, Dolby Digital Plus and Dolby TrueHD (AC-3, E-AC-3, TrueHD).</td></tr>
         <tr><td><code>length:3:30</code> · <code>length:&gt;5:00</code> · <code>length:&lt;30s</code> · <code>length:3:00-4:00</code> · <code>length:&gt;=1h</code></td><td>The track's length as the Duration column shows it (whole seconds), in the same forms as <code>year:</code>. Write a length as seconds (<code>90</code> or <code>90s</code>), minutes (<code>5m</code>), hours (<code>1h</code>), <code>m:ss</code> (<code>1:30</code>) or <code>h:mm:ss</code> (<code>1:02:03</code>). <code>length:3:30</code> finds 3:30 to 3:30.99, <code>length:&lt;30s</code> finds up to 0:29, <code>length:3:00-4:00</code> finds 3:00 to 4:00.99. A track whose length is unknown never matches.</td></tr>
         <tr><td><code>added:&lt;30d</code> · <code>added:&gt;1y</code> · <code>added:2026</code> · <code>added:2026-10</code> · <code>added:2026-10-23</code> · <code>added:2026-01-2026-06</code> · <code>added:&gt;2026-06-01</code></td><td>When the track was added to the library. <code>&lt;</code> and a time counts back from now: <code>added:&lt;30d</code> is the last 30 days (<code>added:30d</code> means the same), <code>added:&gt;2w</code> longer ago than two weeks — <code>h</code> hours, <code>d</code> days, <code>w</code> weeks, <code>m</code> months (30 days), <code>y</code> years (365 days). A year, a month (<code>2026-10</code>) or a day (<code>2026-10-23</code>), in the server's time zone: that period; with <code>&gt;</code> after it, <code>&lt;</code> before it, <code>&gt;=</code> from its start, <code>&lt;=</code> up to its end; <code>2026-01-2026-06</code> from January through June, <code>2026-</code> from 2026 on, <code>-2025</code> up to the end of 2025.</td></tr>
         <tr><td><code>rating:5</code> · <code>rating:&gt;=4</code> · <code>rating:1-3</code> · <code>rating:0</code> · <code>rating:unrated</code></td><td>The track's star rating (0 to 5), in the same forms as <code>year:</code>. An unrated track counts as 0: <code>rating:0</code> and <code>rating:unrated</code> list the unrated tracks, and <code>rating:&lt;3</code> includes them — <code>rating:1-2</code> lists only rated ones. Ratings are shared by every account.</td></tr>
@@ -427,14 +428,14 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
         <tr><td><code>status:broken</code> · <code>status:glitched</code> · <code>status:cantplay</code> · <code>status:corrupt</code> · <code>status:partial</code> · <code>status:unplayable</code> · <code>status:empty</code></td><td>Tracks with that badge: <code>broken</code> and <code>glitched</code> — marked by a listener; <code>corrupt</code> — no player can read the file; <code>partial</code> — plays with some parts substituted; <code>unplayable</code> — the “can't play” badge; <code>empty</code> — the “no tunes” badge (a package that holds no tune); <code>cantplay</code> — broken, corrupt or can't play, the tracks Settings → <b>Tracks that can't be played</b> covers. With that setting on <b>Hide</b>, the search box leaves those tracks out of its results, so there <code>status:broken</code> finds them only with <b>Mark</b>.</td></tr>
         <tr><td><code>lossless:yes</code> · <code>lossless:no</code></td><td>Tracks with / without the lossless badge (FLAC, ALAC, WAV, AIFF, WavPack, DSD …). <code>lossless:no</code> also lists modules, SID tunes and every other format that isn't lossless audio.</td></tr>
         <tr><td><code>bitdepth:24</code> · <code>samplerate:&gt;48000</code> · <code>samplerate:44.1k</code> · <code>bitrate:&lt;192</code> · <code>bitrate:320</code></td><td>The bit depth, the sample rate in Hz and the bitrate in kbps as Track Info shows them, in the same forms as <code>year:</code>. A sample rate may be written in kHz: <code>44.1k</code>, <code>96khz</code>, or a number under 1000 (<code>samplerate:44.1</code> is 44,100 Hz). A track whose value is unknown never matches.</td></tr>
-        <tr><td><code>source:hvsc</code> · <code>source:aminet</code> · <code>source:sceneorg</code> · <code>source:modland</code> · <code>source:ftp</code> · <code>source:smb</code> · <code>source:webdav</code> · <code>source:share</code> · <code>source:collection</code> · <code>source:local</code></td><td>Where a track comes from: an online collection (HVSC, Aminet, scene.org — <code>source:scene.org</code> works too — or Modland), a network share by its kind (FTP, SMB, WebDAV), any network share (<code>share</code>), any online collection (<code>collection</code>), or a folder on this computer or a drive attached to it (<code>local</code>).</td></tr>
+        <tr><td><code>source:hvsc</code> · <code>source:aminet</code> · <code>source:sceneorg</code> · <code>source:modland</code> · <code>source:ftp</code> · <code>source:smb</code> · <code>source:webdav</code> · <code>source:share</code> · <code>source:collection</code> · <code>source:local</code></td><td>Where a track comes from: an online collection (HVSC, Aminet, scene.org — <code>source:scene.org</code> works too — or Modland), a network share by its kind (FTP, SMB, WebDAV — web folders count as <code>webdav</code>), any network share (<code>share</code>), any online collection (<code>collection</code>), or a folder on this computer or a drive attached to it (<code>local</code>).</td></tr>
         <tr><td><code>format:flac,alac</code> · <code>genre:metal,"hard rock"</code> · <code>-format:mp3,aac</code></td><td>Several values: any of them matches; with a <code>-</code>, each is left out.</td></tr>
         <tr><td><code>-format:mp3</code> · <code>-genre:podcast</code> · <code>-live</code> · <code>-"live at"</code></td><td>A <code>-</code> at the start of an operator or a word leaves out what it matches, the way it would match without the dash: <code>nightwish -live</code> finds Nightwish without the tracks with a word starting “live” (“Live”, “Lively”); <code>-"live at"</code> leaves out the tracks with the phrase “live at”. A search of only exclusions lists every track except those. A dash inside a word (<code>a-ha</code>, <code>x-ray</code>) or a value (<code>year:-1990</code>) is no exclusion.</td></tr>
         <tr><td><code>artist:"The Ghost Inside"</code></td><td>Quote any value containing spaces.</td></tr>
         <tr><td><code>"song of myself"</code></td><td>Quoted words in the search text are a phrase: those words next to each other, in this order, in one field — the title, artist, album artist, album, composer, scene group or game. The last word may be the start of a word (<code>"song of my</code> while you type). Without quotes the words may be anywhere.</td></tr>
         <tr><td><code>bpm:120-130</code> · <code>tunes:&gt;1</code> · <code>channels:&gt;4</code></td><td>The tempo in BPM (rounded to a whole number), the number of tunes in a file (a file without several tunes counts as one) and the number of channels — for a tracker module its channels, for a SID tune its number of SID chips — in the same forms as <code>year:</code>. A track whose value is unknown never matches.</td></tr>
         <tr><td><code>chip:6581</code> · <code>chip:8580</code> · <code>chip:2sid</code> · <code>chip:3sid</code></td><td>C64 SID tunes for the 6581 or the 8580 chip (a tune made for both matches either), or for two or three SID chips.</td></tr>
-        <tr><td><code>dup:yes</code> · <code>dup:no</code></td><td>Tracks that are / aren't one of a group of <a href="#library">duplicates</a> (the <b>Duplicates</b> smart view's groups).</td></tr>
+        <tr><td><code>dup:yes</code> · <code>dup:no</code></td><td>Tracks that are / aren't one of a group of <a href="#find">duplicates</a> (the <b>Duplicates</b> smart view's groups).</td></tr>
         <tr><td><code>has:stil</code> · <code>has:game</code></td><td>C64 SID tunes with HVSC's STIL comments / tracks with a game name.</td></tr>
       </tbody>
     </table>
@@ -699,7 +700,8 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        <em>and</em> the in-band metadata modern HLS streams carry. When a track is announced, SoniqBoom looks up
        matching cover art and shows it in place of the station logo; if there's no confident match, the station's
        own logo stays. It looks in your own library first, then on Discogs (only when a Discogs personal access
-       token is set as <code>"discogs_token"</code> in <code>SoniqBoom.conf</code>), then on MusicBrainz and the
+       token is set: gear &rarr; <strong>Metadata &rarr; Discogs</strong>, where <strong>Test token</strong> checks it with
+       Discogs, or <code>"discogs_token"</code> in <code>SoniqBoom.conf</code>, read when SoniqBoom starts), then on MusicBrainz and the
        Cover Art Archive, sending them the announced artist and title when your library has no match. To switch
        the cover lookup off, set <code>"radio_art_lookup": false</code> in <code>SoniqBoom.conf</code> and restart
        SoniqBoom. Community vote counts ride along, and playing a directory station reports the play to Radio
@@ -754,12 +756,13 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
         <img src="img/08-tracker64.jpg" alt="A 58-channel Impulse Tracker module with per-channel VU meters"></div>
       <figcaption>A <b>58-channel</b> Impulse Tracker module — its first 32 channels metered at once.</figcaption>
     </figure>
-    <div class="note">C64 SID tunes of up to ten minutes get a three-voice meter, built in the background the first
+    <div class="note">The packed Amiga modules SoniqBoom converts and Sawteeth songs get a meter per
+      channel as well. C64 SID tunes of up to ten minutes get a three-voice meter, built in the background the first
       time a tune plays (the spectrum shows until it is ready), and Amiga player formats played by UADE, AHX included, get per-voice
       meters from an extra background pass (<a href="#settings">Playback preparation</a>) for tunes of up to seven
       minutes. For formats without
-      per-voice data — HivelyTracker, console chiptunes, AdLib / OPL, Atari ST and the
-      PSF family — the meter falls back to a live 32-bin <b>FFT spectrum analyser</b>, labelled as such; MIDI files and ordinary audio files show no meter. Prefer a different look? Set
+      per-voice data — HivelyTracker, console chiptunes, AdLib / OPL, Atari ST, the
+      PSF family, the modules only libxmp plays, DefleMask and FamiTracker — the meter falls back to a live 32-bin <b>FFT spectrum analyser</b>, labelled as such; MIDI files and ordinary audio files show no meter. Prefer a different look? Set
       <b>VU meter style</b> to <b>Circuit board</b> under <strong>gear → System → Settings → Visualizations</strong>
       (<strong>gear → Preferences</strong> for accounts without admin rights) — a skin driven by the same live
       per-channel levels. In the <b>Retro hi-fi</b> <a href="#ui-style">style</a> each channel (or spectrum band) is an LED
@@ -895,7 +898,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p>One badge per row shows the most
        serious problem — red <b>can't play</b> / <b>broken</b> / <b>corrupt</b> / <b>no tunes</b> (passed by; <b>no tunes</b> is an
        archive of an online collection with no tune in it, shown where a copy of it is still on screen), amber <b>glitched</b> /
-       <b>partial</b> (plays; a Sonix module whose instrument files are missing, which play as silence) — in track
+       <b>partial</b> (plays; an archived Sonix module some of whose instrument files are missing, which play as silence — one with none of them is <b>corrupt</b>) — in track
        lists, search results, playlists, the queue, Track Info and on the phone.
        In the queue, rows that will be passed by are dimmed. Subsonic apps don't get tracks marked broken, tracks
        that can't be decoded or played or files whose default tune is short in random songs, similar songs
@@ -1011,7 +1014,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        them (beside them in a narrow window) — the times sit in small display windows, the waveform is an amber strip
        with a lit playhead, the transport and toolbar buttons are hardware keys (a lamp lights on a key that is
        switched on) and the volume is a ribbed fader. In either style, in a window 1100&nbsp;px wide or less the radio, download,
-       now-playing and cast buttons move into the toolbar's <b>⋯</b> menu, between 601 and 900&nbsp;px the
+       now-playing and cast (<span class="badge beta">Beta</span>) buttons move into the toolbar's <b>⋯</b> menu, between 601 and 900&nbsp;px the
        lyrics and playlists buttons too, and between 601 and 720&nbsp;px the equalizer button.</p>
 
     <h3>Time-synced lyrics</h3>
@@ -1272,17 +1275,28 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <table>
       <thead><tr><th>Family</th><th>Formats</th><th>Rendered by</th></tr></thead>
       <tbody>
-        <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack</td><td>native / ffmpeg</td></tr>
-        <tr><td><strong>Lossy</strong></td><td>MP3, AAC, Ogg Vorbis, Opus, Musepack</td><td>native / ffmpeg</td></tr>
+        <tr><td><strong>Lossless / PCM</strong></td><td>FLAC, ALAC (M4A), WAV, AIFF, WavPack, WMA Lossless, Amiga IFF samples (16SV, unpacked 8SVX)</td><td>native / ffmpeg</td></tr>
+        <tr><td><strong>Lossy</strong></td><td>MP3, MP2, MP1, AAC, Ogg Vorbis (also <code>.oga</code>), Opus, Musepack, WMA (1, 2, Pro), Fibonacci-packed 8SVX</td><td>native / ffmpeg</td></tr>
         <tr><td><strong>DSD (1-bit)</strong></td><td>DSF, DFF, WSD</td><td>ffmpeg</td></tr>
+        <tr><td><strong>Surround</strong></td><td>Dolby Digital / Digital Plus (AC3, EAC3, EC3, or in M4A), DTS / DTS-HD (DTS, DTSHD), Dolby TrueHD (THD, TRUEHD), MLP</td><td>ffmpeg (to PCM with all their channels)</td></tr>
         <tr><td><strong>SID</strong> (C64)</td><td>SID, PSID, RSID</td><td>sidplayfp + HVSC Songlengths &amp; STIL (a <code>.sid</code> without a PSID/RSID header is Amiga SidMon: uade123)</td></tr>
+        <tr><td><strong>GoatTracker</strong> (C64)</td><td>GoatTracker 1.x and 2.x songs (SNG)</td><td><code>gt2reloc</code> (GoatTracker's packer) converts the song to a SID tune, sidplayfp plays it (an Amiga <code>.sng</code> — ZoundMonitor, Richard Joseph — is told apart by its content: uade123)</td></tr>
+        <tr><td><strong>C64 Sidplayer</strong></td><td>Sidplayer songs (MUS), with the STR of a stereo song</td><td>sidplayfp (an Amiga UFO <code>.mus</code> is told apart by its content: uade123)</td></tr>
         <tr><td><strong>MIDI</strong></td><td>MID, MIDI</td><td>FluidSynth + SoundFonts</td></tr>
-        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, SFX, WOW, AMF, DSM</td><td>libopenmpt (MED 2–4 modules: zxtune123)</td></tr>
+        <tr><td><strong>Tracker / module</strong></td><td>MOD, S3M, XM, IT, MTM, MED, OCT, 669, DBM, ULT, STM, FAR, GDM, IMF, OKT, SFX, WOW, AMF, DSM, FTM (Face The Music), PTM (PolyTracker, ProTracker IFF), DSYM, DTM, DMF, MDL, PSM, J2B, MO3, OXM, MPTM, RTM, STX, XMF, UMX; OctaMED and ChipTracker under their other names (MD0–MD3, MMD3, OMED, OCSS, CHP, CHIP)</td><td>libopenmpt (MED 2–4 modules: zxtune123; early DSIK <code>.dsm</code> modules, the <code>DSM\x10</code> variant: milkyrender (MilkyPlay))</td></tr>
+        <tr><td><strong>libxmp modules</strong></td><td>Archimedes Tracker (MUSX), Coconizer (COCO), FlexTrax (FLX), Funktracker (FNK), Liquid Tracker (LIQ), Megatracker (MGT); the Titanics Player, STIM, The Dark Demon and Eureka packers; 15 packers SoniqBoom converts to ProTracker (Ben Replay, Binary Packer, Devils Replay, GnoiPacker, GPMO, GnuPlayer, HCD Protector, Newtron, Perfect Song, PMD3, NoiseTracker Compressed, The Player 2.2A / 3.0A)</td><td><code>xmprender</code> (libxmp)</td></tr>
         <tr><td><strong>Amiga</strong> (Hively / AHX)</td><td>AHX, HivelyTracker (HVL)</td><td>AHX: uade123, stopping where the song ends · HVL: the bundled HivelyTracker engine, which also measures AHX song ends (outside Docker it is built on first play and needs a C compiler)</td></tr>
-        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>~175 custom players — TFMX, Future Composer, Jochen Hippel, SidMon, SoundMon, SoundFactory, David Whittaker, Delta Music, plus ~110 ProWizard-packed formats …</td><td>uade123</td></tr>
+        <tr><td><strong>Amiga exotica</strong> (UADE)</td><td>~175 custom players — TFMX (also a <code>.tfx</code> song with its <code>.sam</code>), Future Composer, Jochen Hippel, SidMon, SoundMon, SoundFactory, David Whittaker, Delta Music, Musicline Editor, plus ~110 ProWizard-packed formats, also under the names NostalgicPlayer's collection gives some of them (CH1–CH3, SD1, SD2, MP, WNP, STP, FUZZAC, KSM …)</td><td>uade123 (a Musicline Editor tune uade renders only as silence, or can't render: mlrender)</td></tr>
         <tr><td><strong>Atari ST</strong></td><td>SNDH, YM, SC68</td><td>psgplay / bundled StSound engine (outside Docker it is built on first play and needs a C++ compiler) / sc68</td></tr>
-        <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF and their mini variants (MiniPSF, MiniUSF …)</td><td>zxtune123 (a <code>.psf</code> without a PSF header is Amiga SoundFactory: uade123)</td></tr>
+        <tr><td><strong>Console rips</strong> (PSF family)</td><td>PSF, PSF2, USF, GSF, 2SF, SSF, DSF (Dreamcast), NCSF and their mini variants (MiniPSF, MiniUSF …)</td><td>zxtune123 (Dreamcast and Naomi DSF: <code>dsfrender</code> when it is installed — a rip it refuses or renders no sound from plays through zxtune123; a <code>.psf</code> without a PSF header is Amiga SoundFactory: uade123)</td></tr>
         <tr><td><strong>Console chiptune</strong></td><td>NSF, NSFe, SPC, GBS, VGM, VGZ, AY, KSS, SAP, GYM (packed GYMX too), HES</td><td>libgme (VGM/VGZ using a chip other than the Sega PSG and YM2612 — YM2413, YM2151, NES APU, AY-3-8910 …: zxtune123; KSS — MSX and Sega Master System / Game Gear music, with the MSX-MUSIC, MSX-AUDIO and SCC sound chips: kssrender, or libgme where kssrender isn't installed)</td></tr>
+        <tr><td><strong>NES trackers</strong></td><td>FamiTracker (FTM)</td><td>Furnace's headless player (a Face The Music <code>.ftm</code> is told apart by its content: libopenmpt)</td></tr>
+        <tr><td><strong>Multi-system trackers</strong></td><td>DefleMask (DMF)</td><td>Furnace's headless player (an X-Tracker, DSMI Compact or Software Visions <code>.dmf</code> is told apart by its content: libopenmpt)</td></tr>
+        <tr><td><strong>MSX drivers</strong></td><td>MGSDRV (MGS)</td><td><code>kssrender</code> with the MGSDRV driver (MGSDRV © Ain./Gigamix)</td></tr>
+        <tr><td><strong>FM dumps &amp; synth songs</strong></td><td>S98 (PC-98, X68000 and other FM-chip logs), Farbrausch V2 (V2M)</td><td>zxtune123</td></tr>
+        <tr><td><strong>Modular synth</strong></td><td>SunVox projects</td><td><code>sunvoxrender</code> (the SunVox Library — Powered by SunVox (modular synth &amp; tracker) Copyright (c) 2008 - 2026, Alexander Zolotov &lt;nightradio@gmail.com&gt;, WarmPlace.ru)</td></tr>
+        <tr><td><strong>Synth tracker</strong></td><td>Sawteeth (ST)</td><td><code>sawteethrender</code> (NostalgicPlayer's Sawteeth player, ported to C)</td></tr>
+        <tr><td><strong>Sharp X68000</strong></td><td>MDX, with the PDX sample file it names</td><td><code>mdxrender</code> (the MXDRV driver with the X68Sound chip emulation)</td></tr>
         <tr><td><strong>AdLib / OPL FM</strong></td><td>id IMF, ROL, CMF, D00, RAD, LAA, SCI, DRO, HSC, RIX, A2M, ADL, BAM, KSM, AMD</td><td>AdPlug (<code>adplay</code>, Nuked OPL3)</td></tr>
       </tbody>
     </table>
@@ -1293,21 +1307,35 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        format needs beside it — a TFMX <code>smpl.</code> file, instrument files, a Sonix <code>Instruments</code>
        folder — are taken from the same folder or archive.</p>
     <p><strong>How long a retro tune plays.</strong> A console chiptune that states its length (an SPC's ID666 tag,
-       NSFe, a tagged rip, a VGM's intro and two loops) plays that long and then fades out over 8&nbsp;seconds; one
+       NSFe, a tagged rip, an Atari SAP file's TIME, a VGM's intro and two loops) plays that long and then fades out over 8&nbsp;seconds (a SAP tune whose TIME isn't
+       marked <code>LOOP</code> ends there, with no fade); one
        that states none plays the <em>SID duration</em> set under <strong>System → Settings</strong> and fades over its
        last 8&nbsp;seconds. A PSF-family rip plays the length in its tags and fades over its fade tag; a rip whose
-       library file (<code>_lib</code>) is missing says which file it needs. An SNDH tune plays the length the file
+       library file (<code>_lib</code>) is missing says which file it needs. An S98 or Farbrausch V2 file plays the
+       length of its dump or song, read when it is scanned (an S98 loop is not repeated). An MDX song plays until
+       it has looped twice and MXDRV has faded it out (to its end if it doesn't loop), at most the <em>SID duration</em>
+       (after a change of that setting, its next play renders it again and the library shows the new length);
+       its PDX sample file must sit beside it — on a network share or in an online collection only that file is
+       downloaded with the song — and a song whose PDX file is missing says which file it needs. An MGSDRV song plays
+       until it has looped twice (or stopped, or fallen silent for 3&nbsp;seconds), then fades over 8&nbsp;seconds, at most the <em>SID duration</em> (after a change of
+       that setting, its next play renders it again). A GoatTracker song loops: it plays the <em>SID duration</em>,
+       fading over its last 8&nbsp;seconds, from its first subtune; the song doesn't store GoatTracker's speed
+       multiplier, so one written for a multiplied speed plays at the normal speed. A FamiTracker module plays its
+       first track to its end and its loop once more, a DefleMask module its song; the library shows its length once it has been played. A SunVox
+       project plays once, to its end (at most 30&nbsp;minutes). An SNDH tune plays the length the file
        states, or 3&nbsp;minutes when it states none.</p>
     <p>Archives and disk images are scanned and played <strong>inline</strong> — tracks inside <code>.zip</code> files
        (a ZIP inside a ZIP too), Amiga <code>.lha</code> / <code>.lzh</code> archives, C64 <code>.d64</code> /
        <code>.d71</code> / <code>.d81</code> disk images and Amiga <code>.adf</code> disks appear in your library
        without unpacking (on network shares: ZIP and LHA/LZH archives). The <strong>Scan ZIPs</strong> settings switch
-       this on and off. (Where the <code>lha</code> tool from lhasa isn't installed — always the case in the Docker
-       image — LHA archives packed with methods other than <code>-lh0-</code>, <code>-lh5-</code>, <code>-lh6-</code>
-       and <code>-lh7-</code>, such as the older <code>-lh1-</code> and <code>-lh4-</code>, are not read.)</p>
+       this on and off. (LHA archives packed with <code>-lh0-</code>, <code>-lh1-</code>, <code>-lh4-</code> … <code>-lh7-</code>,
+       <code>-lz4-</code>, <code>-lz5-</code> or <code>-lzs-</code> are read everywhere; the rare archives packed with
+       another method, such as <code>-lh2-</code>, <code>-lh3-</code> or <code>-pm0-</code>, are read with the
+       <code>lha</code> tool from lhasa, which the Docker image includes and <code>install.sh</code> installs where the
+       system has it.)</p>
     <p><strong>What your browser gets.</strong> MP3, FLAC, WAV, Ogg, Opus and AAC files stream to the browser as they
        are. Apple Lossless (ALAC) plays as it is in Safari and is converted for other browsers; Safari before
-       version&nbsp;18.4 gets Ogg and Opus files converted. Conversions — ALAC, AIFF, WavPack, Musepack, DSD — start
+       version&nbsp;18.4 gets Ogg and Opus files converted. Conversions — ALAC, AIFF, WavPack, Musepack, DSD, Dolby and DTS surround — start
        playing almost at once while the rest converts, and are kept in the conversion cache for the next play. If the
        browser can't decode a file — a damaged MP3 or FLAC, for example — SoniqBoom plays it again through ffmpeg,
        and keeps doing so for that track in this browser.</p>
@@ -1323,7 +1351,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p class="sec-sub">Send what you're playing to a TV, speaker or receiver on your network.</p>
     <div class="note beta"><b>Casting is in Beta.</b> Chromecast, AirPlay and DLNA targets are supported;
       behaviour can vary by device. Each target type needs its Python package in SoniqBoom's environment —
-      <code>pychromecast</code>, <code>pyatv</code> or <code>async-upnp-client</code> (not included in the Docker image).</div>
+      <code>pychromecast</code>, <code>pyatv</code> or <code>async-upnp-client</code>, installed separately (neither <code>install.sh</code> nor the Docker image installs them).</div>
     <ol class="steps">
       <li>Press the <b>cast button</b> in the player toolbar.</li>
       <li>Pick a device from the list — discovered Chromecast, Apple TV / HomePod (AirPlay), and DLNA receivers appear together.</li>
@@ -1458,7 +1486,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p>The phone page always has the <b>Retro hi-fi</b> look, in every view; the <a href="#ui-style">Style</a> switch
        of the desktop page doesn't change it. The page is one hi-fi component: the top bar is a metal plate with the
        view's name on a display, the tab bar a row of keys whose lamp lights for the view you are in, and the
-       mini-player a strip with the title on a display and Play, Next and Cast keys (Play's lamp lights while a
+       mini-player a strip with the title on a display and Play, Next and Cast (<span class="badge beta">Beta</span>) keys (Play's lamp lights while a
        track plays, Cast's while you cast; the position runs as an amber light bar). Lists — tracks, albums, playlists, search results,
        the queue and the stations — are lines printed on a cassette insert; the playing line is lit amber. The
        Library's All / Artists / Albums … choices and Radio's ★&nbsp;Favorites / Scene / Browse are keys with lamps,
@@ -1479,7 +1507,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        position slider (<b>● LIVE</b> for a station), and Play, Shuffle and Repeat are keys whose lamp lights while
        they are on. With reduced motion the reels stay still. Turned sideways, the cassette sits beside the
        controls. On a phone the mini-player steps aside while Now&nbsp;Playing is open — the cassette and the
-       meter display get its room — and a <b>Cast</b> key joins Shuffle and Repeat (its lamp lights while you cast);
+       meter display get its room — and a <b>Cast</b> (<span class="badge beta">Beta</span>) key joins Shuffle and Repeat (its lamp lights while you cast);
        the mini-player is back as soon as you press another tab key. Where the page is at least 428&nbsp;px wide and
        428&nbsp;px tall — the largest phones and an iPad — the mini-player stays, with its own Cast key.</p>
     <p id="mobile-meters">Under the cassette, Now&nbsp;Playing has a <strong>meter display</strong>. <b>Meter</b> shows one LED
@@ -1663,7 +1691,7 @@ soniqboom collections list             # what there is, and what is still waitin
        while the HVSC collection is off (the collection keeps it for its own tunes). <code>remove</code> needs one or
        more names, or <code>all</code>.</p>
     <p>A native install runs them as <code>.venv/bin/soniqboom</code> in its folder; in Docker, prefix
-       <code>docker exec soniqboom</code>. A running server takes the request, otherwise its next
+       <code>docker compose exec soniqboom</code>. A running server takes the request, otherwise its next
        start does (after a download it is already doing — within about 10&nbsp;seconds otherwise); the progress shows
        on the <strong>Collections</strong> tab (where each collection can be switched off again), the
        <strong>Metadata</strong> tab and the <strong>HVSC SID database</strong> card under <strong>Renderers</strong>.
@@ -1675,7 +1703,7 @@ soniqboom collections list             # what there is, and what is still waitin
        <code>SONIQBOOM_SCENE_INFO</code> (<code>yes</code> when not set, <code>no</code>, or a list of names; any
        other value adds nothing). With the HVSC collection on, its song lengths and STIL serve your own SID files
        too, and a local HVSC folder found later takes over; without it, the <strong>HVSC SID database</strong> card
-       is set to <em>Download from the internet</em> — choose <em>Local folder</em> there to use your own.</p>
+       is set to <em>Download from the internet</em> — choose <em>Local DOCUMENTS folder</em> there to use your own.</p>
 
     <h3 id="modland">Modland</h3>
     <p>Switch on <strong>Modland catalogue</strong> and SoniqBoom
@@ -1702,7 +1730,7 @@ soniqboom collections list             # what there is, and what is still waitin
           plays next, and a Chromecast (casting is in <span class="badge beta">Beta</span>) loads the next tune of
           its queue shortly before it starts. Folder views, searches, artwork, waveforms, VU meters and background
           passes never download a catalogue tune on their own (except with <em>For tunes shown in lists</em>,
-          below). At most 120 new tunes are downloaded within ten minutes; a play
+          below). At most 120 new tunes are downloaded within ten minutes (from all the online collections together); a play
           beyond that says to try again shortly.</li>
       <li><strong>Tunes</strong>: <em>Everything except the large PC tracker folders</em> (the default) leaves out
           Fasttracker&nbsp;2, Impulsetracker, Screamtracker&nbsp;3, Fasttracker and Multitracker; <em>Everything</em>
@@ -1764,7 +1792,10 @@ soniqboom collections list             # what there is, and what is still waitin
        title, composer and chip. Until then a tune in a composer's folder (<em>MUSICIANS</em>) shows its composer
        as the folder names them (<em>Hubbard Rob</em>), and a tune in <em>GAMES</em> or <em>DEMOS</em> shows none.
        Once a tune of a composer's folder has played and its file names that composer, the folder's other tunes show
-       the name the file gives (<em>Rob Hubbard</em>, <em>Stephen L. Judd (Wyndex)</em>).</p>
+       the name the file gives (<em>Rob Hubbard</em>, <em>Stephen L. Judd (Wyndex)</em>). When a played tune's file
+       names someone else than its folder — a group's folder (<em>Art_of_Noise</em>) holding a member's tune — the
+       member becomes its artist (<em>ESM</em>) and the folder's name its album artist (<em>Art of Noise</em>), so
+       <code>artist:"Art of Noise"</code> still finds it.</p>
     <ul>
       <li><strong>Leave Modland's HVSC folder out</strong> (on by default): Modland carries a copy of HVSC too. While
           this is on, the Modland catalogue leaves its HVSC folder out. A tune's rating, play count, history and
@@ -1772,7 +1803,7 @@ soniqboom collections list             # what there is, and what is still waitin
           and back when this collection is switched off while Modland's folder is in. A tune rated or played on both
           copies keeps each copy's own rating and play count; its playlist entries still move.</li>
       <li><strong>Use its song lengths and STIL for my own SID files</strong> (on by default): when no HVSC folder of
-          your own is in use (gear → Renderers → HVSC), the downloaded song lengths and STIL comments serve your own SID
+          your own is in use (gear → Renderers → HVSC SID database), the downloaded song lengths and STIL comments serve your own SID
           files too — matched by checksum, so a SID filed anywhere in your library finds its lengths and its STIL
           comment. An HVSC folder of your own always takes precedence. With <strong>Download from the
           internet</strong> chosen on the HVSC card too, the collection's own index check keeps those files up to
@@ -1833,7 +1864,7 @@ soniqboom collections list             # what there is, and what is still waitin
           and end for its tags and length, and the next-track preparation skips it. A tune over 48&nbsp;MB inside a
           ZIP archive is downloaded only when it plays. Nothing larger than half the <em>Remote cache (MB)</em>
           under <strong>System → Settings</strong> is downloaded: such a file plays only as it is, straight from the
-          archive — not converted for a browser, a Subsonic app or a Cast device — and a tune that large inside an
+          archive — not converted for a browser, a Subsonic app or a Cast device (<span class="badge beta">Beta</span>) — and a tune that large inside an
           archive (or an LHA archive that large) doesn't play.</li>
       <li>The listing is checked monthly by default (daily, weekly or every 2 weeks, or on demand with
           <strong>Refresh now</strong>).</li>
@@ -1862,7 +1893,7 @@ soniqboom collections list             # what there is, and what is still waitin
        checks at once, and a notice appears only when new tracks are found. To rebuild everything by hand, use
        <strong>↻ Rebuild Index</strong>; to re-scan a single folder, use its <strong>Re-Index</strong> button.
        While a scan is running you can <strong>Pause</strong> it and later <strong>Resume</strong> from where it left
-       off — handy for easing server load during busy listening.</p>
+       off.</p>
     <p>The Library tab's <strong>Library Health</strong> cards show how many tracks and scan folders are indexed and
        whether the search index is in order. If titles, artists or albums show the replacement character
        <code>�</code>, or modules show a placeholder title such as <code>&lt;unnamed&gt;</code>,
@@ -1890,8 +1921,8 @@ soniqboom collections list             # what there is, and what is still waitin
     <pre>docker compose stop
 docker compose run --rm -v "${PWD}:/backup:ro" soniqboom soniqboom import /backup/soniqboom-2026-10-01.sbz
 docker compose start</pre>
-    <p>With the server stopped, <code>docker compose run --rm -v "${PWD}:/backup" soniqboom soniqboom export /backup/soniqboom.sbz</code>
-       writes a backup the same way. In Docker, back up the whole <code>soniqboom-data</code> volume
+    <p><code>docker compose run --rm -v "${PWD}:/backup" soniqboom soniqboom export /backup/soniqboom.sbz</code>
+       writes a backup the same way (it only reads, so the server can keep running). In Docker, back up the whole <code>soniqboom-data</code> volume
        (<code>/data</code>) as well; the caches in <code>/data/cache/remote</code>, <code>/data/zip-extracts</code> and
        <code>/data/soniqboom/cache</code> can be skipped. The same tab shows the <strong>Last known-good snapshot</strong> — an automatic copy of the library index
        (<code>library.json.prev</code> in the data folder), refreshed each time the server starts and the index loads
@@ -1907,7 +1938,7 @@ docker compose start</pre>
        newer release than the one starting is refused rather than opened.</p>
     <div class="note">The backup holds your <em>library database</em>, not the audio files or SoniqBoom's settings. User
        accounts, saved play queues, and the favourites, album / artist ratings and bookmarks from Subsonic apps are kept
-       in SoniqBoom's data folder (<code>users.json</code>, <code>subsonic_state.json</code> and <code>secret.key</code>),
+       in SoniqBoom's data folder (<code>users.json</code> and <code>users.json.bak</code>, <code>sessions.json</code>, <code>subsonic_state.json</code> and <code>secret.key</code>),
        not in the <code>.sbz</code> — back up that whole folder too, keeping those files together, along with your music.
        It is <code>~/Library/Application Support/SoniqBoom</code> on macOS, <code>~/.local/share/soniqboom</code> on
        Linux (or <code>$XDG_DATA_HOME/soniqboom</code>), <code>/data</code> in Docker, or the <code>data_dir</code> /
@@ -1967,8 +1998,8 @@ bash setup-admin.sh -user bob -disable                                 <span cla
        lasts until the browser hasn't used SoniqBoom for seven days, and restarts don't end it.</p>
 
     <h3>System notes</h3>
-    <div class="note"><b>RAM &amp; disk.</b> SoniqBoom keeps your entire library index in memory, so browsing and search
-       stay instant even at six-figure track counts — plan for RAM that grows with the size of your collection; the
+    <div class="note"><b>RAM &amp; disk.</b> SoniqBoom keeps your entire library index in memory — plan for RAM that grows
+       with the size of your collection; the
        optional <a href="#modland">Modland catalogue</a> needs about 1&nbsp;GB more. The
        initial scan runs at roughly two minutes per 50,000 tracks. On disk, SoniqBoom keeps a snapshot of the library
        plus a render / transcode cache for instant replay — adjustable from 256&nbsp;MB to 100&nbsp;GB in
@@ -1994,13 +2025,13 @@ bash setup-admin.sh -user bob -disable                                 <span cla
       <div class="card"><span class="ico">🔌</span><h4>Optional services</h4><p>The <strong>System → Services</strong> panel turns each network service on or off — OpenSubsonic API, Multi-room, Cast <span class="badge beta">Beta</span> and the DLNA Media Server <span class="badge beta">Beta</span> (off by default). Changes take effect after a server restart — use <strong>Restart now</strong> in the panel. While a service is off, its pages and API answer “not found”. On the server (from inside the SoniqBoom folder) you can do the same with <code>.venv/bin/soniqboom services list</code> and <code>… services enable</code> / <code>disable</code> followed by <code>subsonic</code>, <code>multiroom</code>, <code>cast</code> or <code>dlna_server</code> (in Docker: <code>docker compose exec soniqboom soniqboom services list</code>), then restart.</p></div>
       <div class="card"><span class="ico">📦</span><h4>Game names from archive names</h4><p>In <strong>gear → Metadata → Game names from archive names</strong>, <em>Game from archive names</em> (on by default) names a retro track's game after its archive when the archive's name is a known game of the track's platform, from the included title lists (Wikidata, No-Intro, the MAME software lists, ZXDB) and your HVSC copy. <strong>Download TOSEC</strong> and <strong>Download Redump</strong> add more titles on request. It applies right away and after each scan; turning it off removes only the names it added.</p></div>
       <div class="card"><span class="ico">🏷️</span><h4>Retro genres</h4><p>A retro track whose file names no genre is listed under the genres SoniqBoom knows for it: what it is — <em>Game</em>, <em>Demo</em>, <em>Cracktro</em>, <em>Music Disk</em>, <em>Diskmag</em> or <em>Scene</em> — and its platform — <em>SID</em>, <em>Amiga</em>, <em>Atari ST</em>, <em>NES</em>, <em>SNES</em>, <em>Game Boy</em>, <em>Mega Drive</em>, <em>PlayStation</em>, <em>ZX Spectrum</em>, <em>AdLib</em>, <em>MIDI</em> and more. They come from the track's game (from any of its game sources), console-rip formats, Demozoo (the demo, cracktro, music disk, diskmag or game released the same year that uses the tune, and the party competition it entered — to add these, use <strong>Download / refresh index</strong> and then <strong>Apply to library</strong> in <strong>gear → Metadata → Scene groups (Demozoo)</strong>), its composer's Demozoo group, HVSC's <em>GAMES</em> and <em>DEMOS</em> folders and folder names such as <em>games</em>, <em>demos</em>, <em>intros</em>, <em>cracktros</em>, <em>musicdisks</em> or <em>parties</em> inside a music folder. In <strong>gear → Metadata → Retro genres</strong>, <em>Game and group names as genres</em> (on by default) also adds the game, the composer's scene groups and the party, so a Subsonic app can browse a game's or a group's tunes by genre; a large library then lists many more genres. A genre in the file's own tags (other than the format words SoniqBoom adds, such as <em>Chiptune</em> or <em>C64</em>), or one you type in Track Info, replaces them. Track Info, the Genres view, genre search (<code>genre:Cracktro</code>) and Subsonic apps list them: an app shows the first one as the song's genre and all of them where it shows several.</p></div>
-      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), turn <em>Use folder art</em> on or off and choose which filenames count as folder art, and toggle ZIP-archive scanning — <em>Scan ZIPs</em> for local folders and <em>Scan ZIPs on remote shares</em> for archives on FTP, SMB and WebDAV shares.</p><p><em>Tracks on unavailable drives</em> decides what happens to tracks that can't play right now: tracks on a drive or share that isn't connected (on a share, unless their file is in SoniqBoom's cache) and <a href="#modland">Modland catalogue</a> tunes that aren't cached while Modland can't be reached. <strong>Mark them</strong> (the default) lists them dimmed with an “offline” badge (its tooltip says whether the drive, the share or the catalogue is offline); <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you can still open list them, marked; <strong>Show them as usual</strong> lists them unmarked. With Mark or Hide, shuffle, Instant Mix, More like this and the next track skip them; a track you click still tries to play and says why it can't. While <em>Hide duplicates in search</em> is on, Mark and Hide list a duplicate whose best copy can't play by the best copy that can, until that drive or share is back. The lists update by themselves when a drive or share goes away or comes back (a local drive is checked every 30 seconds while the web app is in use; one that stops answering counts as gone at the next check, within about a minute; a drive whose folder is still there but empty counts as not connected while the library has tracks in it). The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p><p><em>Tracks that can't be played</em> decides what happens to tracks marked <b>can't play</b> (refused the same way twice by their player), <b>corrupt</b> (no engine can decode them) or <b>broken</b> (reported by a listener) — see <a href="#playing">Playing music</a>. Tracks marked <b>glitched</b> or <b>partial</b> still play, and this setting never hides them. <strong>Mark them</strong> (the default) lists them with their badge; <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you open list them, marked; from there a track can still be played or its mark cleared. Either way shuffle, Instant Mix, More like this and the next track skip them, and a track you click still tries to play. While <em>Hide duplicates in search</em> is on, Hide lists a duplicate whose best copy can't be played by the best copy that can — or, when no copy can play right now, by a copy that is listed (one on a drive that isn't connected, marked offline). Open pages update by themselves when the setting changes or a track is marked or its mark is cleared. Both settings can hide at once: a track is left out when either one hides it. The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p></div>
+      <div class="card"><span class="ico">🖼️</span><h4>Library display</h4><p>Under <strong>System → Settings</strong> you can hide duplicate copies (in search and/or folder views), turn <em>Use folder art</em> on or off and choose which filenames count as folder art, and toggle ZIP-archive scanning — <em>Scan ZIPs</em> for local folders and <em>Scan ZIPs on remote shares</em> for archives on FTP, SMB and WebDAV shares.</p><p><em>Tracks on unavailable drives</em> decides what happens to tracks that can't play right now: tracks on a drive or share that isn't connected (on a share, unless their file is in SoniqBoom's cache) and <a href="#modland">Modland catalogue</a> tunes that aren't cached while Modland can't be reached. <strong>Mark them</strong> (the default) lists them dimmed with an “offline” badge (its tooltip says whether the drive, the share or the catalogue is offline); <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you can still open list them, marked; <strong>Show them as usual</strong> lists them unmarked. With Mark or Hide, shuffle, Instant Mix, More like this and the next track skip them; a track you click still tries to play and says why it can't. While <em>Hide duplicates in search</em> is on, Mark and Hide list a duplicate whose best copy can't play by the best copy that can, until that drive or share is back. The lists update by themselves when a drive or share goes away or comes back (a local drive is checked every 30 seconds while the web app is in use; one that stops answering counts as gone at the next check, within about a minute; a drive whose folder is still there but empty counts as not connected while the library has tracks in it). The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p><p><em>Tracks that can't be played</em> decides what happens to tracks marked <b>can't play</b> (refused the same way twice by their player), <b>corrupt</b> (no engine can decode them) or <b>broken</b> (reported by a listener) — see <a href="#playing">Now playing</a>. Tracks marked <b>glitched</b> or <b>partial</b> still play, and this setting never hides them. <strong>Mark them</strong> (the default) lists them with their badge; <strong>Hide them</strong> leaves them out of searches, track lists, smart views and their counts, while playlists, the queue, the Duplicates view and any folder you open list them, marked; from there a track can still be played or its mark cleared. Either way shuffle, Instant Mix, More like this and the next track skip them, and a track you click still tries to play. While <em>Hide duplicates in search</em> is on, Hide lists a duplicate whose best copy can't be played by the best copy that can — or, when no copy can play right now, by a copy that is listed (one on a drive that isn't connected, marked offline). Open pages update by themselves when the setting changes or a track is marked or its mark is cleared. Both settings can hide at once: a track is left out when either one hides it. The setting applies to every user of the web app and the phone page; Subsonic apps and the DLNA Media Server <span class="badge beta">Beta</span> list these tracks as usual. On the phone it is under <strong>Settings → Library</strong>, where admins can change it.</p></div>
       <div class="card" id="ui-style"><span class="ico">📻</span><h4>Style</h4><p>The equalizer, the Stations view, Playlists, the queue, the player bar, Track Info, the lyrics panel, the full-width visualizer, and the large now-playing cover share one look: <b>Modern</b> or <b>Retro hi-fi</b>, which is the look until you choose one. The <b>Style</b> switch in the equalizer, or <b>Style</b> under <strong>gear → System → Settings</strong> (accounts without admin rights: <strong>gear → Preferences</strong>), changes them all at once, and this browser keeps the choice — other open SoniqBoom tabs switch along. Both looks come in the light and the dark theme. The <a href="#apps">phone page</a> is always Retro hi-fi; this switch doesn't change it.</p></div>
       <div class="card"><span class="ico">🌗</span><h4>Theme</h4><p>Dark is the default. Switch to light under <strong>gear → System → Settings → Theme</strong> and press <strong>Save Settings</strong> (accounts without admin rights: <strong>gear → Preferences → Theme</strong>, then <strong>Save</strong>); the choice is saved in this browser. The phone page follows your device's light or dark mode.</p></div>
       <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
       <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and Amiga, HVL, SC68 and PSF tracks show their length once they have played; AdLib and console chiptune rows still learn their length in the background. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>
       <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. <strong>gear → Renderers → Transcode &amp; render cache</strong> shows how full it is and how much each kind of format takes. Set <em>Cache size (MB)</em> from 256&nbsp;MB to 100&nbsp;GB and press <strong>Apply</strong> — a lower size removes the least recently used entries at once. <strong>Clear transcoded only</strong> frees converted files (DSD, ALAC, AIFF …) and keeps the retro renders; <strong>Clear all conversion cache</strong> empties it.</p></div>
-      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found, with the version it reports, and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing. On the server (from inside the SoniqBoom folder), <code>.venv/bin/soniqboom fetch-ffmpeg</code> downloads that ffmpeg too (<code>--force</code> downloads it again even when it is current); restart SoniqBoom afterwards.</p><p>If a renderer is installed somewhere SoniqBoom doesn't look, give its full path under <strong>gear → Renderers → Renderer binaries</strong> (uade123, gme, adplay, psgplay, sc68, zxtune123) and press <strong>Save paths</strong>; leave a field empty to find it automatically. The paths of sidplayfp, fluidsynth and openmpt123 go in <code>SoniqBoom.conf</code> under <code>renderers</code> (<code>sidplayfp_path</code>, <code>fluidsynth_path</code>, <code>openmpt123_path</code>).</p></div>
+      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found, with the version it reports, and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing. On the server (from inside the SoniqBoom folder), <code>.venv/bin/soniqboom fetch-ffmpeg</code> downloads that ffmpeg too (<code>--force</code> downloads it again even when it is current); restart SoniqBoom afterwards.</p><p>If a renderer is installed somewhere SoniqBoom doesn't look, give its full path under <strong>gear → Renderers → Renderer binaries</strong> (uade123, gme, adplay, psgplay, sc68, zxtune123, kssrender, dsfrender, milkyrender, mlrender, mdxrender, gt2reloc, sunvoxrender, furnace) and press <strong>Save paths</strong>; leave a field empty to find it automatically. The paths of sidplayfp, fluidsynth and openmpt123 go in <code>SoniqBoom.conf</code> under <code>renderers</code> (<code>sidplayfp_path</code>, <code>fluidsynth_path</code>, <code>openmpt123_path</code>).</p></div>
       <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — tracks, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later with <code>soniqboom import</code>. Back up the data folder too, for user accounts and Subsonic app state, and <code>SoniqBoom.conf</code> for your shares and admin settings (see <a href="#manage">Back up &amp; restore</a>).</p></div>
       <div class="card"><span class="ico">🎚️</span><h4>This browser's preferences</h4><p>Some settings are kept per browser: <em>Crossfade</em>, <em>Streaming quality</em> (below), <em>Preload buffer</em> (wait until this many seconds are buffered before a track starts), <em>“Converting…” notice delay</em> (how long a conversion may take before the notice shows), <em>Let shuffle repeat tracks you've heard</em>, <em>Sync the play queue across devices</em>, the visualization switches and <em>Theme</em>. Admins find them under <strong>gear → System → Settings</strong>; for other accounts the gear opens <strong>Preferences</strong> with the same choices, plus the account's Subsonic app password and API keys.</p></div>
       <div class="card"><span class="ico">✨</span><h4>Visualizations</h4><p>Under <strong>gear → System → Settings → Visualizations</strong>: <em>Enable visualizations</em> switches every animation on or off; <em>Now-playing</em> turns the player's VU meters, the signal chain and the full-width visualizer (its CRT scope included) on or off; <em>Admin diagnostics</em> the animated views in the admin panel; <em>VU meter style</em> picks <em>Bars</em> or <em>Circuit board</em> (the Retro hi-fi style shows LED columns and needle meters instead). <em>Play SID in browser</em> (experimental) also renders C64 tunes in this browser to drive their per-voice meter — playback still streams from the server. These choices apply at once to this device. Accounts without admin rights find them in <strong>gear → Preferences</strong> as <em>Visualizations</em>, <em>Now-playing visualizations</em>, <em>VU meter style</em> and <em>Play SID in browser (experimental)</em>, applied when you press <strong>Save</strong>. When your system asks for reduced motion, animations stay still.</p></div>
@@ -2031,11 +2062,12 @@ bash setup-admin.sh -user bob -disable                                 <span cla
     <p>The message says why. Usually its renderer isn't installed (or, after a system upgrade, no longer runs):
        re-run <code>bash install.sh</code> (it installs them all), or install the one package SoniqBoom names in the
        error — <code>sidplayfp</code>, <code>fluidsynth</code>, <code>libopenmpt</code>, <code>uade</code>,
-       <code>libgme</code>, <code>adplay</code>, <code>psgplay</code>, <code>sc68</code>, <code>zxtune123</code> or
-       <code>kssrender</code>.
+       <code>libgme</code>, <code>adplay</code>, <code>psgplay</code>, <code>sc68</code>, <code>zxtune123</code>,
+       <code>kssrender</code>, <code>dsfrender</code>, <code>milkyrender</code>, <code>mlrender</code>, <code>mdxrender</code>,
+       <code>gt2reloc</code>, <code>sunvoxrender</code>, <code>furnace</code>, <code>xmprender</code> or <code>sawteethrender</code>.
        The HivelyTracker (<code>.hvl</code>) and StSound (Atari&nbsp;ST <code>.ym</code>) engines are built the first
        time such a tune plays; outside Docker that needs a C compiler (HivelyTracker) and a C++ compiler (StSound). A tune that needs a file beside it — an AdLib instrument bank, a PSF rip's
-       library file — names the missing file; a damaged file, or a tune that renders nothing but silence, says so.
+       library file, an MDX song's PDX sample file — names the missing file; a damaged file, or a tune that renders nothing but silence, says so.
        <strong>gear → Renderers → Renderer Status</strong> shows what is installed. Everything else keeps working in
        the meantime.</p>
     <h3>A track shows an “offline” badge</h3>

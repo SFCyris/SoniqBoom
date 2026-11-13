@@ -4,11 +4,14 @@
  * kssrender — render one song of an MSX / Sega Master System KSS file
  * (KSCC, KSSX: PSG, SCC, OPLL, MSX-AUDIO, SN76489) to a 16-bit stereo WAV,
  * with libkss (Mitsutaka Okazaki, ISC; its emu* chip cores MIT, kmz80 public
- * domain).  Built against libkss without its kss-drivers (EXCLUDE_DRIVER_ALL):
- * a KSS file carries its own driver.
+ * domain) — or an MGSDRV song (.mgs), which libkss plays with the MGSDRV
+ * driver (Ain./Gigamix; free, used unmodified).  Built against libkss with
+ * only that one of its kss-drivers (build.sh): a KSS file carries its own
+ * driver.
  *
  *   kssrender [-s song] [-r rate] [-m max_seconds] [-f fade_ms] [-l loops]
  *             [-q quality] FILE OUT.wav
+ *   kssrender -i [-s song] [-r rate] [-m max_seconds] [-f fade_ms] [-l loops] FILE
  *   kssrender --version
  *
  * The song plays until it has looped `loops` times (default 1) or stopped,
@@ -16,7 +19,10 @@
  * 8000).  A song that falls silent for 3 s stops there.  The WAV is written as
  * it renders (a 44-byte header first, its sizes patched at the end), in
  * 0.1-second blocks flushed as they are made, so a reader can follow it.
- * Exit status 0 with audio written, 1 on a bad file, 2 on usage. */
+ * -i plays the song the same way without writing it and prints
+ * "seconds=<length>" — the length a render with the same options has (the
+ * emulation is deterministic).  Exit status 0 with audio written (-i: with
+ * the song played), 1 on a bad file, 2 on usage. */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -50,12 +56,14 @@ static void wav_header(unsigned char *h, uint32_t rate, uint32_t data_bytes) {
 
 static int usage(void) {
   fprintf(stderr, "usage: kssrender [-s song] [-r rate] [-m max_seconds] [-f fade_ms] "
-                  "[-l loops] [-q quality] FILE OUT.wav\n");
+                  "[-l loops] [-q quality] FILE OUT.wav\n"
+                  "       kssrender -i [same options] FILE\n");
   return 2;
 }
 
 #ifndef KSSRENDER_VERSION
-#define KSSRENDER_VERSION "1.1"   /* 1.1: write / allocation failures exit 1 */
+#define KSSRENDER_VERSION "1.2"   /* 1.1: write / allocation failures exit 1;
+                                     1.2: -i, MGSDRV */
 #endif
 #ifndef LIBKSS_COMMIT
 #define LIBKSS_COMMIT "unknown"
@@ -68,8 +76,11 @@ int main(int argc, char **argv) {
     return 0;
   }
   const char *in = NULL, *out = NULL;
+  int info = 0;
   for (int i = 1; i < argc; i++) {
-    if (argv[i][0] == '-' && argv[i][1] && i + 1 < argc && strchr("srmflq", argv[i][1])
+    if (strcmp(argv[i], "-i") == 0) {
+      info = 1;
+    } else if (argv[i][0] == '-' && argv[i][1] && i + 1 < argc && strchr("srmflq", argv[i][1])
         && argv[i][2] == '\0') {
       long v = strtol(argv[i + 1], NULL, 10);
       switch (argv[i][1]) {
@@ -89,7 +100,7 @@ int main(int argc, char **argv) {
       return usage();
     }
   }
-  if (!in || !out || song < 0 || song > 255 || rate < 8000 || rate > 192000
+  if (!in || (!info && !out) || (info && out) || song < 0 || song > 255 || rate < 8000 || rate > 192000
       || max_s < 1 || max_s > 3600 || fade_ms < 0 || loops < 1)
     return usage();
 
@@ -98,20 +109,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "kssrender: not a KSS file this build can play: %s\n", in);
     return 1;
   }
-  FILE *fp = fopen(out, "wb");
-  if (!fp) {
+  FILE *fp = info ? NULL : fopen(out, "wb");
+  if (!info && !fp) {
     fprintf(stderr, "kssrender: can't write %s\n", out);
     KSS_delete(kss);
     return 1;
   }
   unsigned char h[44];
   wav_header(h, (uint32_t)rate, 0);
-  int failed = fwrite(h, 1, sizeof h, fp) != sizeof h || fflush(fp) != 0;
+  int failed = fp && (fwrite(h, 1, sizeof h, fp) != sizeof h || fflush(fp) != 0);
 
   KSSPLAY *kp = KSSPLAY_new((uint32_t)rate, 2, 16);
   if (!kp) {
     fprintf(stderr, "kssrender: out of memory\n");
-    fclose(fp);
+    if (fp) fclose(fp);
     KSS_delete(kss);
     return 1;
   }
@@ -141,9 +152,9 @@ int main(int argc, char **argv) {
   uint64_t fade_frames = (uint64_t)fade_ms * (uint64_t)rate / 1000;
   while (!failed && frames < max_frames) {
     KSSPLAY_calc(kp, buf, block);
-    for (uint32_t i = 0; i < 2 * block; i++)
+    for (uint32_t i = 0; i < 2 * block && fp; i++)
       put16(le + 2 * i, (uint16_t)buf[i]);
-    if (fwrite(le, 1, 4 * block, fp) != 4 * block || fflush(fp) != 0) {
+    if (fp && (fwrite(le, 1, 4 * block, fp) != 4 * block || fflush(fp) != 0)) {
       failed = 1;                                 /* a full disk, a closed pipe */
       break;
     }
@@ -159,14 +170,19 @@ int main(int argc, char **argv) {
       break;
   }
 
-  uint64_t bytes = frames * 4;
-  wav_header(h, (uint32_t)rate, (uint32_t)bytes);
-  if (fseek(fp, 0, SEEK_SET) != 0 || fwrite(h, 1, sizeof h, fp) != sizeof h)
-    failed = 1;
-  if (fclose(fp) != 0)
-    failed = 1;
-  if (failed)
-    fprintf(stderr, "kssrender: can't write %s\n", out);
+  if (info) {
+    if (!failed)
+      printf("seconds=%.3f\n", (double)frames / (double)rate);
+  } else {
+    uint64_t bytes = frames * 4;
+    wav_header(h, (uint32_t)rate, (uint32_t)bytes);
+    if (fseek(fp, 0, SEEK_SET) != 0 || fwrite(h, 1, sizeof h, fp) != sizeof h)
+      failed = 1;
+    if (fclose(fp) != 0)
+      failed = 1;
+    if (failed)
+      fprintf(stderr, "kssrender: can't write %s\n", out);
+  }
   free(le);
   free(buf);
   KSSPLAY_delete(kp);

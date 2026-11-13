@@ -379,6 +379,7 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
       // of the settings mirrors — cheap, idempotent).
       loadSettings();
     } else if (tab.dataset.tab === 'tab-metadata') {
+      loadDiscogsStatus();
       loadSceneStatus();
       loadSongdbStatus();
       loadGameTitlesStatus();
@@ -2367,7 +2368,9 @@ async function loadRendererStatus() {
   try { loadSceneStatus(); } catch (_) { /* defined later */ }
   const names = ['ffmpeg', 'sidplayfp', 'fluidsynth', 'openmpt123',
                  'uade123', 'hvl2wav', 'gme', 'adplay',
-                 'psgplay', 'ym2wav', 'sc68', 'zxtune123', 'kssrender'];
+                 'psgplay', 'ym2wav', 'sc68', 'zxtune123', 'kssrender', 'dsfrender',
+                 'milkyrender', 'mlrender', 'mdxrender',
+                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender'];
   // Set all to loading state \u2014 ``renderer-loading`` adds a subtle pulse
   // animation so the user sees the row is actively probing rather than
   // frozen at "\u2026".
@@ -2419,7 +2422,7 @@ async function loadRendererStatus() {
           iconEl.title =
             'ffmpeg is installed but missing: ' +
             (info.missing || []).join(', ') +
-            '. Click "Fix ffmpeg" below to download a complete bundled copy.';
+            '. Use the button in the notice below to download a complete bundled copy.';
         } else {
           iconEl.textContent = '\u2713';
           iconEl.className = 'renderer-icon renderer-ok';
@@ -3320,6 +3323,108 @@ document.getElementById('setting-lyrics-writeback')?.addEventListener('change', 
   }
 });
 
+// ── Discogs token (Metadata tab) ─────────────────────────────────────────────
+// The server never sends the token back: the status line says whether one is
+// saved (and its last four characters).  Test checks the typed token, else
+// the saved one, with Discogs.
+
+let _discogsBusy = false;
+
+function _discogsButtons(state) {
+  const env = !!(state && state.from_env);
+  for (const id of ['setting-discogs-token', 'btn-discogs-save', 'btn-discogs-remove']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = env || (id === 'btn-discogs-remove' && !(state && state.set));
+  }
+}
+
+// One Discogs request at a time; the clicked button keeps keyboard focus.
+async function _discogsRun(btn, fn) {
+  if (_discogsBusy) return;
+  _discogsBusy = true;
+  btn?.setAttribute('aria-busy', 'true');
+  try { await fn(); } finally {
+    _discogsBusy = false;
+    btn?.removeAttribute('aria-busy');
+  }
+}
+
+let _discogsState = null;
+
+function _showDiscogsState(state) {
+  _discogsState = state;
+  const el = document.getElementById('md-discogs-status');
+  if (!el) return;
+  if (!state) { el.textContent = 'Status: —'; return; }
+  let text;
+  if (state.from_env) {
+    text = state.set
+      ? `Status: SONIQBOOM_DISCOGS_TOKEN sets the token${state.ends_with ? ` (ending in ${state.ends_with})` : ''} — change it there.`
+      : 'Status: SONIQBOOM_DISCOGS_TOKEN is set but empty — change it there.';
+  } else {
+    text = state.set
+      ? `Status: a token is saved${state.ends_with ? ` (ending in ${state.ends_with})` : ''}.`
+      : 'Status: no token — covers are looked up on MusicBrainz only.';
+  }
+  if (state.offline) text += ' Offline mode is on: no cover is looked up online.';
+  else if (state.lookup_off) text += ' Radio cover lookups are off ("radio_art_lookup": false in SoniqBoom.conf).';
+  el.textContent = text;
+  _discogsButtons(state);
+}
+
+async function loadDiscogsStatus() {
+  try {
+    const res = await api('/admin/discogs');
+    _showDiscogsState(await res.json());
+  } catch {
+    _showDiscogsState(null);
+  }
+}
+
+document.getElementById('btn-discogs-save')?.addEventListener('click', (ev) => _discogsRun(ev.currentTarget, async () => {
+  const input = document.getElementById('setting-discogs-token');
+  const token = (input?.value || '').trim();
+  if (!token) { showMsg('md-discogs-msg', 'Paste a token first.', 'err'); return; }
+  try {
+    const res = await api('/admin/discogs', { method: 'PUT', body: JSON.stringify({ token }) });
+    _showDiscogsState(await res.json());
+    if (input) input.value = '';
+    showMsg('md-discogs-msg', 'Saved — Discogs is asked first for the covers of songs not found yet.', 'ok');
+  } catch (e) {
+    showMsg('md-discogs-msg', _apiErrText(e, 'Could not save the token.'), 'err');
+  }
+}));
+
+document.getElementById('btn-discogs-remove')?.addEventListener('click', (ev) => _discogsRun(ev.currentTarget, async () => {
+  try {
+    const res = await api('/admin/discogs', { method: 'PUT', body: JSON.stringify({ token: '' }) });
+    _showDiscogsState(await res.json());
+    showMsg('md-discogs-msg', 'Removed — Discogs is no longer asked.', 'ok');
+    document.getElementById('setting-discogs-token')?.focus();
+  } catch (e) {
+    showMsg('md-discogs-msg', _apiErrText(e, 'Could not remove the token.'), 'err');
+  }
+}));
+
+document.getElementById('btn-discogs-test')?.addEventListener('click', (ev) => _discogsRun(ev.currentTarget, async () => {
+  const token = (document.getElementById('setting-discogs-token')?.value || '').trim();
+  if (!token && !(_discogsState && _discogsState.set)) {
+    showMsg('md-discogs-msg', 'Paste a token to test it.', 'err');
+    return;
+  }
+  showMsg('md-discogs-msg', 'Checking with Discogs…', 'ok');
+  try {
+    const res = await api('/admin/discogs/test', { method: 'POST', body: JSON.stringify({ token }) });
+    const r = await res.json();
+    const which = token ? 'The token you typed' : 'The saved token';
+    showMsg('md-discogs-msg', r.ok
+      ? `${which} works — Discogs account ${r.username}.`
+      : `${which} doesn't work: ${r.error || 'unknown error'}`, r.ok ? 'ok' : 'err');
+  } catch (e) {
+    showMsg('md-discogs-msg', _apiErrText(e, 'Could not test the token.'), 'err');
+  }
+}));
+
 // Server toggles that save as soon as they change (they sit away from the
 // Settings grid's Save button).  Each checkbox ships ``disabled`` and is enabled
 // by loadSettings only once the server has told us its real value, so a failed
@@ -4045,7 +4150,9 @@ async function loadSettings() {
     if (sidBoostEl) sidBoostEl.checked = !!r.sid_digiboost;
     // Renderer binary paths (Renderers tab)
     for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
-                        'zxtune123', 'kssrender']) {
+                        'zxtune123', 'kssrender', 'dsfrender',
+                      'milkyrender', 'mlrender', 'mdxrender',
+                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender']) {
       const el = document.getElementById(`setting-path-${name}`);
       if (el) el.value = r[`${name}_path`] || '';
     }
@@ -5214,7 +5321,9 @@ document.getElementById('btn-save-sidfid')?.addEventListener('click', async () =
 document.getElementById('btn-save-renderer-paths')?.addEventListener('click', async () => {
   const renderers = {};
   for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
-                      'zxtune123', 'kssrender']) {
+                      'zxtune123', 'kssrender', 'dsfrender',
+                      'milkyrender', 'mlrender', 'mdxrender',
+                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender']) {
     const el = document.getElementById(`setting-path-${name}`);
     if (el) renderers[`${name}_path`] = el.value.trim();
   }

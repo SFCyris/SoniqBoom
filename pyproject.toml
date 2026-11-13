@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soniqboom"
-version = "2.0.2"
+version = "2.1.0"
 description = "Self-hosted music server for personal libraries — FLAC, MP3, Opus, SID, MIDI, plus 20+ tracker formats"
 requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
@@ -64,4 +64,4 @@ where = ["."]
 include = ["soniqboom*"]
 
 [tool.setuptools.package-data]
-"soniqboom" = ["frontend/**/*", "data/**/*"]
+"soniqboom" = ["frontend/**/*", "data/**/*", "native/uade-players/*"]

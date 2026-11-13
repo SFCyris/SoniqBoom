@@ -16,7 +16,9 @@ Three pipelines write it, all in the layout below:
   through ``libopenmpt`` via a thin ``ctypes`` binding, alongside the
   ``openmpt123`` render of the audio WAV.  When a tracker track has no
   sidecar yet, the first ``GET /api/tracks/<id>/vu`` extracts one from the
-  source file (every tracker format except ASYLUM/DMP ``.amf``).  One
+  source file (every tracker format libopenmpt plays, except ASYLUM/DMP
+  ``.amf``; early DSIK ``.dsm`` modules, which milkyrender plays, and MED 2–4
+  modules, which ZXTune plays, have none).  One
   channel per module channel, at most 32: a module with more channels gets
   meters for its first 32.
 * **C64 SID tunes** — three channels, one per SID voice.  The browser
@@ -87,8 +89,8 @@ gzip-compressed when the client accepts it.
 | 1     | Left              | `●○○`          |
 | 2     | Right             | `○○●`          |
 
-Stored once in the header.  Pan automation within the song is not
-captured in v1.
+Stored once in the header.  Pan changes within the song are not
+captured.
 
 * **Tracker** — pan is **derived** during VU extraction by summing each
   channel's left and right VU readings over the entire song and classifying:
@@ -100,10 +102,8 @@ captured in v1.
   else              -> 0 (centre)
   ```
 
-  This captures the effective pan distribution as the song actually
-  plays, including any default-pan settings from the song header.  Songs
-  with pan automation that swings hard are classified by where the
-  channel spent most of its energy.
+  The sums cover the whole song, default pans from the song header
+  included, so a channel whose pan changes is classified by its totals.
 * **SID** — every voice is 0 (the SID output is mono).
 * **Amiga** — the Paula channel layout: `1 2 2 1` (channels 0 and 3 left,
   1 and 2 right).
@@ -123,7 +123,7 @@ produced depends on the writer:
   byte = floor(clamp(vu_mono, 0.0, 1.0) * 255)
   ```
 
-  255 = full-scale (rare but possible for trackers using volume slides).
+  255 = full-scale.
 * **SID and Amiga** — the peak magnitude of each voice within the frame,
   scaled by the loudest frame of any voice in the whole tune:
 
@@ -186,8 +186,9 @@ same way.  Readers never see a partial file.
 `GET /api/tracks/<id>/vu` returns the sidecar as
 `application/octet-stream` with `Cache-Control: public, max-age=31536000,
 immutable`, an `ETag` and `X-VU-Version: 1`.  `subsong=<n>` (the same
-`subsong` value the stream URL carries; 0 is the file's default tune) selects the tune of a multi-tune file, which has
-one sidecar per tune; without it, the tune a plain play of the file renders.
+`subsong` value the stream URL carries: for a C64 SID or SNDH file, 0 is the file's
+default tune; for other multi-tune files it is the 0-based tune index) selects the tune
+of a multi-tune file, which has one sidecar per tune; without it, the tune a plain play of the file renders.
 
 ---
 

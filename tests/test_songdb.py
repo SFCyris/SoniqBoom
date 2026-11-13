@@ -248,6 +248,11 @@ async def test_apply_fills_empty_fields_only(env):
     assert d["game_by_songdb"] == "Megademo (Anarchy)" and d["game_aliases"] == ["Megademo (Anarchy)"]
     assert (d["year"], d["year_source"]) == (1990, "demozoo")
     assert d["artist"] == "4-Mat" and d["duration"] == 95.5
+    # a length the database fills is promised up front: it carries the
+    # current uade render revision; a kept or absent one gets none
+    from soniqboom.core.conversion_cache import _RENDER_REVS
+    assert a["duration_rev"] == d["duration_rev"] == _RENDER_REVS["uade"]
+    assert b.get("duration_rev") is None and c.get("duration_rev") is None
     e = t("e")
     assert (e["album"], e["album_source"]) == ("Guess", "modland-filename")  # no db album
     assert e["artist"] == "Heatbeat"

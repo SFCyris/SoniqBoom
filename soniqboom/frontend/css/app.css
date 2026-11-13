@@ -6635,6 +6635,18 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .ctx-star.on { color: var(--accent); }
 .ctx-rate:hover .ctx-star { color: var(--accent-dim); }
 .ctx-star:hover ~ .ctx-star { color: var(--bg4); }
+/* Opened by a finger (a long press on a row): finger-sized items and stars. */
+@media (pointer: coarse) {
+  .ctx-menu { min-width: 220px; }
+  .ctx-item { padding: 12px 14px; font-size: 15px; }
+  .ctx-rate { gap: 0; padding: 2px 6px; }
+  .ctx-star { font-size: 26px; padding: 9px 7px; }
+  .ctx-report { padding: 8px 12px; font-size: 13px; }
+  .ctx-report-btn { padding: 8px 10px; }
+}
+/* A held finger opens the row's menu, not the system's callout or a text selection. */
+#track-tbody tr { -webkit-touch-callout: none; }
+@media (pointer: coarse) { #track-tbody tr { -webkit-user-select: none; user-select: none; } }
 /* "Problem: None · Glitched · Broken" (health.js) — a segmented row. */
 .ctx-report { display: flex; align-items: center; gap: 4px; padding: 5px 12px; font-size: 12px; }
 .ctx-report-lbl { color: var(--text2); margin-right: 2px; }
@@ -8464,6 +8476,9 @@ body.auth-blocked > #app {
 .hvsc-outcome-btn { flex: none; }
 /* (no clicks while a check runs — and it shows) */
 #hvsc-section button:disabled { opacity: 0.5; }
+#md-discogs-section button:disabled,
+#md-discogs-section input:disabled { opacity: 0.5; }
+.admin-setting input.admin-token-input { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 /* (light theme: the result colours darkened to a 4.5:1 contrast) */
 :root[data-theme="light"] .admin-msg.ok   { color: #1d6b43; }
 :root[data-theme="light"] .admin-msg.warn { color: #7a5200; }
@@ -8903,6 +8918,42 @@ body.auth-blocked > #app {
   #track-table td.col-track { display: none; }
   #track-table { font-size: 13px; }
   #track-table td, #track-table th { padding: 6px 4px; }
+  /* The title takes the room: # and Time shrink to their text (# was 44 px
+     for one or two digits, Time 92 px for "3:09"), Album Artist goes like
+     Album, the stars go, and Title — 22 % of the pane, 84 px at 414 px —
+     shares what is left with Artist, or takes it all once Artist is gone
+     (≤480 px).  !important: a width kept from a column-resize drag on a wide
+     window sits inline on the th. */
+  #track-table th.col-album-artist,
+  #track-table td.col-album-artist { display: none; }
+  #track-table th.col-num    { width: 36px !important; }
+  #track-table th.col-cover  { width: 36px !important; }
+  #track-table th.col-dur    { width: 66px !important; }
+  #track-table th.col-title,
+  #track-table th.col-artist { width: auto !important; }
+  /* The five stars took 124 px — a third of a phone's row.  (The row's menu
+     — right-click, or a long press — still rates a track.) */
+  #track-table th.col-rating,
+  #track-table td.col-rating { display: none; }
+  /* Time is the last column now: off the window's edge, with room for "1:02:03". */
+  #track-table th.col-dur,
+  #track-table td.col-dur { padding-right: 10px; }
+  /* The playing row's ▶ stands in place of the number, not after it (three
+     digits + ▶ didn't fit the 36 px). */
+  #track-table tr.playing td.col-num:not(:has(.row-eq)) { font-size: 0; }
+  /* (right-aligned: a one-digit number sits by the cover, not 25 px from it) */
+  #track-table th.col-num,
+  #track-table td.col-num { padding-left: 0; padding-right: 6px; text-align: right; }   /* 30 px of text: "9999" fits */
+  #track-table td.col-num { font-size: 11px; }
+  /* A long word (a file name with no spaces) breaks rather than widening or
+     clipping the wrapped title. */
+  #track-table td.col-title { overflow-wrap: anywhere; }
+  /* A badge ("5 tunes", partial, offline) that doesn't fit beside the title
+     goes under it — beside it, it squeezed the title to "A… B…". */
+  #track-table td.col-title .title-badged { flex-wrap: wrap; column-gap: 6px; row-gap: 2px; }
+  #track-table td.col-title .title-badged > .track-health-badge,
+  #track-table td.col-title .title-badged > .track-offline-badge,
+  #track-table td.col-title .title-badged > .track-tunes-badge { margin-left: 0; }
 }
 
 /* Landscape phone (≤480 px) — compact even further; hide play seekbar

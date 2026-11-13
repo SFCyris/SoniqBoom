@@ -11,6 +11,7 @@
  * format + whether playback is active, via an accessor the caller passes.
  */
 import { registerViz, svgEl, clamp } from './engine.js';
+import { TRACKER_FORMAT_NAMES, XMP_FORMAT_NAMES } from '../utils.js';
 
 const VB_W = 440, VB_H = 120;
 
@@ -35,9 +36,29 @@ const CHAINS = {
   SPC:   ['SPC', 'libgme', 'PCM', 'ReplayGain', 'WebAudio', '🔊'],
   MIDI:  ['MIDI', 'fluidsynth', 'PCM', 'ReplayGain', 'WebAudio', '🔊'],
 };
-const TRACKER = new Set(['MOD', 'XM', 'IT', 'S3M', 'MPTM', 'MTM', 'UMX']);
+const TRACKER = new Set(['MOD', 'XM', 'IT', 'S3M', 'MPTM', 'MTM', 'UMX',
+  ...[...TRACKER_FORMAT_NAMES].map(n => n.toUpperCase())]);   // (libopenmpt's)
+const XMP = new Set([...XMP_FORMAT_NAMES].map(n => n.toUpperCase()));
 
-function chainFor(fmt) {
+// The server's renderer key (Track Info's /extended ``renderer``) → its label
+// in the chain; a key not listed shows as itself (xmprender, mdxrender …).
+const ENGINE_LABELS = {
+  openmpt123: 'libopenmpt', sidplayfp: 'libsidplay', gme: 'libgme', zxtune123: 'ZXTune',
+  'furnace-headless': 'Furnace', furnace: 'Furnace',
+};
+
+/**
+ * The decode chain of a track: ``renderer`` (the server's key for the engine
+ * that plays it, when known) decides the engine stage — its own label, the
+ * file's suffix (``ext``) as the source; without it the chain is guessed
+ * from the format name.
+ */
+function chainFor(fmt, renderer, ext) {
+  if (renderer) {
+    const engine = ENGINE_LABELS[renderer] || renderer;
+    const src = String(ext || fmt || 'audio').replace(/^\./, '').toUpperCase();
+    return [src, engine, 'PCM', 'ReplayGain', 'WebAudio', '🔊'];
+  }
   const F = String(fmt || '').toUpperCase();
   if (CHAINS[F]) return CHAINS[F];
   if (F.includes('SID')) return CHAINS.SID;
@@ -45,7 +66,8 @@ function chainFor(fmt) {
   // "HivelyTracker" contains "TRACKER" but is decoded by hvl2wav, not libopenmpt.
   if (F === 'HIVELYTRACKER' || F.includes('HIVELY') || F === 'HVL') return CHAINS.HVL;
   if (F === 'AHX' || F === 'THX' || F.includes('ABYSS')) return CHAINS.AHX;
-  if (TRACKER.has(F) || F.includes('TRACKER')) return CHAINS.MOD;
+  if (TRACKER.has(F)) return CHAINS.MOD;
+  if (XMP.has(F)) return [F, 'xmprender', 'PCM', 'ReplayGain', 'WebAudio', '🔊'];
   if (F.includes('FLAC')) return CHAINS.FLAC;
   if (F.includes('DSD') || F.includes('DSF') || F.includes('DFF')) return CHAINS.DSF;
   if (F.includes('MIDI') || F === 'MID') return CHAINS.MIDI;
@@ -56,7 +78,7 @@ function chainFor(fmt) {
 /**
  * Mount the signal chain into ``host``.
  * @param {HTMLElement} host
- * @param {() => {format: string, playing: boolean}} getState
+ * @param {() => {format: string, renderer?: string, ext?: string, playing: boolean}} getState
  * @returns {{ unregister: ()=>void, rebuild: ()=>void }}
  */
 export function mountSignalChain(host, getState) {
@@ -77,11 +99,13 @@ export function mountSignalChain(host, getState) {
   let curFmt = null;
   let t = 0;
 
-  function render(fmt) {
-    curFmt = fmt;
+  const keyOf = st => `${st.format || ''}|${st.renderer || ''}|${st.ext || ''}`;
+
+  function render(st) {
+    curFmt = keyOf(st);
     svg.textContent = '';
     ol.textContent = '';
-    const steps = chainFor(fmt);
+    const steps = chainFor(st.format, st.renderer, st.ext);
     const n = steps.length;
     const pad = 26, gapw = (VB_W - pad * 2) / n;
     nodes = steps.map((label, i) => {
@@ -116,7 +140,7 @@ export function mountSignalChain(host, getState) {
     ol.setAttribute('aria-label', 'Decode pipeline: ' + steps.join(' → '));
   }
 
-  render(getState().format);
+  render(getState());
 
   const ctl = registerViz({
     // trackinfo.js owns this embed's visibility: it hides the whole
@@ -128,7 +152,7 @@ export function mountSignalChain(host, getState) {
     host, group: 'nowPlaying', fps: 20, hideWhenOff: false,
     draw(dt) {
       const st = getState();
-      if (st.format !== curFmt) render(st.format);
+      if (keyOf(st) !== curFmt) render(st);
       if (!nodes.length) return;
       // Only flow while playing; when paused, light the output stage.
       const steps = nodes.length;
@@ -155,7 +179,7 @@ export function mountSignalChain(host, getState) {
     },
     freeze() {
       // Static frame: output stage lit, no flowing dot.
-      if (!nodes.length) render(getState().format);
+      if (!nodes.length) render(getState());
       nodes.forEach((node, i) => node.shape.classList.toggle('active', i === nodes.length - 1));
       [...svg.querySelectorAll('circle.viz-sig')].forEach(c => c.remove());
     },
@@ -163,6 +187,6 @@ export function mountSignalChain(host, getState) {
 
   return {
     unregister() { ctl.unregister(); },
-    rebuild() { render(getState().format); ctl.refresh(); },
+    rebuild() { render(getState()); ctl.refresh(); },
   };
 }

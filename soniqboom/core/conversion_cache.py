@@ -251,6 +251,10 @@ _state_lock = threading.RLock()
 
 # Render revision per format type: bumped when that renderer's output for
 # the same tune changes, so older cached renders are left to eviction.
+# gme 2: libgme tunes that state a length play it (+ the fade) instead of the
+# 180 s default (GitHub #38); 3: SAP tunes play their TIME (+ the fade only
+# when marked LOOP — ``gme_render.tune_fade``) — every libgme render is swept
+# once (re-rendered on its next play).
 # tracker 2: our own float WAV with libopenmpt's end fade, and modules ending
 # in a song-end loop stop where it first repeats (a 65:56 render of a 5:02
 # tune was played — and its length written back — while it stayed cached);
@@ -259,7 +263,14 @@ _state_lock = threading.RLock()
 # (``stream._adlib_cmd``), not interpolated to 44.1 kHz by the emulator; 2:
 # without the header sizes adplay writes after the audio into a pipe (a click
 # at the end — ``stream.ADPLAY_TAIL_FILTER``).
-_RENDER_REVS = {"sndh": 2, "gme": 2, "psf": 1, "tracker": 2, "adlib": 2, "imf": 2}
+# uade 1: modules uade only plays staged (``xpk.stage_for_uade``: PowerPacker
+# unpacked, an Atari ST ``.soc`` for the Hippel ST player, a YM-ST replay
+# routine, a sample folder, a second player) — an older render of one played
+# the wrong player (a silent ``.soc``) or nothing usable; 2: Hippel COSO songs
+# played with their shared instrument file (``rip_repairs.coso_with_bank``) —
+# an older render played whatever followed the song as its instruments.
+_RENDER_REVS = {"sndh": 2, "gme": 3, "psf": 1, "tracker": 2, "adlib": 2, "imf": 2,
+                "uade": 2}
 
 
 def _cache_key(
@@ -339,6 +350,10 @@ def _cache_key(
         # A render without subsongs (PSF: one tune per rip) under a revision:
         # PSF rips stopped at their length tag before their fade was played.
         parts.append(f"r{_RENDER_REVS[format_type]}")
+        if variant:
+            # Another renderer's render of the rip (a Dreamcast DSF through
+            # dsfrender — ``core/dsf_render``); unset, keys are unchanged.
+            parts.append(f"v{variant}")
     elif format_type == "transcoded":
         parts.append(f"c{codec or 'flac'}")
         # ar=0 means "preserve source sample rate" — distinct from a literal
@@ -403,16 +418,20 @@ def _find_orphan_sidecar(track_id: str, subsong: int,
     p = base / "tracker" / shard / f"{_cache_key(track_id, 'tracker', int(subsong))}.vu"
     if not uade_variant and p.exists():
         return p
-    if uade_variant:
-        # Only the variant's own sidecar is right for this tune — the plain
-        # ``__sub<N>`` one (or the glob below) could be another tune's.
-        p = base / "uade" / shard / f"{exact}__v{uade_variant}.vu"
+    # A uade render's key carries its render revision too (and its variant):
+    # only that key's sidecar is this render's — the plain ``__sub<N>`` one (or
+    # the glob below) could be another tune's, or an older render's.
+    p = base / "uade" / shard / (
+        f"{_cache_key(track_id, 'uade', int(subsong), variant=uade_variant)}.vu")
+    if uade_variant or p.exists():
         return p if p.exists() else None
     for fmt in FORMAT_TYPES:
+        if fmt == "uade":
+            continue
         d = base / fmt / shard
         if not d.is_dir():
             continue
-        p = d / f"{exact}.vu"                      # tracker / uade
+        p = d / f"{exact}.vu"                      # tracker (older keys)
         if p.exists():
             return p
         try:
@@ -447,7 +466,7 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0,
     """
     want = f"{track_id}__sub{int(subsong)}"
     want_sid_prefix = want + "__"      # SID keys append __dur{D}[+fidelity parts]
-    want_uade = f"{want}__v{uade_variant}" if uade_variant else want
+    want_uade = _cache_key(track_id, "uade", int(subsong), variant=uade_variant)
     want_tracker = _cache_key(track_id, "tracker", int(subsong))
     with _state_lock:
         for cache_key, entry in _meta.items():

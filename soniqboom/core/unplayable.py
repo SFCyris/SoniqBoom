@@ -21,9 +21,12 @@ itself, before it produced any audio:
   crashed" / an illegal instruction / "module check failed" / a cruncher it
   can't unpack; sidplayfp's SIDTUNE loader errors (unsupported or invalid
   data); psgplay's invalid SNDH header; openmpt123's "error loading file"
-  (when it prints it — the play renders ``--quiet``).  A uade render that
-  crashed ("score crashed", illegal instruction) with less than a second of
-  output that held nothing audible counts too.
+  (when it prints it — the play renders ``--quiet``); milkyrender's
+  "damaged DSIK module: …", "not a DSIK v1 module" and MilkyPlay load
+  errors; mlrender's "can't load this Musicline Editor module" and "not a
+  Musicline Editor module".  A uade render that crashed ("score crashed",
+  illegal instruction) with less than a second of output that held nothing
+  audible counts too.
 * *silent* — the renderer exits with an error, crashes (SIGSEGV / SIGBUS /
   SIGILL / SIGFPE) or ends with no audio (a header-only WAV) without naming
   a reason; uade's "score died" (its player gave up — also what a missing
@@ -103,7 +106,13 @@ DEFECT = "unplayable"
 FIELDS = ("defect", "defect_detail", "defect_renderer", "defect_at", "defect_evidence")
 PUBLIC_FIELDS = ("defect", "defect_detail", "defect_renderer", "defect_at")
 HEADER = "X-SB-Defect"            # on the 422 of a verified refusal
-RULES = 1                         # bump when ``classify`` changes: every mark is retried
+# Bump when ``classify`` changes or a renderer starts playing what another one
+# refused: every automatic mark is retried once.  2: dsfrender, milkyrender,
+# mlrender and the uade player fixes.  3: GoatTracker, FamiTracker, SunVox
+# and MGSDRV; "can't write" is an I/O failure.  4: xmprender, the C64
+# Sidplayer, the formats libopenmpt and uade play under other names.  5:
+# DefleMask (Furnace) and Sawteeth (sawteethrender).
+RULES = 5
 VERIFY_MAX_S = 20.0
 SWEEP_EVERY_S = 3600.0
 _MIN_FREE_BYTES = 256 * 1024 * 1024
@@ -115,9 +124,22 @@ _BREAKER = 4                      # different files refused in a row → the ren
 # ``stream._renderer_failure``) → its Settings → Renderers key.
 KIND_KEYS = {
     "uade": "uade123", "SID": "sidplayfp", "tracker": "openmpt123", "MED": "zxtune123",
-    "VGM": "zxtune123", "PSF": "zxtune123", "GME": "gme", "MIDI": "fluidsynth",
+    "VGM": "zxtune123", "PSF": "zxtune123", "S98": "zxtune123", "V2M": "zxtune123",
+    "GME": "gme", "MIDI": "fluidsynth",
     "HVL": "hvl2wav", "YM": "ym2wav", "SNDH": "psgplay", "adlib": "adplay", "sc68": "sc68",
+    "DSF": "dsfrender", "DSIK": "milkyrender", "Musicline": "mlrender", "MDX": "mdxrender",
+    # (a GoatTracker render's failing step is sidplayfp playing the SID tune
+    # gt2reloc made; gt2reloc's own failures are refused by name — stream)
+    "SunVox": "sunvoxrender", "MGSDRV": "kssrender", "GoatTracker": "sidplayfp",
+    "FamiTracker": "furnace", "DefleMask": "furnace", "C64 Sidplayer": "sidplayfp",
+    "Sawteeth": "sawteethrender",
 }
+# xmprender's renders pass the module's format name (``metadata.XMP_EXT_NAMES``
+# / ``PW_EXT_NAMES``) as their kind.
+from soniqboom.core.metadata import XMP_EXT_NAMES as _XMP_NAMES, PW_EXT_NAMES as _PW_NAMES  # noqa: E402
+for _n in {*_XMP_NAMES.values(), *_PW_NAMES.values()}:
+    KIND_KEYS.setdefault(_n, "xmprender")
+del _n
 # A render kind (``get_or_render``'s ``format_type``) → the renderer that
 # usually plays it: what a render that played proves (``_proven``).
 FORMAT_KEYS = {
@@ -133,13 +155,27 @@ NAMES = {
     "hvl2wav": "the HivelyTracker player (hvl2wav)", "ym2wav": "the YM player (ST-Sound)",
     "psgplay": "the Atari ST player (psgplay)", "adplay": "the AdLib player (AdPlug)",
     "sc68": "the Atari ST player (sc68)",
+    "dsfrender": "the Dreamcast player (dsfrender)",
+    "milkyrender": "the DSIK module player (MilkyPlay)",
+    "mlrender": "the Musicline Editor player (mlrender)",
+    "mdxrender": "the X68000 MDX player (mdxrender)",
+    "sunvoxrender": "the SunVox player (sunvoxrender)",
+    "kssrender": "the MSX player (kssrender)",
+    "gt2reloc": "the GoatTracker converter (gt2reloc)",
+    "furnace": "the FamiTracker and DefleMask player (Furnace)",
+    "xmprender": "the module player (libxmp)",
+    "sawteethrender": "the Sawteeth player (sawteethrender)",
 }
+
+# Furnace's load failure: "could not open file! (<reason>)".
+_FURNACE_LOAD_RE = re.compile(r"could not open file!\s*\(([^)\n]{1,120})\)", re.IGNORECASE)
 
 # stderr that is about reaching or writing a file, the machine or how the
 # renderer was called — never about the file's content.
 _IO_RE = re.compile(
     r"no such file|permission denied|not permitted|no space left|disk full|quota|"
     r"input/output error|i/o error|read error|write error|short read|file not found|"
+    r"can't write|cannot write|can not write|"
     r"can not request amiga file|"
     r"could not open|cannot open|can't open|can not open|unable to open|failed to open|"
     r"error opening|opening output|could not create|cannot create|can't create|"
@@ -161,6 +197,14 @@ _LOADER_RE = re.compile(
 _STOP_SIGNALS = {9, 15, 2, 1, 13, 6}       # KILL, TERM, INT, HUP, PIPE, ABRT
 _NOT_RUNNABLE = {126, 127}                  # the shell's "can't execute" / "not found"
 _CRASH_SIGNALS = {11: "SIGSEGV", 10: "SIGBUS", 7: "SIGBUS", 4: "SIGILL", 8: "SIGFPE"}
+# mdxrender's "PDX not found: NAME" line (its exit status 3).
+_PDX_MISSING_RE = re.compile(r"^mdxrender:\s*pdx not found\b", re.IGNORECASE | re.MULTILINE)
+# mlrender asked for a tune (subsong) the module doesn't have: the request,
+# never the file — not marked, and no count against mlrender (``_BREAKER``).
+# (Its own line, a "mlrender: " one: never words of the file's name.)
+_NO_TUNE_RE = re.compile(
+    r"^mlrender:\s*(?:no (?:sub)?(?:song|tune) \d+|(?:sub)?(?:song|tune) \d+ (?:is )?"
+    r"(?:out of range|does ?n[o']t exist|not found))", re.IGNORECASE | re.MULTILINE)
 
 
 class RenderRefusal(HTTPException):
@@ -231,6 +275,72 @@ def _diagnosis(key: str, low: str, text: str) -> "str | None":
         return "doesn't recognise this file" if "unknown filetype" in low else None
     if key == "openmpt123":
         return "can't load this file" if "error loading" in low or "errors loading" in low else None
+    if key == "milkyrender":
+        why = dsik_damage(text)
+        if why:
+            return f"can't play this file: it is damaged ({why})"
+        if "not a dsik v1 module" in low:
+            return "doesn't recognise this file as a DSIK module"
+        return "can't load this file" if "can't load this module" in low else None
+    if key == "mdxrender":
+        return ("doesn't recognise this file as an MDX song"
+                if "not an mdx file" in low else None)
+    if key == "sunvoxrender":
+        if "the project is empty" in low:
+            return "finds nothing to play in this project"
+        return ("doesn't recognise this file as a SunVox project"
+                if "not a sunvox project" in low else None)
+    if key == "xmprender":
+        if "nothing to play" in low or "an empty module" in low:
+            return "finds nothing to play in this module"
+        return ("doesn't recognise this file as a module it plays"
+                if "not a module libxmp plays" in low else None)
+    if key == "sawteethrender":
+        if "nothing to play" in low:
+            return "finds nothing to play in this song"
+        if "a damaged sawteeth module" in low:
+            return "can't load this file (a damaged Sawteeth song)"
+        return ("doesn't recognise this file as a Sawteeth song"
+                if "not a sawteeth module" in low else None)
+    if key == "kssrender":
+        return ("doesn't recognise this file"
+                if "not a kss file this build can play" in low else None)
+    if key == "furnace":
+        # "could not open file! (<why>)" — Furnace's loader naming what is
+        # wrong with the module (not an I/O failure: those name the OS error)
+        m = _FURNACE_LOAD_RE.search(text)
+        if m and not _IO_RE.search(m.group(1).lower()):
+            return f"can't load this file ({_clean(m.group(1))})"
+        return None
+    if key == "mlrender":
+        why = ml_damage(text)
+        if why:
+            return f"can't play this file: it is damaged ({why})"
+        if "can't load this musicline" in low or "not a musicline" in low:
+            return "can't load this file"
+        return None
+    return None
+
+
+def ml_damage(err_text: str) -> "str | None":
+    """What mlrender says is wrong with a Musicline Editor module ("sample
+    3's data runs past the end") from its "damaged Musicline Editor module:
+    …" line, cleaned for a listener; None without one."""
+    for ln in (err_text or "").splitlines():
+        m = re.search(r"damaged musicline editor module:\s*(.+)$", ln, re.IGNORECASE)
+        if m:
+            return _clean(m.group(1)) or None
+    return None
+
+
+def dsik_damage(err_text: str) -> "str | None":
+    """What milkyrender says is wrong with a DSIK module ("pattern 5 is cut
+    short") from its "damaged DSIK module: …" line, cleaned for a listener;
+    None without one."""
+    for ln in (err_text or "").splitlines():
+        m = re.search(r"damaged dsik module:\s*(.+)$", ln, re.IGNORECASE)
+        if m:
+            return _clean(m.group(1)) or None
     return None
 
 
@@ -251,11 +361,20 @@ def classify(kind: str, returncode, err_text: str = "", *, audio: bool = False,
     low = text.lower()
     if _LOADER_RE.search(low) or _USAGE_RE.search(low):
         return None
+    if key == "mlrender" and returncode not in (0, None) and _NO_TUNE_RE.search(text):
+        return None
+    # mdxrender without the PDX sample file the song names: a missing
+    # companion, never the file — not marked.
+    if key == "mdxrender" and _PDX_MISSING_RE.search(text):
+        return None
     # (the emulated Amiga CPU crashing is never an I/O problem — any other
     # reason next to an I/O word is not trusted)
     diag = _diagnosis(key, low, text)
     crash = diag in ("stops on this file: score crashed", "stops on this file: illegal instruction")
-    if not crash and _IO_RE.search(low):
+    # (Furnace says "could not open file!" before every reason it gives — one
+    # its diagnosis read as the module's own is trusted)
+    trusted = crash or (key == "furnace" and diag is not None)
+    if not trusted and _IO_RE.search(low):
         return None
     if audio:
         if tiny and crash:
@@ -461,6 +580,7 @@ async def render_checked(render_fn, format_type: str):
     module docstring).  Returns what the render returned; raises its error
     (a verified one as a 422 naming the reason, ``HEADER`` set)."""
     t0 = time.monotonic()
+    _ran.set(None)                    # (the render names itself — ``renderer_ran``)
     try:
         return await render_fn()
     except RenderRefusal as first:
@@ -606,12 +726,29 @@ def clear(track_id: str, why: str, store=None, *, tell: bool = True) -> bool:
     return True
 
 
+# ``(renderer key, format_type)``: the renderer making the render
+# ``render_checked`` runs, when it isn't the one ``FORMAT_KEYS`` names for
+# its format (dsfrender for a ``psf`` render, milkyrender for a ``tracker``
+# one, mlrender for a ``uade`` one — ``renderer_ran``).
+_ran: "contextvars.ContextVar[tuple[str, str] | None]" = contextvars.ContextVar(
+    "unplayable_ran", default=None)
+
+
+def renderer_ran(key: str, format_type: str) -> None:
+    """Name renderer ``key`` as the one making the current ``format_type``
+    render (called by the render itself); ``rendered_ok`` proves it instead
+    of ``FORMAT_KEYS``' renderer."""
+    _ran.set((key, format_type))
+
+
 def rendered_ok(format_type: str) -> None:
-    """A ``format_type`` render played (stored, not silent): its renderer is
-    proven (and any refusal streak of it ends), and the track of the play it
-    was for — when it rendered the file's default tune — loses an automatic
-    mark."""
-    key = FORMAT_KEYS.get(format_type)
+    """A ``format_type`` render played (stored, not silent): its renderer
+    (``renderer_ran``'s, else ``FORMAT_KEYS``') is proven (and any refusal
+    streak of it ends), and the track of the play it was for — when it
+    rendered the file's default tune — loses an automatic mark."""
+    ran = _ran.get()
+    _ran.set(None)
+    key = ran[0] if ran is not None and ran[1] == format_type else FORMAT_KEYS.get(format_type)
     if key:
         _proven[key] = time.monotonic()
         _streaks.pop(key, None)

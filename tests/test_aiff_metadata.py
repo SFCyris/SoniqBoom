@@ -114,7 +114,8 @@ def test_a_rejected_id3_chunk_keeps_the_stream_info(tmp_path):
     with pytest.raises(Exception):
         AIFF(str(f))
     m = metadata.extract(f, "x")
-    assert (m.title, m.format, m.sample_rate) == ("Bad Tag", "AIFF", 44100)
+    # (the title from the file's NAME chunk — ffmpeg writes one beside the ID3)
+    assert (m.title, m.format, m.sample_rate) == ("RealTitle", "AIFF", 44100)
     assert m.duration == pytest.approx(2.0, abs=0.01)
 
 
@@ -185,7 +186,9 @@ def test_a_network_share_scan_reads_an_aiff_whole(tmp_path):
     data = f.read_bytes()
     assert metadata.HEADER_BUDGET[".aiff"] is None and metadata.HEADER_BUDGET[".aif"] is None
     _p, front, *_ = scanner._extract_one_remote(data[:2 * 1024 * 1024], "ftp://h/s/big.aiff", "r")
-    assert (front.title, front.game) == ("big", "")
+    # (the NAME chunk before the audio gives the title; the ID3 chunk after
+    # it — the game — is missing from a front read)
+    assert (front.title, front.game) == ("RealTitle", "")
     assert front.duration == pytest.approx(30.0, abs=0.01)
     _p, whole, *_ = scanner._extract_one_remote(data, "ftp://h/s/big.aiff", "r")
     assert (whole.title, whole.artist, whole.game) == ("RealTitle", "RealArtist", "Uridium 2")

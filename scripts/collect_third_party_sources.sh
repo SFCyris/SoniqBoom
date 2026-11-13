@@ -46,7 +46,7 @@ fetch() {    # fetch <url> <file> <component> <version> [<expected sha256>]
     fi
 }
 
-git_snapshot() {   # git_snapshot <repo> <ref> <component> — recursive clone incl. submodules
+git_snapshot() {   # git_snapshot <repo> <ref> <component> [<paths left out>] — recursive clone incl. submodules
     local dir="$WORK/$3-$2"
     git clone -q "$1" "$dir"
     git -C "$dir" checkout -q "$2"
@@ -54,6 +54,8 @@ git_snapshot() {   # git_snapshot <repo> <ref> <component> — recursive clone i
     local commit; commit="$(git -C "$dir" rev-parse HEAD)"
     rm -rf "$dir/.git"
     find "$dir" -name .git -prune -exec rm -rf {} +
+    local p
+    for p in ${4:-}; do rm -rf "${dir:?}/$p"; done
     tar -C "$WORK" -czf "$OUT/$3-$2.tar.gz" "$3-$2"
     local version="$2"; [ "$commit" = "$2" ] || version="$2 ($commit)"
     record "$3-$2.tar.gz" "$3" "$version" "$1"
@@ -63,8 +65,8 @@ git_snapshot() {   # git_snapshot <repo> <ref> <component> — recursive clone i
 git_snapshot https://github.com/frno7/psgplay.git "$(arg PSGPLAY_COMMIT)" psgplay
 
 # libkss (kssrender) — pinned commit with the submodules the image builds:
-# the chip cores and kmz80, never kss-drivers (not under libkss's licence,
-# not built — soniqboom/native/kssrender/build.sh)
+# the chip cores and kmz80, never kss-drivers (not under libkss's licence;
+# of its drivers only MGSDRV is built — its header, below)
 LIBKSS_COMMIT="$(arg LIBKSS_COMMIT)"
 LIBKSS_DIR="$WORK/libkss-$LIBKSS_COMMIT"
 git clone -q https://github.com/digital-sound-antiques/libkss.git "$LIBKSS_DIR"
@@ -75,6 +77,89 @@ find "$LIBKSS_DIR" -name .git -prune -exec rm -rf {} +
 tar -C "$WORK" -czf "$OUT/libkss-$LIBKSS_COMMIT.tar.gz" "libkss-$LIBKSS_COMMIT"
 record "libkss-$LIBKSS_COMMIT.tar.gz" libkss "$LIBKSS_COMMIT" \
     https://github.com/digital-sound-antiques/libkss.git
+
+# MGSDRV (kssrender) — the one driver header of kss-drivers the image builds,
+# as published (MGSDRV may be redistributed unmodified — Ain./Gigamix)
+KSS_DRIVERS_COMMIT="$(arg KSS_DRIVERS_COMMIT)"
+fetch "https://raw.githubusercontent.com/digital-sound-antiques/kss-drivers/${KSS_DRIVERS_COMMIT}/mgsdrv.h" \
+      "mgsdrv-${KSS_DRIVERS_COMMIT}.h" mgsdrv "$KSS_DRIVERS_COMMIT" "$(arg MGSDRV_H_SHA256)"
+
+# GoatTracker 2 (gt2reloc) — the release archive soniqboom/native/goattracker/
+# build.sh builds unmodified
+GOATTRACKER_VERSION="$(arg GOATTRACKER_VERSION)"
+fetch "https://sourceforge.net/projects/goattracker2/files/GoatTracker%202/${GOATTRACKER_VERSION}/GoatTracker_${GOATTRACKER_VERSION}.zip/download" \
+      "GoatTracker_${GOATTRACKER_VERSION}.zip" goattracker "$GOATTRACKER_VERSION" \
+      "$(arg GOATTRACKER_SHA256)"
+
+# SunVox Library (sunvoxrender) — its release archive (the library's source)
+SUNVOX_LIB_VERSION="$(arg SUNVOX_LIB_VERSION)"
+fetch "https://warmplace.ru/soft/sunvox/sunvox_lib-${SUNVOX_LIB_VERSION}.zip" \
+      "sunvox_lib-${SUNVOX_LIB_VERSION}.zip" sunvox_lib "$SUNVOX_LIB_VERSION" \
+      "$(arg SUNVOX_LIB_SHA256)"
+
+# libxmp (xmprender) — its release archive, built unmodified
+LIBXMP_VERSION="$(arg LIBXMP_VERSION)"
+fetch "https://github.com/libxmp/libxmp/releases/download/libxmp-${LIBXMP_VERSION}/libxmp-${LIBXMP_VERSION}.tar.gz" \
+      "libxmp-${LIBXMP_VERSION}.tar.gz" libxmp "$LIBXMP_VERSION" "$(arg LIBXMP_SHA256)"
+
+# Furnace (furnace-headless) — the pinned commit with the two submodules the
+# headless build compiles (extern/fmt, extern/adpcm); its demo songs (not
+# under the GPL), instruments and wavetables (not built, no licence stated)
+# are left out
+FURNACE_COMMIT="$(arg FURNACE_COMMIT)"
+FURNACE_DIR="$WORK/furnace-$FURNACE_COMMIT"
+git init -q "$FURNACE_DIR"
+git -C "$FURNACE_DIR" remote add origin https://github.com/tildearrow/furnace.git
+git -C "$FURNACE_DIR" fetch -q --depth 1 origin "$FURNACE_COMMIT"
+git -C "$FURNACE_DIR" checkout -q FETCH_HEAD
+git -C "$FURNACE_DIR" submodule update -q --init --depth 1 extern/fmt extern/adpcm
+find "$FURNACE_DIR" -name .git -prune -exec rm -rf {} +
+rm -rf "${FURNACE_DIR:?}/demos" "${FURNACE_DIR:?}/instruments" "${FURNACE_DIR:?}/wavetables"
+tar -C "$WORK" -czf "$OUT/furnace-$FURNACE_COMMIT.tar.gz" "furnace-$FURNACE_COMMIT"
+record "furnace-$FURNACE_COMMIT.tar.gz" furnace "$FURNACE_COMMIT" \
+    https://github.com/tildearrow/furnace.git
+
+# Highly Theoretical and psflib (dsfrender) — pinned commits.  Of Highly
+# Theoretical only its Dreamcast core is built (soniqboom/native/dsfrender/
+# build.sh); never its 68000 cores Musashi (Core/m68k) and Starscream
+# (Core/Starscream), under their own licences, and C68K (Core/c68k,
+# GPL-2.0-or-later) — none of them built — which are left out.
+git_snapshot https://github.com/kode54/Highly_Theoretical.git "$(arg HT_COMMIT)" Highly_Theoretical \
+    "Core/m68k Core/Starscream Core/c68k"
+git_snapshot https://github.com/kode54/psflib.git "$(arg PSFLIB_COMMIT)" psflib
+# MilkyTracker (milkyrender builds MilkyPlay, its src/milkyplay) — pinned commit
+MILKYTRACKER_COMMIT="$(arg MILKYTRACKER_COMMIT)"
+fetch "https://github.com/milkytracker/MilkyTracker/archive/${MILKYTRACKER_COMMIT}.tar.gz" \
+      "milkytracker-${MILKYTRACKER_COMMIT}.tar.gz" milkytracker "$MILKYTRACKER_COMMIT"
+
+# musicline_playback (mlrender) — the files soniqboom/native/mlrender/build.sh
+# builds, from DEViLBOX at the pinned commit: DEViLBOX's licence and
+# third-party notices and the port's replayer sources (never the rest of
+# DEViLBOX, nor the port's uade copy); build.sh resizes MAX_INTERNAL_TICK in
+# module.h and applies soniqboom/native/mlrender/musicline_playback.patch
+# (with ml_bounds.h, both in the SoniqBoom source) when it builds them
+DEVILBOX_COMMIT="$(arg DEVILBOX_COMMIT)"
+ML_DIR="$WORK/musicline_playback-$DEVILBOX_COMMIT"
+ML_PORT=third-party/musicline_playback-main/musicline
+git init -q "$ML_DIR"
+git -C "$ML_DIR" remote add origin https://github.com/spotUP/DEViLBOX.git
+git -C "$ML_DIR" config core.sparseCheckout true
+printf '%s\n' /LICENSE /THIRD_PARTY_NOTICES.md "/$ML_PORT/*.cpp" "/$ML_PORT/*.h" \
+    "/$ML_PORT/player/mline_backend.cpp" "/$ML_PORT/player/mline_backend.h" \
+    > "$ML_DIR/.git/info/sparse-checkout"
+git -C "$ML_DIR" fetch -q --depth 1 --filter=blob:none origin "$DEVILBOX_COMMIT"
+git -C "$ML_DIR" checkout -q FETCH_HEAD
+rm -rf "$ML_DIR/.git"
+tar -C "$WORK" -czf "$OUT/musicline_playback-$DEVILBOX_COMMIT.tar.gz" \
+    "musicline_playback-$DEVILBOX_COMMIT"
+record "musicline_playback-$DEVILBOX_COMMIT.tar.gz" musicline_playback "$DEVILBOX_COMMIT" \
+    https://github.com/spotUP/DEViLBOX.git
+
+# portable_mdx (mdxrender) — the commit soniqboom/native/mdxrender/build.sh
+# builds unmodified
+PORTABLE_MDX_COMMIT="$(arg PORTABLE_MDX_COMMIT)"
+fetch "https://github.com/yosshin4004/portable_mdx/archive/${PORTABLE_MDX_COMMIT}.tar.gz" \
+      "portable_mdx-${PORTABLE_MDX_COMMIT}.tar.gz" portable_mdx "$PORTABLE_MDX_COMMIT"
 
 # zxtune — the image installs the official zxtune123 build of this revision
 ZXREV="$(arg ZXTUNE_REV)"

@@ -19,6 +19,9 @@ lossless and DSD — with ffmpeg and the retro-format players baked in.
 > **Mac:** open the **Terminal** app (press Cmd-Space, type "Terminal"). **Windows:** after
 > installing Docker Desktop, open **PowerShell** (Start menu → type "PowerShell").
 > **Linux:** you already know where it is. Paste each command and press Enter.
+> The commands use Mac/Linux syntax. In PowerShell, put a command that is split over
+> several lines (lines ending in `\`) on one line without the `\`, run commands joined
+> with `&&` one after the other, and write `IMAGE=…` as `$IMAGE = "…"`.
 
 ## Step 0 — Install Docker (once)
 
@@ -42,7 +45,7 @@ docker --version
 > `ghcr.io/sfcyris/soniqboom:latest`; each release is also tagged with its version
 > (for example `:2.0.0`, and `:2.0` for the newest 2.0.x). In `docker-compose.yml`,
 > comment out `build: .` and uncomment the `image:` line (there's a comment marking the
-> spot), then use `docker compose pull && docker compose up -d` at step 3 — it starts in
+> spot), then use `docker compose pull` and then `docker compose up -d` at step 3 — it starts in
 > seconds instead of compiling the players. Building from source (below) is only needed
 > to modify SoniqBoom.
 
@@ -57,7 +60,9 @@ mkdir -p music
 #    ln -s /path/to/your/music music
 
 # 3. Build and start (first run takes a few minutes — it compiles the
-#    retro-format players; after that, starts in seconds)
+#    retro-format players; after that, starts in seconds).  To leave out the
+#    online collections or the scene information, first uncomment
+#    SONIQBOOM_COLLECTIONS / SONIQBOOM_SCENE_INFO in docker-compose.yml (see Step 2).
 docker compose up -d
 
 # 4. Create your login — replace 'me' and the password with your own (keep the quotes)
@@ -103,9 +108,9 @@ your library and fetched when you play them; the Modland catalogue needs about 1
 memory) and downloads the **scene information**
 (HVSC song lengths and STIL, the Modland checksum list, the UADE song database and
 Demozoo, about 250 MB). To leave either out, or pick some, set
-`SONIQBOOM_COLLECTIONS` / `SONIQBOOM_SCENE_INFO` before the first start (see
-[Configuration](#configuration)). To add them later, see
-[Handy commands](#handy-commands).
+`SONIQBOOM_COLLECTIONS` / `SONIQBOOM_SCENE_INFO` (the `environment:` lines in
+`docker-compose.yml`) before the first start (see [Configuration](#configuration)); after
+it, add or remove them as described in [Handy commands](#handy-commands).
 
 ---
 
@@ -159,15 +164,23 @@ well: `dpkg --print-architecture` must print `arm64`. If it prints `armhf`, the 
 32-bit OS (even when `uname -m` prints `aarch64`): install the 64-bit Raspberry Pi OS.
 
 **Build on the machine you'll run it on** and you never have to think about architecture.
-Several players are compiled from source during the build — the C64 SID chain
-(`sidplayfp` with reSIDfp), `libgme`, `psgplay`, `kssrender` (MSX KSS, libkss), the Amiga
+Several players are compiled from source during the build — libopenmpt
+(`openmpt123`), the C64 SID chain (`sidplayfp` with reSIDfp), `libgme`, `psgplay`, `kssrender` (MSX KSS and MGSDRV, libkss), `dsfrender`
+(Dreamcast DSF, Highly Theoretical), `milkyrender` (early DSIK `.dsm` modules, MilkyPlay),
+`mlrender` (Musicline Editor, musicline_playback), `mdxrender` (X68000 MDX, portable_mdx),
+`gt2reloc` (GoatTracker), `sunvoxrender` (SunVox, the SunVox Library), `furnace-headless`
+(FamiTracker and DefleMask, Furnace), `xmprender` (libxmp modules, libxmp), `sawteethrender`
+(Sawteeth, NostalgicPlayer's player ported to C), the Amiga
 `uade123`, the Atari-ST `sc68` and the bundled HivelyTracker and ST-Sound engines
 (`hvl2wav`, `ym2wav`) — and
 compiling them for a *different* CPU than your own (cross-building) can fail.
 The build then stops and lists the missing players. Build on a machine of the target CPU;
-or pass `--build-arg SLIM=1` to leave out `uade123` and `sc68` (AHX, the Amiga "exotica"
-formats and `.sc68` disks then don't play), or `--build-arg ALLOW_MISSING_RENDERERS=1` to
-finish the build without whichever players are missing.
+or build with `docker compose build --build-arg SLIM=1` (then `docker compose up -d`) to
+leave out `uade123` and `sc68` (AHX, the Amiga "exotica" formats and `.sc68` disks then
+don't play), or with `--build-arg ALLOW_MISSING_RENDERERS=1` to finish the build without
+whichever players are missing. A later `docker compose up -d --build` builds without the
+argument again; to keep it, add it to `docker-compose.yml`
+(`build: { context: ., args: { SLIM: "1" } }`).
 
 ### Plain `docker run` (without Compose)
 
@@ -235,7 +248,7 @@ See [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md#source-code-for-distribute
 | `/music` | Your audio library | read-only (`-v /your/music:/music:ro`) — the server can't change your files |
 | `/data`  | The library index, **user accounts**, settings, SoundFonts you add, saved share passwords and last.fm / ListenBrainz logins, logs, the cover-art and render caches, the cache of files played from network shares, and downloaded metadata indexes | a named volume (`soniqboom-data`) — **this is what you back up** |
 
-Editing tags in the browser (Track Info → **✏️ Edit tags**) and **Save fetched lyrics to
+Editing tags in the browser (Track Info → **Edit tags**) and **Save fetched lyrics to
 files** write into your music files, so they need the music mounted without `:ro`.
 
 Paths you type into SoniqBoom are paths inside the container — music folders under
@@ -277,8 +290,9 @@ that container's last.fm / ListenBrainz logins either: enter them again under ge
 Back up the `soniqboom-data` volume (`/data`): it holds the library index, the user
 accounts (`users.json` with the `secret.key` it needs), the Subsonic apps' stars,
 bookmarks and saved play queues (`subsonic_state.json`), the settings file and SoundFonts
-(`/data/soniqboom`), the key for saved passwords and logins (`credential.key`) and the
-logs. Caches you can leave out of the backup: `/data/cache/remote`, `/data/zip-extracts`
+(`/data/soniqboom`), the key for saved passwords and logins (`credential.key`), each
+account's radio Favorites (`/data/radio`), the copies of the library database made before an
+update converted it (`/data/backups`) and the logs. Caches you can leave out of the backup: `/data/cache/remote`, `/data/zip-extracts`
 and `/data/soniqboom/cache`. Backups and restores
 **never touch your music files** — all of this is just the index and settings.
 
@@ -298,9 +312,10 @@ docker compose exec soniqboom soniqboom-setadm -user me -passwd 'change-this-pas
 
 **Portable export.** For a self-contained copy of the library index — tracks, playlists,
 ratings, play history and the music folder list — use gear → **Backup → Export .sbz**.
-With the server stopped, `docker compose run --rm -v "${PWD}:/backup" soniqboom soniqboom export /backup/soniqboom.sbz`
-writes one into the SoniqBoom folder instead. User accounts, the settings file, the Subsonic
-apps' stars, bookmarks and play queues, and the radio Favorites are not in the `.sbz`.
+`docker compose run --rm -v "${PWD}:/backup" soniqboom soniqboom export /backup/soniqboom.sbz`
+writes one into the SoniqBoom folder instead (it only reads, so the server can keep running).
+Each account's radio Favorites are in the `.sbz`; user accounts, the settings file and the
+Subsonic apps' stars, bookmarks and play queues are not.
 
 To restore one, copy the `.sbz` into the SoniqBoom folder (the one with
 `docker-compose.yml`) and run these commands there (for the HTTPS setup, add
@@ -416,6 +431,11 @@ Browser sign-ins are kept on `/data` too (`sessions.json`), so browsers stay sig
 a restart; Subsonic apps sign in with every request. The version you're running is shown in
 gear → **System → About**.
 
+An update that changes the library database's format first copies its files to
+`/data/backups/db-v<old>-<date-time>/`. An older SoniqBoom refuses to start on a database a
+newer version wrote: to go back to an older image, restore that copy (or a backup of
+`/data`) first.
+
 ---
 
 ## Automatic HTTPS (access over the internet)
@@ -425,11 +445,9 @@ The repo ships a Caddy setup that gets a real Let's Encrypt certificate automati
 1. Point your domain's DNS at the host and open ports **80** and **443**.
 2. Edit [`deploy/Caddyfile`](deploy/Caddyfile) — replace `music.example.com` with your domain.
 3. If the Step 1 setup is running, stop it with `docker compose down` (your data volume,
-   with your settings, is kept). Then launch:
-
-   ```bash
-   docker compose -p soniqboom -f deploy/docker-compose.https.yml up -d
-   ```
+   with your settings, is kept). `docker-compose.yml` settings you changed (the music
+   folder, `:ro`, `TZ`, the `SONIQBOOM_*` lines) go into `deploy/docker-compose.https.yml`
+   too: it has its own.
 
    `-p` must be the Step 1 setup's project name, so this setup uses the same data
    volume: the part before `_soniqboom-data` in `docker volume ls` (`soniqboom` for a git
@@ -437,14 +455,21 @@ The repo ships a Caddy setup that gets a real Let's Encrypt certificate automati
    with every `docker compose` command for this setup. An HTTPS setup first started
    without `-p` uses its own volume, `deploy_soniqboom-data`: keep leaving `-p` out for
    that one.
-4. On a new install, create your login now:
+4. On a new install, create your login before the first start (until an account exists,
+   the server lets anyone set it up):
 
    ```bash
-   docker compose -p soniqboom -f deploy/docker-compose.https.yml exec soniqboom \
+   docker compose -p soniqboom -f deploy/docker-compose.https.yml run --rm soniqboom \
      soniqboom-setadm -user me -passwd 'change-this-password'
    ```
 
-5. Open `https://your-domain`. The certificate is issued on the first request.
+5. Launch:
+
+   ```bash
+   docker compose -p soniqboom -f deploy/docker-compose.https.yml up -d
+   ```
+
+6. Open `https://your-domain`. The certificate is issued on the first request.
 
 Here SoniqBoom is **not** published on the host — only Caddy is — so the single way in is
 over TLS. (Prefer Traefik or nginx-proxy-manager? Point any reverse proxy at the
@@ -465,6 +490,8 @@ map $http_upgrade $connection_upgrade {
 }
 
 # in the server { } block
+client_max_body_size 4g;    # .sbz imports and SoundFont uploads
+
 location / {
     proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
@@ -491,8 +518,8 @@ location ~ ^/(api/stream/|api/stations/relay/|rest/(stream|download|radioStream|
 }
 ```
 
-Keep the `Host` (or `X-Forwarded-Host`) header as above: SoniqBoom compares it with the
-browser's `Origin` to refuse changes made from other sites' pages. Request bodies are
+Keep the `Host` (or `X-Forwarded-Host`) header as above, or changes made in the browser
+are refused (403). Request bodies are
 limited to 16 MB (sign-in and the other `/api/auth/` requests to 64 KB); **Import .sbz** and
 SoundFont uploads may be up to 4 GB, and with *Play SID in browser* on, a browser sends the
 SID audio it rendered (up to 64 MB) to the server's render cache — let them through the
@@ -533,7 +560,8 @@ the file: `SONIQBOOM_CONVERSION_CACHE_DIR`, `SONIQBOOM_ART_CACHE_DIR`,
 `SONIQBOOM_SOUNDFONTS_DIR` (`/data/soniqboom/soundfonts` in the image; while the folder
 holds no SoundFont, the server links in the one named by `SONIQBOOM_DEFAULT_SOUNDFONT`,
 FluidR3_GM in the image, when it starts), `SONIQBOOM_DISCOGS_TOKEN` (a Discogs
-personal access token, used to find covers for the song a radio station is playing) and
+personal access token, used to find covers for the song a radio station is playing; set
+this way, gear → Metadata → Discogs shows it as set and can't change it) and
 `SONIQBOOM_RADIO_ART_LOOKUP` (`false` turns that cover lookup off, so the station's
 artist and title aren't sent to MusicBrainz or Discogs). Services (web UI, the
 `soniqboom services` command or the file), network shares and the sign-up and password
@@ -614,19 +642,34 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
 - **Renderers degrade gracefully.** If a format won't play, the player names the package
   it needs; everything else keeps working. The image includes every player: ffmpeg,
   FluidSynth and adplay from Debian; libopenmpt / openmpt123 0.8.9, sidplayfp 3.1.0
-  (with the reSIDfp engine), libgme 0.6.5, psgplay, sc68, `kssrender` (MSX KSS, built
-  from libkss) and `uade123` (Amiga AHX and the ~175 Amiga "exotica" players) compiled
+  (with the reSIDfp engine), libgme 0.6.5, psgplay, sc68, `kssrender` (MSX KSS and MGSDRV
+  songs, built from libkss with the MGSDRV driver), `dsfrender` (Dreamcast and Naomi DSF, built from Highly Theoretical and
+  psflib), `milkyrender` (early DSIK `.dsm` modules, built from MilkyPlay), `mlrender`
+  (Musicline Editor tunes uade renders as silence, built from musicline_playback),
+  `mdxrender` (Sharp X68000 MDX songs, built from portable_mdx), `gt2reloc` (GoatTracker
+  songs, built from GoatTracker 2.77), `sunvoxrender` (SunVox projects, built from the
+  SunVox Library 2.1.4d), `furnace-headless` (FamiTracker and DefleMask modules, built from Furnace
+  0.6.8.3), `xmprender` (the modules only libxmp plays and the packed Amiga modules
+  SoniqBoom converts, built from libxmp 4.7.4), `sawteethrender` (Sawteeth songs, compiled
+  from SoniqBoom's own source) and
+  `uade123` (Amiga AHX and the ~175 Amiga "exotica" players) compiled
   from source; the prebuilt zxtune123; and the bundled ST-Sound (`.ym`) and
   HivelyTracker (`.hvl`) engines.
-  The image build stops if any of them is missing, or if adplay or kssrender renders its
-  short test tune as silence (unless built with `--build-arg ALLOW_MISSING_RENDERERS=1`). gear → **Renderers → Renderer Status** shows
+  The image build stops if any of them is missing, if adplay, kssrender, dsfrender,
+  milkyrender, mlrender, mdxrender, xmprender or sawteethrender renders its short test tune as silence, or if gt2reloc
+  with sidplayfp, sunvoxrender or furnace-headless renders an example song of its own
+  source as silence (unless built with
+  `--build-arg ALLOW_MISSING_RENDERERS=1`). gear → **Renderers → Renderer Status** shows
   each one and the version it reports.
 - **LHA archives.** The image reads `.lha` / `.lzh` archives with its built-in readers —
   header levels 0–3 and the methods `-lh0-`, `-lh1-`, `-lh4-` … `-lh7-`, `-lz4-`, `-lz5-`
-  and `-lzs-` — and has no `lha` (lhasa) program, so an archive packed with another
-  method (`-lh2-`, `-lh3-`, `-pm0-` … `-pm2-`, `-lk7-`) isn't opened.
+  and `-lzs-` — and an archive packed with another method (`-lh2-`, `-lh3-`, `-pm0-` …
+  `-pm2-`, `-lk7-`) with the `lha` program from Debian's lhasa package.
 - **Face The Music.** `.ftm` modules (and `FTM.title` names in archives) play through the
-  image's libopenmpt 0.8.9; a module saved without its samples doesn't play.
+  image's libopenmpt 0.8.9; a module saved without its samples doesn't play. A FamiTracker
+  `.ftm` module is told apart by its content and plays through `furnace-headless`, as
+  does a DefleMask `.dmf` module (X-Tracker, DSMI Compact and Software Visions `.dmf`
+  modules play through libopenmpt).
 - **Slim image.** `docker build --build-arg SLIM=1 -t soniqboom .` leaves out `uade123`
   and `sc68` (AHX, the Amiga "exotica" family and native `.sc68` disks); every other
   format still plays.
@@ -673,7 +716,8 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
     Subsonic apps show;
   - `musicbrainz.org` and `coverartarchive.org` (its images come from `archive.org`), and
     `api.discogs.com` (and the image address it names) with a Discogs token, for the cover
-    of the song a station is playing;
+    of the song a station is playing, and when **Test token** (gear → Metadata → Discogs)
+    checks a token;
   - `api.listenbrainz.org` / `ws.audioscrobbler.com` (last.fm) for scrobbling, once an
     account is connected (a scrobble that couldn't be sent is tried again every minute,
     from startup on);

@@ -593,3 +593,89 @@ async def test_a_group_members_tune_is_credited_to_the_member(env):
                         added_at=1, dir_hash="d", root_h="r")
     assert t["artist"] != "Worktunes"
 
+
+
+# ── A group's folder: the member as artist, the group as album artist ──────
+
+def test_a_members_tune_keeps_the_group_as_album_artist():
+    """``group_album_artist``: a tune whose own author is someone else than
+    the composer its folder names (a group's folder holding a member's tune)
+    gets the folder's name as album artist; the folder's composer — alone, in
+    a collaboration, with a remark, by handle — or no author never does."""
+    g = online_hvsc.group_album_artist
+    for author, want in (("ESM", "Art of Noise"), ("Exxos", "Art of Noise"),
+                         ("Art of Noise", None), ("<?>", None), ("", None)):
+        d = {"artist": author}
+        g(d, "Art of Noise")
+        assert d.get("album_artist") == want, author
+    for author in ("Rob Hubbard", "Rob Hubbard & Ben Daglish", "Rob Hubbard (remix)",
+                   "Rob Hubbard/Ben Daglish"):
+        d = {"artist": author}
+        g(d, "Hubbard Rob")
+        assert "album_artist" not in d, author
+    # The composer's name with a handle of two words — the handle is the folder.
+    d = {"artist": "J. Wassermann (Spider Jerusalem)"}
+    g(d, "Spider Jerusalem")
+    assert "album_artist" not in d
+    # A member of a group, the group abbreviated beside the name: the group.
+    d = {"artist": "Ludovic Llorca (Harmony Prods)"}
+    g(d, "Harmony Productions")
+    assert d["album_artist"] == "Harmony Productions"
+    for author in ():
+        d = {"artist": author}
+        g(d, "Hubbard Rob")
+        assert "album_artist" not in d, author
+    d = {"artist": "ESM", "album_artist": "Mine"}
+    g(d, "Art of Noise")
+    assert d["album_artist"] == "Mine"                       # (one already there stays)
+
+
+def test_the_first_play_merge_sets_it(monkeypatch):
+    cat = online_hvsc.HVSC_ONLINE
+    monkeypatch.setattr(cat, "_credits", lambda: {})
+    d = cat.merged_fields({"artist": "ESM", "title": "Renegade v2.0"}, {},
+                          "MUSICIANS/A/Art_of_Noise/Renegade_v2_0.sid")
+    assert (d["artist"], d["album_artist"]) == ("ESM", "Art of Noise")
+    d = cat.merged_fields({"artist": "Rob Hubbard"}, {}, "MUSICIANS/H/Hubbard_Rob/Commando.sid")
+    assert "album_artist" not in d
+    # Modland's HVSC mirror merges the same way.
+    from soniqboom.core import modland_catalog as mc
+    monkeypatch.setattr(mc, "_siblings_map", lambda: {})
+    old = {"id": "m", "path": mc.track_path("HVSC/MUSICIANS/A/Art_of_Noise/Renegade_v2_0.sid"),
+           "title": "Renegade v2 0", "artist": "Art of Noise"}
+    m = mc.merged_track(old, {"artist": "ESM", "title": "Renegade v2.0", "format": "SID"},
+                        "Renegade_v2_0")
+    assert (m["artist"], m.get("album_artist")) == ("ESM", "Art of Noise")
+
+
+@pytest.mark.asyncio
+async def test_tunes_played_before_get_it_at_start(env):
+    """Played tunes merged before the rule: ``fill_group_album_artists``
+    (run at start) sets it; unplayed tunes, the composer's own tunes and an
+    album artist the user typed are left as they are."""
+    await _enable(env)
+    cat, store = env["cat"], env["store"]
+    commando = cat.track_id("MUSICIANS/H/Hubbard_Rob/Commando.sid")
+    monty = cat.track_id("MUSICIANS/H/Hubbard_Rob/Monty_on_the_Run.sid")
+    arkanoid = cat.track_id("GAMES/A-F/Arkanoid.sid")
+    now = time.time()
+    store.update_track_fields_batch([
+        (commando, {"artist": "Ben Daglish", "mtime": now}),          # someone else's tune
+        (monty, {"artist": "Rob Hubbard", "mtime": now}),             # the composer's own
+        (arkanoid, {"artist": "Ben Daglish", "mtime": now}),          # (no composer folder)
+    ])
+    cat._learned = None
+    assert await cat.fill_group_album_artists() == 1
+    assert store.get_track(commando)["album_artist"] == "Hubbard Rob"
+    assert not store.get_track(monty).get("album_artist")
+    assert not store.get_track(arkanoid).get("album_artist")
+    assert await cat.fill_group_album_artists() == 0                  # (once)
+    # One an earlier rule set where this one gives none: taken back.
+    store.update_track_fields_batch([(monty, {"album_artist": "Hubbard Rob"})])
+    assert await cat.fill_group_album_artists() == 1
+    assert not store.get_track(monty).get("album_artist")
+    # … but never one the user typed.
+    store.update_track_fields_batch([(monty, {"album_artist": "Hubbard Rob",
+                                              "user_edited": ["album_artist"]})])
+    assert await cat.fill_group_album_artists() == 0
+    assert store.get_track(monty)["album_artist"] == "Hubbard Rob"

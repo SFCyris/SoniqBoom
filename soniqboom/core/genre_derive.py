@@ -77,6 +77,8 @@ import logging
 import re
 import time
 
+from soniqboom.core import prowizard as _prowizard   # (the packed formats: Amiga)
+
 log = logging.getLogger(__name__)
 
 CONFIG_KEY = "genre_names_in_genres"        # setting: on by default
@@ -111,10 +113,16 @@ _FORMAT_PLATFORM = {
     "SSF": "Saturn", "DSF (Dreamcast)": "Dreamcast",
     "SNDH": "Atari ST", "YM": "Atari ST", "SC68": "Atari ST",
     "AHX": "Amiga", "HivelyTracker": "Amiga",
+    "V2M": "PC",            # Farbrausch V2: Windows demoscene productions
+    "MDX": "X68000",
+    "GoatTracker": "SID", "FamiTracker": "NES", "MGSDRV": "MSX", "C64 Sidplayer": "SID",
     # Amiga-born sample trackers (PC trackers — S3M, XM, IT … — name no
     # platform).
     "ProTracker": "Amiga", "OctaMED": "Amiga", "SoundFX": "Amiga",
     "Oktalyzer": "Amiga", "DigiBooster Pro": "Amiga", "Face The Music": "Amiga",
+    "ProTracker IFF": "Amiga", "ChipTracker": "Amiga", "Titanics Player": "Amiga",
+    "STIM": "Amiga", "The Dark Demon": "Amiga", "Eureka Packer": "Amiga",
+    **{_n: "Amiga" for _n in _prowizard.FORMATS},       # (packed ProTracker modules)
     "MIDI": "MIDI", "General MIDI": "MIDI",
 }
 _FAMILY_PLATFORM = {"adlib": "AdLib", "atari": "Atari ST", "sid": "SID", "midi": "MIDI",
@@ -126,7 +134,7 @@ _DOS_PLAYER_RE = re.compile(r"\bAGI\b")
 
 # Console / handheld rips: the music of a game.
 _GAME_RIP_FAMILIES = frozenset({"nes", "snes", "gameboy", "genesis", "pce", "vgm", "psf"})
-_GAME_RIP_FORMATS = frozenset({"KSS"})
+_GAME_RIP_FORMATS = frozenset({"KSS", "S98"})
 
 # The extractor's format words (``core/metadata.py``): not a genre the file
 # names.  With the derived vocabulary, the words a "real" genre is not.

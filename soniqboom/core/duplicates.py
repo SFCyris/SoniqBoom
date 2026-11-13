@@ -32,13 +32,17 @@ from typing import Any
 # ── Format quality scoring ───────────────────────────────────────────────────
 
 # Lossless formats get the highest score
-_LOSSLESS_FORMATS = {"FLAC", "ALAC", "WAV", "WAVE", "AIFF"}
+_LOSSLESS_FORMATS = {"FLAC", "ALAC", "WAV", "WAVE", "AIFF", "TRUEHD", "MLP", "DTS-HD MA"}
 
 # Lossy format tiers (format_upper → base score)
 _LOSSY_SCORES: dict[str, int] = {
     "OGG VORBIS": 82,
     "OPUS": 82,
     "AAC": 78,
+    "E-AC-3": 74,
+    "AC-3": 70,
+    "DTS-HD HRA": 80,
+    "DTS": 72,
     "MP3": 65,  # adjusted upward by bitrate below
 }
 

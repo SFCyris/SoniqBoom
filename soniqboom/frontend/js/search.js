@@ -449,8 +449,9 @@ function _insertOperator(op) {
   input.focus();
   try { input.setSelectionRange(caret, caret); } catch { /* not a text field */ }
   // No search for a bare operator — the value typed next runs it (the
-  // 'input' handler).  Only the clear button follows the new value.
+  // 'input' handler).  The clear button and Save search follow the new value.
   clear.hidden = !input.value;
+  input.dispatchEvent(new Event('sb:search-set'));   // (app.js: Save as smart playlist)
 }
 
 function _renderSyntaxHint(container) {
@@ -729,6 +730,7 @@ if (_isEdge) {
 clear.addEventListener('click', () => {
   input.value = '';
   clear.hidden = true;
+  input.dispatchEvent(new Event('sb:search-set'));   // (app.js: Save as smart playlist)
   input.focus();  // clear is now hidden — keep keyboard focus on the search field
   _hidePreview();
   Library.showAll();

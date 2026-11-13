@@ -6,8 +6,11 @@
 The remote scan extracts most formats from a front window of the file
 (``metadata.HEADER_BUDGET`` × ``HEADER_BUDGET_MULTIPLIERS``, then the whole
 file — ``scanner._process_one``).  Formats that state their length in a
-header (FLAC STREAMINFO, WAV) read the real length from that window (MP4 /
-M4A / AAC are always read whole).  Two do not, and mutagen measures the
+header (FLAC STREAMINFO) read the real length from that window (MP4 /
+M4A / AAC are always read whole).  A WAV's own reader caps its data chunk at
+what the file holds — a window's length — so the scan measures it again
+from the window's chunk headers and the listing size
+(``metadata.wav_window_length``).  Two more do not, and mutagen measures the
 window instead of the file:
 
 * MP3 without a Xing / Info / VBRI frame count (CBR from most encoders other

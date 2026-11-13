@@ -64,8 +64,9 @@ MODLAND_FILENAME_CONFIG_KEY = "modland_filename_game"
 # Modland game name is recorded also where it is not the album
 # (``game_by_modland`` — ``game:`` searches it); 7 = a file-name guess takes the
 # game-title lists' spelling ("Backtothefuture3" → "Back to the Future III",
-# ``game_titles.list_spelling``).
-MODLAND_APPLY_VERSION = 7
+# ``game_titles.list_spelling``); 8 = Modland's ``_unknown`` author folder is
+# no credit (clears the artist "_unknown" an older apply stamped from it).
+MODLAND_APPLY_VERSION = 8
 APPLY_VERSION_CONFIG_KEY = "modland_apply_version"
 # A stale match (md5 no longer in the index) is withdrawn only when the index
 # looks complete — a truncated download must never wipe the enrichment of
@@ -206,8 +207,10 @@ def refresh_index() -> dict:
 _TWO_LEVEL_FORMAT_DIRS = frozenset({"Ad Lib", "Spectrum", "Video Game Music"})
 # Mirrored foreign trees — no Format/Author semantics at all.
 _MIRROR_DIRS = frozenset({"HVSC"})
+# (Modland files every tune without a known composer under ``_unknown`` —
+# 98,943 rows in the 2026-11 index, where ``- unknown`` no longer occurs.)
 _UNKNOWN_AUTHORS = frozenset({
-    "- unknown", "-unknown", "unknown", "- unkown", "unknown_composer",
+    "- unknown", "-unknown", "unknown", "- unkown", "_unknown", "unknown_composer",
     "unknown composer", "unknown artist",
 })
 # "coop-X" (6,312 rows), "coop - X" (28), "coop X" (21), "coop-&X" (3).
@@ -698,6 +701,30 @@ def _legacy_credit(p: str, fmt_name: str) -> str | None:
     return author
 
 
+def _placeholder_credit(p: str) -> str | None:
+    """The artist credit an apply that didn't know the placeholder stamped
+    for Modland path ``p`` whose author folder is an unknown-author
+    placeholder (``_UNKNOWN_AUTHORS``: ``_unknown``, ``Unknown_Composer`` …)
+    — the folder name as spelled, with its ``coop-X`` partners; None for a
+    path with a real author or none.  Used solely to recognise — and clear —
+    such a credit."""
+    parts = p.split("/")
+    dirs = parts[:-1]
+    if not dirs or dirs[0] in _MIRROR_DIRS:
+        return None
+    k = 2 if dirs[0] in _TWO_LEVEL_FORMAT_DIRS else 1
+    rest = dirs[k:]
+    if not rest or rest[0].strip().lower() not in _UNKNOWN_AUTHORS:
+        return None
+    partners = []
+    for seg in rest[1:]:
+        m = _COOP_RE.match(seg.strip())
+        if not m:
+            break
+        partners.append(m.group(1).strip())
+    return " & ".join([rest[0], *partners])
+
+
 def collect_updates(*, use_filename: bool | None = None,
                     tracks: list[dict] | None = None,
                     matched_ids: set | None = None,
@@ -796,6 +823,8 @@ def collect_updates(*, use_filename: bool | None = None,
         if not fa.field_locked(t, "artist"):
             if credit and not cur_artist:
                 updates["artist"] = credit
+            elif cur_artist and not credit and cur_artist == _placeholder_credit(path):
+                updates["artist"] = ""          # "_unknown" stamped as a composer
             elif cur_artist and cur_artist != (credit or ""):
                 legacy = _legacy_credit(path, fmt_name)
                 if legacy and cur_artist == legacy.strip():

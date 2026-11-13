@@ -22,6 +22,9 @@ freshness_state.json
 /data
 /log
 /cache
+# Your music folder (DEPLOY.md Step 1 copies or links it here): mounted at /music,
+# never part of the image.
+/music
 # Build/packaging tooling and release artifacts — never needed at runtime.
 installer
 dist

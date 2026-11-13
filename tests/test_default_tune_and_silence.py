@@ -358,6 +358,7 @@ def _track(tid="t", fmt="Fred Gray", subsongs=4, default=None, mtime=1.0, durati
            start=None):
     return types.SimpleNamespace(id=tid, format=fmt, subsongs=subsongs, default_subsong=default,
                                  start_subsong=start, mtime=mtime, duration=duration,
+                                 duration_rev=stream._uade_render_rev(),
                                  genre=["Amiga", "Module"], path="/x/" + tid)
 
 
@@ -884,7 +885,11 @@ def test_old_med_magic():
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(not DSM10.exists(), reason="DSIK fixture missing")
-async def test_an_early_dsik_module_is_a_clear_422():
+async def test_an_early_dsik_module_is_a_clear_422(monkeypatch):
+    # (without milkyrender — tests/test_milkyrender.py covers it installed)
+    real_find = stream._find_renderer
+    monkeypatch.setattr(stream, "_find_renderer",
+                        lambda conf, name: None if name == "milkyrender" else real_find(conf, name))
     with pytest.raises(HTTPException) as ei:
         await stream._render_tracker(DSM10)
     assert ei.value.status_code == 422 and "early DSM variant" in ei.value.detail

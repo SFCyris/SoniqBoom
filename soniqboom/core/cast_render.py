@@ -62,6 +62,21 @@ _TRACKER_EXTS = {
 }
 from soniqboom.core.metadata import OPENMPT_EXTRA_EXTS as _OPENMPT_EXTRA_EXTS  # noqa: E402
 _TRACKER_EXTS |= _OPENMPT_EXTRA_EXTS          # (.ftm where libopenmpt reads it)
+from soniqboom.core.metadata import _TRACKER_ALT_EXTS  # noqa: E402
+_TRACKER_EXTS |= set(_TRACKER_ALT_EXTS)       # (.ptm, OctaMED's / ChipTracker's other names)
+# One-tune files their own renderer plays (stream's PSF route — MDX, SunVox,
+# MGSDRV, GoatTracker, FamiTracker, DefleMask, C64 Sidplayer, Sawteeth, the modules xmprender
+# plays): rendered through ``stream._render_psf`` under the key a web play
+# uses.  A GoatTracker ``.sng`` / FamiTracker ``.ftm`` / Sidplayer ``.mus``
+# is named by its record's format (``stream._render_ident``: ".goattracker"
+# / ".famitracker" / ".deflemask" / ".sidplayer" / ".sawteeth"); the suffixes alone are listed so a
+# remote one is fetched before it is told apart.
+from soniqboom.core.metadata import XMP_EXT_NAMES as _XMP_NAMES, PW_EXT_NAMES as _PW_NAMES  # noqa: E402
+_ONE_TUNE_ROUTE_EXTS = {".mdx", ".sunvox", ".mgs", ".goattracker", ".famitracker", ".deflemask",
+                        ".sidplayer", ".sawteeth",
+                        *_XMP_NAMES, *_PW_NAMES}
+_ONE_TUNE_SUFFIXES = {".mdx", ".sunvox", ".mgs", ".sng", ".ftm", ".dmf", ".mus", ".st", *_XMP_NAMES,
+                      *_PW_NAMES}
 # Stream-supported libgme containers (matches _GME_EXTS_STREAM in stream.py).
 _GME_EXTS = {
     ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
@@ -80,7 +95,22 @@ def is_rendered_format(source_ext: str) -> bool:
             or e in _UADE_EXTS
             or e in _HVL_EXTS
             or e in _TRACKER_EXTS
-            or e in _GME_EXTS)
+            or e in _GME_EXTS
+            or e in _ONE_TUNE_ROUTE_EXTS
+            or e in _ONE_TUNE_SUFFIXES)
+
+
+def one_tune_route(track_id: str, track_path: str, track=None) -> "str | None":
+    """The routing name (``stream._render_ident``) of a track one of the
+    one-tune renderers plays — ".mdx", ".sunvox", ".mgs", ".goattracker",
+    ".famitracker", ".deflemask", ".sidplayer", ".sawteeth", an xmprender module's suffix — else None.  ``track``: its record (read from the store
+    when not given)."""
+    from soniqboom.api.stream import _render_ident
+    if track is None:
+        from soniqboom.core.store import get_store
+        track = get_store().get_track(track_id)
+    ext, uade_named = _render_ident(track_path or "", track)
+    return ext if not uade_named and ext in _ONE_TUNE_ROUTE_EXTS else None
 
 
 def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str | None:
@@ -97,6 +127,9 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
     if not e.startswith("."):
         e = "." + e
     from soniqboom.core.conversion_cache import _cache_key
+    if e in _ONE_TUNE_ROUTE_EXTS:
+        from soniqboom.api.stream import _own_engine, _own_variant
+        return _cache_key(track_id, "psf", subsong=0, variant=_own_variant(_own_engine(e)[0]))
     # ``subsong`` 0 is the bare play: the file's default tune, which for a
     # multi-tune Amiga / libgme file may not be its first (``stream.tune_index``).
     # SID maps the wire itself.
@@ -251,11 +284,16 @@ async def _render_input(track_id: str, track_path: str,
     # ``subsong`` 0 is the bare play: the file's default tune — for a
     # multi-tune Amiga / libgme file its first tune that isn't empty, probed
     # once (``stream.ensure_default_tune``, the probe a web play runs).  The
-    # renderers below except SID take the tune index.
+    # renderers below except SID take the tune index.  (A file a one-tune
+    # renderer plays — by its record, ``one_tune_route`` — plays as one track:
+    # no tune to probe; a uade ``.sng`` / ``.mus`` / prefix-named ``.st`` is
+    # probed like any Amiga module.)
     if src_ext not in _SID_EXTS and is_rendered_format(src_ext):
         from soniqboom.api.stream import _bare_play_track, _probe_family, tune_index
         from soniqboom.core.data import get_track
         _track = await get_track(track_id)
+        if one_tune_route(track_id, track_path, _track if _track is not None else {}):
+            return path_obj, src_ext, subsong
         if not subsong and await asyncio.to_thread(path_obj.exists):
             _track = await _bare_play_track(track_id, _track, path_obj,
                                             _probe_family(src_ext, False, path_obj))
@@ -352,6 +390,18 @@ async def prepare_source_for_stream(
     binary is missing, which cast_stream re-raises unchanged.
     """
     path_obj, src_ext, subsong = await _render_input(track_id, track_path, subsong)
+
+    if one_tune_route(track_id, track_path) is not None:
+        # MDX, SunVox, MGSDRV, GoatTracker, FamiTracker, DefleMask, C64 Sidplayer, Sawteeth,
+        # xmprender's modules: their own renderer
+        # (stream's PSF route), under the cache key a web play renders to.
+        from soniqboom.api.stream import _render_psf, _route_variant
+        variant = await asyncio.to_thread(_route_variant, path_obj)
+        cached_path, _hit = await get_or_render(
+            track_id=track_id, format_type="psf", subsong=0, variant=variant,
+            render_fn=lambda: _render_psf(path_obj),
+        )
+        return cached_path, "wav"
 
     if src_ext in _SID_EXTS:
         # Late import — keeps the cast modules independently loadable

@@ -269,6 +269,9 @@ class FtpServer:
         class TCP(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
             daemon_threads = True
+            # Default backlog is 5; on macOS a connect beyond it is reset
+            # (see _webdav_server.py), and an FTP pool opens several at once.
+            request_queue_size = 128
 
         self._srv = TCP((host, port), Handler)
         self.port = self._srv.server_address[1]

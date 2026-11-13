@@ -272,15 +272,18 @@ async def test_a_packed_module_is_unpacked_beside_its_companion(tmp_path):
 
 
 @pytest.mark.skipif(not shutil.which("uade123"), reason="uade123 not installed")
-def test_the_scan_probe_reads_a_packed_module(tmp_path):
+def test_the_scan_probe_reads_a_packed_module(tmp_path, monkeypatch):
     import tempfile as _tf
     from soniqboom.core import metadata
     f = tmp_path / "warriors.ahx"
     f.write_bytes(_sqsh([xpk.unpack(WARRIORS_XPK)]))
-    before = {p.name for p in Path(_tf.gettempdir()).glob("sb-xpk-*")}
+    # Its own temp folder: other tests stage into the system one in parallel.
+    own = tmp_path / "tmp"
+    own.mkdir()
+    monkeypatch.setattr(_tf, "tempdir", str(own))
     info = metadata.uade_get_info(f)
     assert info["_ok"] and info.get("modulename") == "Warriors"
-    assert {p.name for p in Path(_tf.gettempdir()).glob("sb-xpk-*")} == before
+    assert list(own.glob("sb-xpk-*")) == []
 
 
 _HIPPEL = Path(__file__).resolve().parent.parent / "internal" / "testdata" / "uade" / "Hippel" / "dragonflight unicorn.hip"

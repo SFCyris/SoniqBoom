@@ -188,7 +188,9 @@ def stray_temp_wavs() -> "tuple[int, int]":
 RENDERER_NAMES = frozenset({
     "zxtune123", "uade123", "uadecore", "sidplayfp", "fluidsynth", "adplay",
     "psgplay", "sc68", "ym2wav", "hvl2wav", "openmpt123", "gme", "ffmpeg",
-    "metaflac", "lha",
+    "metaflac", "lha", "kssrender", "dsfrender", "milkyrender", "mlrender", "mdxrender",
+    "gt2reloc", "sunvoxrender", "furnace", "furnace-headless", "xmprender",
+    "sawteethrender",
 })
 _IN_CMD_RE = re.compile(r"soniqboom-render-([0-9a-f]{8})-(\d+)-([0-9a-f]{8})(?=/)")
 

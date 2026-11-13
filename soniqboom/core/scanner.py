@@ -1067,8 +1067,12 @@ _SKIP_WAVEFORM_EXTS = {
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
 }
-from soniqboom.core.metadata import OPENMPT_EXTRA_EXTS as _OPENMPT_EXTRA_EXTS  # noqa: E402
-_SKIP_WAVEFORM_EXTS |= _OPENMPT_EXTRA_EXTS        # (.ftm where libopenmpt reads it)
+from soniqboom.core.metadata import (OPENMPT_EXTRA_EXTS as _OPENMPT_EXTRA_EXTS,  # noqa: E402
+                                     _TRACKER_ALT_EXTS, XMP_EXT_NAMES, PW_EXT_NAMES)
+_SKIP_WAVEFORM_EXTS |= _OPENMPT_EXTRA_EXTS        # (the formats libopenmpt reads, where it does)
+# (.ptm and the other names of OctaMED / ChipTracker modules; the modules
+# xmprender plays; C64 Sidplayer songs; DefleMask modules; Sawteeth songs)
+_SKIP_WAVEFORM_EXTS |= {*_TRACKER_ALT_EXTS, *XMP_EXT_NAMES, *PW_EXT_NAMES, ".mus", ".dmf", ".st"}
 
 
 # ── Progress state ────────────────────────────────────────────────────────────
@@ -2003,6 +2007,22 @@ def _extract_one_remote(
         return remote_path, f"{type(exc).__name__}: {exc}", None, None
 
 
+def _not_playable_here(result) -> bool:
+    """Is ``result`` (an ``_extract_one`` result) the error of a file this
+    install has no player for (``metadata.NotPlayableHere``)?  The scan
+    skips such a file without counting an error."""
+    from soniqboom.core.metadata import NOT_PLAYABLE_HERE
+    return isinstance(result, str) and result.startswith(NOT_PLAYABLE_HERE)
+
+
+def _window_refusal(result) -> bool:
+    """Is ``result`` the NotPlayableHere of libopenmpt refusing the bytes it
+    was given (``metadata.LIBOPENMPT_REFUSAL``) — which a front window of a
+    module can earn and the whole file not?"""
+    from soniqboom.core.metadata import LIBOPENMPT_REFUSAL
+    return isinstance(result, str) and LIBOPENMPT_REFUSAL in result
+
+
 class _Culprit(str):
     """The error text of a file that killed or hung its worker alone: the
     remote fetch ladder stops there (a bigger fetch would only do it again)."""
@@ -2383,6 +2403,11 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
                 and _uade.classify(_stem) is not None):
             uade_name = _stem
     is_uade_member = _uade.classify(uade_name) is not None
+    if is_uade_member and real_base.lower().endswith(".sng"):
+        # (a GoatTracker song in Amiga prefix form — ``sng.NAME``, listed as
+        # ``sng.NAME.sng`` — is no uade module: its ``.sng`` name routes it)
+        from soniqboom.core.metadata import is_goattracker_song
+        is_uade_member = not is_goattracker_song(data[:4])
 
     if is_uade_member:
         tdir = Path(tempfile.mkdtemp(prefix="sq_uadescan_"))
@@ -2427,14 +2452,10 @@ def _extract_from_zip(virtual_path: str, track_id: str) -> TrackMeta:
                         for r in archive.raw_namelist(outer)
                         if r.replace("\\", "/").lower().startswith(_prefix)
                     }
-                    _missing = _uade.sonix_missing_instruments(data, _present)
-                    if _missing:
-                        _n = len(_missing)
-                        _shown = ", ".join(_missing[:3]) + ("…" if _n > 3 else "")
-                        meta.defect = "partial"
-                        meta.defect_detail = (
-                            f"{_n} instrument{'s' if _n != 1 else ''} "
-                            f"substituted (silent): {_shown}")
+                    _flag = _uade.sonix_defect(
+                        data, _uade.sonix_missing_instruments(data, _present))
+                    if _flag:
+                        meta.defect, meta.defect_detail = _flag
                 except Exception:
                     log.debug("Sonix instrument check failed for %s",
                               virtual_path, exc_info=True)
@@ -3610,11 +3631,11 @@ _REEXTRACT_VOLATILE = frozenset(_KEEP_ON_REEXTRACT) | {"mtime", "file_size"}
 # both sides have one) they don't count as a change — unless the stored track
 # has no value at all and the extract has one (a checksum an older build
 # didn't compute): that is new information and is written.
-_POST_SCAN_FIELDS = frozenset(("cover_art", "duration", "stil", "hvsc_lengths",
+_POST_SCAN_FIELDS = frozenset(("cover_art", "duration", "duration_rev", "stil", "hvsc_lengths",
                                "subsongs", "start_subsong", "default_subsong",
                                "sid_md5", "file_md5"))
-# Post-scan fields whose 0 is a real value (a tune index), not "unset".
-_POST_SCAN_INDEX_FIELDS = frozenset(("start_subsong", "default_subsong"))
+# Post-scan fields whose 0 is a real value (a tune index, a render revision), not "unset".
+_POST_SCAN_INDEX_FIELDS = frozenset(("start_subsong", "default_subsong", "duration_rev"))
 _SMALL_COMMIT = 2500     # commit deltas up to this size merge into the live sorted indexes
 _DRILL_WRITE_CHUNK = 25  # folder-click refresh: rows per store write (a loop turn after each)
 _DUP_INPUT_FIELDS = ("id", "title", "artist", "album_artist", "duration", "format",
@@ -3767,12 +3788,14 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
 
 
 _FP_KEY = "archive_listing_fp:"
-_ARCHIVE_LISTING_VERSION = 3      # bump when archive discovery rules change
+_ARCHIVE_LISTING_VERSION = 4      # bump when archive discovery rules change
 # 2: re-list every archive once — Linux scans lost members to forked workers
 #    sharing the server's open archive (archive._forget_inherited_archives),
 #    and an automatic scan lists only the members already indexed.
 # 3: members only their bytes name (``archive.sniffed_members``), Face The
 #    Music, and LHA archives lhafile turns down (the embedded reader).
+# 4: DefleMask ``.dmf`` members (Furnace; ``archive._dmf_plays``) and Sawteeth
+#    ``.st`` ones (``archive._st_plays``).
 
 
 def _content_named(members) -> bool:
@@ -3891,8 +3914,10 @@ async def _carry_healed_smb_paths(scan_root: str, ghost_pairs, purge: set,
 
 def _listing_fingerprint() -> str:
     """What decides which archive members discovery lists: the supported
-    formats, the installed uade's name tokens, the owned-extension table and
-    the discovery rules' version."""
+    formats, the installed uade's name tokens, the optional libopenmpt
+    formats (Face The Music shares ``.ftm`` with FamiTracker, always
+    supported — a libopenmpt upgrade must still re-list), the
+    owned-extension table and the discovery rules' version."""
     import hashlib
     from soniqboom.core import metadata as _md, uade_formats as _uf
     try:
@@ -3900,7 +3925,7 @@ def _listing_fingerprint() -> str:
     except Exception:                                   # noqa: BLE001
         tokens = []
     raw = repr((_ARCHIVE_LISTING_VERSION, sorted(_md.SUPPORTED_EXTENSIONS), tokens,
-                sorted(_uf._SUFFIX_OWNED_ELSEWHERE)))
+                sorted(_uf._SUFFIX_OWNED_ELSEWHERE), sorted(_md.OPENMPT_EXTRA_EXTS)))
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -4638,7 +4663,9 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
             for the store or counted as an error, progress, and what the
             stall checks read."""
             nonlocal source_errors, last_ok, hang_run
-            if isinstance(result, str):
+            if _not_playable_here(result):
+                log.debug("Skipped %s: %s", path, result)
+            elif isinstance(result, str):
                 log.error("Metadata error %s: %s", path, result)
                 _progress.errors += 1
             else:
@@ -5708,6 +5735,10 @@ def schedule_startup_enrichment() -> None:
             log.debug("default-length note failed", exc_info=True)
 
         async def _render_lengths() -> None:
+            try:
+                await _repair.rename_formats_once()
+            except Exception:                       # noqa: BLE001
+                log.exception("format relabelling failed")
             try:
                 await _repair.fix_render_lengths_once()
             except Exception:                       # noqa: BLE001
@@ -7700,7 +7731,9 @@ async def _remote_scan_body(
         """Replace ``meta.duration`` when the front window ``head`` of a
         ``size``-byte file capped it (``core/partial_length.py``): an MP3
         without a frame count is re-computed from the listing size and the
-        ID3v2 tag size; an Ogg Vorbis / Opus file gets the length of its
+        ID3v2 tag size; a WAV the length of its data chunk as long as the
+        file is (``metadata.wav_window_length``); an Ogg Vorbis / Opus file
+        gets the length of its
         last page, read from its end (``OGG_TAIL`` bytes) — not from a
         source without real range reads (its ``read_at`` reads the whole
         file).  When that end read fails the window length is kept, logged,
@@ -7712,6 +7745,9 @@ async def _remote_scan_body(
         ext = os.path.splitext(remote_path.lower())[1]
         if ext == _pl.MP3_EXT:
             full = _pl.mp3_length(head, size, meta.duration or 0, meta.bitrate or 0)
+        elif ext == ".wav":
+            from soniqboom.core.metadata import wav_window_length
+            full = wav_window_length(head, size)
         elif ext in _pl.OGG_EXTS and supports_ranges(source):
             off = max(0, size - _pl.OGG_TAIL)
             try:
@@ -7895,7 +7931,10 @@ async def _remote_scan_body(
                 # data is the source's real metadata, not under-shoot.  A file
                 # that killed or hung its worker alone (``_Culprit``) stops
                 # here too: more bytes would only run it again.
-                if not was_partial or isinstance(result, _Culprit):
+                # (a libopenmpt refusal of a front window judged a part of
+                # the module: the bigger fetch is tried)
+                if not was_partial or isinstance(result, _Culprit) or (
+                        _not_playable_here(result) and not _window_refusal(result)):
                     break
                 bad = isinstance(result, str) or (
                     not isinstance(result, str)
@@ -7911,7 +7950,10 @@ async def _remote_scan_body(
                         label, remote_path, next_label,
                     )
 
-            if isinstance(result, str):
+            if _not_playable_here(result):
+                log.debug("Skipped %s: %s", remote_path, result)
+                _gave_up[remote_path] = "error"     # (waits like a refused file; no error)
+            elif isinstance(result, str):
                 log.error("Metadata error %s: %s", remote_path, result)
                 _progress.errors += 1
                 _gave_up[remote_path] = "crash" if isinstance(result, _Culprit) else "error"
@@ -8329,6 +8371,8 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
         hash_map = await store_hash_lookups_batch(unique_dirs)
         for s in to_scan:
             _p, result, _sm, _lg = await loop.run_in_executor(None, _extract_one, Path(s))
+            if _not_playable_here(result):
+                continue
             if isinstance(result, str):
                 errors += 1
                 continue

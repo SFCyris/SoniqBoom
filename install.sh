@@ -100,7 +100,8 @@ _clean_bundled_siblings(){  # <binary> <dir>: rm the binary's transitive @loader
 _clean_renderers(){
   local bindir removed=0 name bin
   bindir="$(brew --prefix 2>/dev/null || echo /usr/local)/bin"
-  for name in zxtune123 sidplayfp psgplay uade123 sc68 kssrender; do
+  for name in zxtune123 sidplayfp psgplay uade123 sc68 kssrender dsfrender milkyrender mlrender mdxrender \
+              gt2reloc sunvoxrender furnace-headless xmprender sawteethrender; do
     bin="$bindir/$name"
     if [ -L "$bin" ]; then
       warn "  $name is Homebrew-managed (symlink) — skipping (use 'brew reinstall $name')"
@@ -146,8 +147,9 @@ Usage: install.sh [--slim] [--no-collections] [--no-scene-info]
   (no option)   Install/update SoniqBoom and its renderers (idempotent —
                 already-present renderers are left as-is).
   --slim        Skip the slow zxtune123 build (~10-15 min on macOS).  These
-                won't play: the PSF family — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF,
-                DSF (PlayStation / N64 / GBA / DS / Saturn / Dreamcast rips) —
+                won't play: the PSF family — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF
+                (PlayStation / N64 / GBA / DS / Saturn rips; Dreamcast DSF rips
+                play through dsfrender) — S98 and Farbrausch V2 (.v2m) files,
                 MED 2-4 modules and VGM files that use a chip other than the
                 Sega PSG / YM2612.  Re-run without --slim to add them.
   --rebuild     Delete the from-source renderers, then run the install so they
@@ -167,7 +169,9 @@ Usage: install.sh [--slim] [--no-collections] [--no-scene-info]
   --help        Show this message.
 
 --clean/--rebuild affect ONLY the renderers install.sh builds from source —
-zxtune123, sidplayfp, psgplay (+ their bundled libraries), kssrender, on Linux
+zxtune123, sidplayfp, psgplay (+ their bundled libraries), kssrender, dsfrender,
+milkyrender, mlrender, mdxrender, gt2reloc, sunvoxrender, furnace-headless,
+xmprender, sawteethrender, on Linux
 also the source-built uade123/sc68, and the build-on-first-use ym2wav/hvl2wav.
 Homebrew-managed players (macOS: fluidsynth, openmpt123, adplay, sc68, uade123)
 are left untouched; use `brew reinstall <name>` to rebuild those.
@@ -276,7 +280,9 @@ if [ "$PLATFORM" = "macos" ]; then
     info "sidplayfp already installed: $(command -v sidplayfp)"
   else
     BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
-    RESIDFP_VER="1.2.2"; LIBSID_VER="3.1.0"; SIDCLI_VER="3.1.0"
+    RESIDFP_VER="1.2.2"; RESIDFP_SHA="2eb0204b76d52fe825c0e1f98826f62a179033a60543032d0e8b90060ecaa50e"
+    LIBSID_VER="3.1.0";  LIBSID_SHA="12a7ba238a6f61a811134a31d494e251eba0dd8f1c03b627d2422d8133a3584b"
+    SIDCLI_VER="3.1.0";  SIDCLI_SHA="287cc5fe859e242f885f8f2c6da37add62b89b232c8a55d23b74e2c59281f4e7"
     if [ -z "$BREW_PREFIX" ]; then
       warn "sidplayfp: brew unavailable — skipping (SID disabled)"
     else
@@ -284,14 +290,18 @@ if [ "$PLATFORM" = "macos" ]; then
       SID_TMP="$(mktemp -d)"; SID_PREFIX="$SID_TMP/prefix"; mkdir -p "$SID_PREFIX"
       SID_PKGCONF="$SID_PREFIX/lib/pkgconfig:$BREW_PREFIX/lib/pkgconfig"
       info "Building the accurate SID chain (libresidfp→libsidplayfp→sidplayfp, ~2-3 min)…"
-      _sid_lib(){  # <url> <subdir> <log>: fetch + configure + make + make install
-        curl -sfL "$1" -o "$SID_TMP/s.tgz" && tar xzf "$SID_TMP/s.tgz" -C "$SID_TMP" \
-          && ( cd "$SID_TMP/$2" && PKG_CONFIG_PATH="$SID_PKGCONF" ./configure --prefix="$SID_PREFIX" --quiet \
-               && make -j"$(sysctl -n hw.ncpu)" && make install ) >"$SID_TMP/$3" 2>&1
+      _sid_get(){  # <url> <sha256> <file>: download and verify (the same pins as the Linux build)
+        curl -sfL "$1" -o "$SID_TMP/$3" \
+          && echo "$2  $SID_TMP/$3" | shasum -a 256 -c - >/dev/null 2>&1
       }
-      if _sid_lib "https://github.com/libsidplayfp/libresidfp/releases/download/v${RESIDFP_VER}/libresidfp-${RESIDFP_VER}.tar.gz" "libresidfp-${RESIDFP_VER}" "1_residfp.log" \
-         && _sid_lib "https://github.com/libsidplayfp/libsidplayfp/releases/download/v${LIBSID_VER}/libsidplayfp-${LIBSID_VER}.tar.gz" "libsidplayfp-${LIBSID_VER}" "2_libsid.log" \
-         && curl -sfL "https://github.com/libsidplayfp/sidplayfp/releases/download/v${SIDCLI_VER}/sidplayfp-${SIDCLI_VER}.tar.gz" -o "$SID_TMP/cli.tgz" \
+      _sid_lib(){  # <url> <sha256> <subdir> <log>: fetch + verify + configure + make + make install
+        _sid_get "$1" "$2" s.tgz && tar xzf "$SID_TMP/s.tgz" -C "$SID_TMP" \
+          && ( cd "$SID_TMP/$3" && PKG_CONFIG_PATH="$SID_PKGCONF" ./configure --prefix="$SID_PREFIX" --quiet \
+               && make -j"$(sysctl -n hw.ncpu)" && make install ) >"$SID_TMP/$4" 2>&1
+      }
+      if _sid_lib "https://github.com/libsidplayfp/libresidfp/releases/download/v${RESIDFP_VER}/libresidfp-${RESIDFP_VER}.tar.gz" "$RESIDFP_SHA" "libresidfp-${RESIDFP_VER}" "1_residfp.log" \
+         && _sid_lib "https://github.com/libsidplayfp/libsidplayfp/releases/download/v${LIBSID_VER}/libsidplayfp-${LIBSID_VER}.tar.gz" "$LIBSID_SHA" "libsidplayfp-${LIBSID_VER}" "2_libsid.log" \
+         && _sid_get "https://github.com/libsidplayfp/sidplayfp/releases/download/v${SIDCLI_VER}/sidplayfp-${SIDCLI_VER}.tar.gz" "$SIDCLI_SHA" cli.tgz \
          && tar xzf "$SID_TMP/cli.tgz" -C "$SID_TMP" \
          && ( cd "$SID_TMP/sidplayfp-${SIDCLI_VER}" && PKG_CONFIG_PATH="$SID_PKGCONF" ./configure --prefix="$SID_PREFIX" --quiet \
               && make -j"$(sysctl -n hw.ncpu)" ) >"$SID_TMP/3_cli.log" 2>&1; then
@@ -788,12 +798,22 @@ else
     KSS_DEST="/usr/local/bin"
   fi
   KSS_TMP="$(mktemp -d)"
-  if LIBKSS_COMMIT="$LIBKSS_COMMIT" sh "$SCRIPT_DIR/soniqboom/native/kssrender/build.sh" "$KSS_TMP" >"$KSS_TMP.log" 2>&1 \
+  # (MGSDRV's header at the Dockerfile's pins; build.sh's own without one)
+  KSS_DRIVERS_COMMIT="$(sed -n 's/^ARG KSS_DRIVERS_COMMIT=//p' "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+  MGSDRV_H_SHA256="$(sed -n 's/^ARG MGSDRV_H_SHA256=//p' "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+  # (env, not a bare assignment prefix: an assignment that comes out of an
+  # expansion would be run as the command)
+  if env LIBKSS_COMMIT="$LIBKSS_COMMIT" \
+      ${KSS_DRIVERS_COMMIT:+"KSS_DRIVERS_COMMIT=$KSS_DRIVERS_COMMIT"} \
+      ${MGSDRV_H_SHA256:+"MGSDRV_H_SHA256=$MGSDRV_H_SHA256"} \
+      sh "$SCRIPT_DIR/soniqboom/native/kssrender/build.sh" "$KSS_TMP" >"$KSS_TMP.log" 2>&1 \
       && [ -x "$KSS_TMP/kssrender" ]; then
+    # (the old binary is removed, then the new one copied in)
     if [ -w "$KSS_DEST" ]; then
-      cp "$KSS_TMP/kssrender" "$KSS_DEST/kssrender" && KSS_BUILT=1
+      rm -f "$KSS_DEST/kssrender" && cp "$KSS_TMP/kssrender" "$KSS_DEST/kssrender" && KSS_BUILT=1
     elif command -v sudo &>/dev/null; then
-      sudo cp "$KSS_TMP/kssrender" "$KSS_DEST/kssrender" && KSS_BUILT=1
+      sudo rm -f "$KSS_DEST/kssrender" && sudo cp "$KSS_TMP/kssrender" "$KSS_DEST/kssrender" \
+        && KSS_BUILT=1
     fi
   fi
   if [ "$KSS_BUILT" != 1 ] && [ -s "$KSS_TMP.log" ]; then
@@ -805,12 +825,355 @@ else
   elif command -v kssrender &>/dev/null; then
     warn "kssrender build failed — the kssrender already installed ($(command -v kssrender)) stays"
   else
-    warn "kssrender build failed — KSS files play through libgme (without the MSX FM chips)"
+    warn "kssrender build failed — KSS files play through libgme (without the MSX FM chips); MGSDRV songs don't play"
   fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# zxtune123 (PSF console-music family: PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF)
+# dsfrender (Sega Dreamcast / Naomi DSF) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# Our own small renderer on Highly Theoretical + psflib
+# (soniqboom/native/dsfrender), pinned to the commits the Docker image builds.
+# Plain C (needs git, a C compiler and zlib's headers), a few seconds.  Without
+# it Dreamcast DSF rips play through zxtune123.  A dsfrender of another
+# version or other commits is rebuilt.
+section "dsfrender (Dreamcast / Naomi DSF)"
+_dsf_pin() {   # _dsf_pin NAME — the Dockerfile's ARG, else build.sh's own default
+  local v
+  v="$(sed -n "s/^ARG $1=//p" "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+  [ -n "$v" ] || v="$(sed -n "s/^$1=\"\${$1:-\([0-9a-f]*\)}\"$/\1/p" \
+    "$SCRIPT_DIR/soniqboom/native/dsfrender/build.sh" | head -1)"
+  printf '%s' "$v"
+}
+HT_COMMIT="$(_dsf_pin HT_COMMIT)"
+PSFLIB_COMMIT="$(_dsf_pin PSFLIB_COMMIT)"
+DSF_VERSION="$(sed -n 's/^#define DSFRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/dsfrender/dsfrender.c" | head -1)"
+DSF_BUILT=0
+if [ -n "$HT_COMMIT" ] && [ -n "$PSFLIB_COMMIT" ] && [ -n "$DSF_VERSION" ] \
+    && command -v dsfrender &>/dev/null \
+    && dsfrender --version 2>/dev/null | grep -qF \
+       "dsfrender $DSF_VERSION (Highly Theoretical ${HT_COMMIT:0:12}, psflib ${PSFLIB_COMMIT:0:12})"; then
+  info "dsfrender already installed: $(command -v dsfrender)"
+else
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+    DSF_DEST="$(brew --prefix)/bin"
+  else
+    DSF_DEST="/usr/local/bin"
+  fi
+  # (Linux: zlib's headers come with the source-build toolchain)
+  if [ "$PLATFORM" = "linux" ] && type _ensure_build_deps &>/dev/null \
+      && ! printf '#include <zlib.h>\n' | cc -E -x c - >/dev/null 2>&1; then
+    _ensure_build_deps
+  fi
+  DSF_TMP="$(mktemp -d)"
+  if HT_COMMIT="$HT_COMMIT" PSFLIB_COMMIT="$PSFLIB_COMMIT" \
+      sh "$SCRIPT_DIR/soniqboom/native/dsfrender/build.sh" "$DSF_TMP" >"$DSF_TMP.log" 2>&1 \
+      && [ -x "$DSF_TMP/dsfrender" ]; then
+    # (the old binary is removed, then the new one copied in)
+    if [ -w "$DSF_DEST" ]; then
+      rm -f "$DSF_DEST/dsfrender" && cp "$DSF_TMP/dsfrender" "$DSF_DEST/dsfrender" && DSF_BUILT=1
+    elif command -v sudo &>/dev/null; then
+      sudo rm -f "$DSF_DEST/dsfrender" && sudo cp "$DSF_TMP/dsfrender" "$DSF_DEST/dsfrender" \
+        && DSF_BUILT=1
+    fi
+  fi
+  if [ "$DSF_BUILT" != 1 ] && [ -s "$DSF_TMP.log" ]; then
+    tail -n 5 "$DSF_TMP.log" | sed 's/^/    /' >&2
+  fi
+  rm -rf "$DSF_TMP" "$DSF_TMP.log"
+  if [ "$DSF_BUILT" = 1 ]; then
+    info "dsfrender: $DSF_DEST/dsfrender"
+  elif command -v dsfrender &>/dev/null; then
+    warn "dsfrender build failed — the dsfrender already installed ($(command -v dsfrender)) stays"
+  else
+    warn "dsfrender build failed — Dreamcast DSF rips play through zxtune123"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# milkyrender (early DSIK "DSM\x10" modules) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# Our own small renderer on MilkyPlay, MilkyTracker's playback library
+# (soniqboom/native/milkyrender), pinned to the commit the Docker image builds.
+# C++ (needs git and a C++20 compiler), a few seconds.  Without it early DSIK
+# modules don't play (a RIFF DSMF .dsm plays through libopenmpt either way).
+# A milkyrender of another version or MilkyTracker commit is rebuilt.
+section "milkyrender (early DSIK modules)"
+MILKYTRACKER_COMMIT="$(sed -n 's/^ARG MILKYTRACKER_COMMIT=//p' "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+if [ -z "$MILKYTRACKER_COMMIT" ]; then   # (no Dockerfile: build.sh's own pin)
+  MILKYTRACKER_COMMIT="$(sed -n 's/^MILKYTRACKER_COMMIT="\${MILKYTRACKER_COMMIT:-\([0-9a-f]*\)}"$/\1/p' \
+    "$SCRIPT_DIR/soniqboom/native/milkyrender/build.sh" | head -1)"
+fi
+MILKY_VERSION="$(sed -n 's/^#define MILKYRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/milkyrender/milkyrender.cpp" | head -1)"
+MILKY_BUILT=0
+if [ -n "$MILKYTRACKER_COMMIT" ] && [ -n "$MILKY_VERSION" ] && command -v milkyrender &>/dev/null \
+    && milkyrender --version 2>/dev/null \
+       | grep -qF "milkyrender $MILKY_VERSION (MilkyPlay ${MILKYTRACKER_COMMIT:0:12})"; then
+  info "milkyrender already installed: $(command -v milkyrender)"
+else
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+    MILKY_DEST="$(brew --prefix)/bin"
+  else
+    MILKY_DEST="/usr/local/bin"
+  fi
+  # (Linux: a C++ compiler comes with the source-build toolchain)
+  if [ "$PLATFORM" = "linux" ] && type _ensure_build_deps &>/dev/null \
+      && ! command -v "${CXX:-c++}" &>/dev/null; then
+    _ensure_build_deps
+  fi
+  MILKY_TMP="$(mktemp -d)"
+  if MILKYTRACKER_COMMIT="$MILKYTRACKER_COMMIT" sh "$SCRIPT_DIR/soniqboom/native/milkyrender/build.sh" "$MILKY_TMP" >"$MILKY_TMP.log" 2>&1 \
+      && [ -x "$MILKY_TMP/milkyrender" ]; then
+    # (the old binary is removed, then the new one copied in)
+    if [ -w "$MILKY_DEST" ]; then
+      rm -f "$MILKY_DEST/milkyrender" && cp "$MILKY_TMP/milkyrender" "$MILKY_DEST/milkyrender" && MILKY_BUILT=1
+    elif command -v sudo &>/dev/null; then
+      sudo rm -f "$MILKY_DEST/milkyrender" && sudo cp "$MILKY_TMP/milkyrender" "$MILKY_DEST/milkyrender" \
+        && MILKY_BUILT=1
+    fi
+  fi
+  if [ "$MILKY_BUILT" != 1 ] && [ -s "$MILKY_TMP.log" ]; then
+    tail -n 5 "$MILKY_TMP.log" | sed 's/^/    /' >&2
+  fi
+  rm -rf "$MILKY_TMP" "$MILKY_TMP.log"
+  if [ "$MILKY_BUILT" = 1 ]; then
+    info "milkyrender: $MILKY_DEST/milkyrender"
+  elif command -v milkyrender &>/dev/null; then
+    warn "milkyrender build failed — the milkyrender already installed ($(command -v milkyrender)) stays"
+  else
+    warn "milkyrender build failed — early DSIK (.dsm) modules won't play"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mlrender (Musicline Editor) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# Our own small renderer on musicline_playback, the C++ port of the Musicline
+# Editor 1.16 replayer (soniqboom/native/mlrender), fetched from DEViLBOX at
+# the commit the Docker image builds — only the port's replayer sources.
+# Needs git and a C++20 compiler, a few seconds.  uade123 still plays Musicline
+# Editor modules; mlrender plays the tunes uade renders only as silence.  An
+# mlrender of another version or commit is rebuilt.
+section "mlrender (Musicline Editor)"
+DEVILBOX_COMMIT="$(sed -n 's/^ARG DEVILBOX_COMMIT=//p' "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+if [ -z "$DEVILBOX_COMMIT" ]; then   # (no Dockerfile: build.sh's own pin)
+  DEVILBOX_COMMIT="$(sed -n 's/^DEVILBOX_COMMIT="\${DEVILBOX_COMMIT:-\([0-9a-f]*\)}"$/\1/p' \
+    "$SCRIPT_DIR/soniqboom/native/mlrender/build.sh" | head -1)"
+fi
+ML_VERSION="$(sed -n 's/^#define MLRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/mlrender/mlrender.cpp" | head -1)"
+ML_BUILT=0
+if [ -n "$DEVILBOX_COMMIT" ] && [ -n "$ML_VERSION" ] && command -v mlrender &>/dev/null \
+    && mlrender --version 2>/dev/null \
+       | grep -qF "mlrender $ML_VERSION (musicline_playback ${DEVILBOX_COMMIT:0:12})"; then
+  info "mlrender already installed: $(command -v mlrender)"
+else
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+    ML_DEST="$(brew --prefix)/bin"
+  else
+    ML_DEST="/usr/local/bin"
+  fi
+  # (Linux: a C++ compiler comes with the source-build toolchain)
+  if [ "$PLATFORM" = "linux" ] && type _ensure_build_deps &>/dev/null \
+      && ! command -v "${CXX:-c++}" &>/dev/null; then
+    _ensure_build_deps
+  fi
+  ML_TMP="$(mktemp -d)"
+  if DEVILBOX_COMMIT="$DEVILBOX_COMMIT" sh "$SCRIPT_DIR/soniqboom/native/mlrender/build.sh" "$ML_TMP" >"$ML_TMP.log" 2>&1 \
+      && [ -x "$ML_TMP/mlrender" ]; then
+    # (the old binary is removed, then the new one copied in)
+    if [ -w "$ML_DEST" ]; then
+      rm -f "$ML_DEST/mlrender" && cp "$ML_TMP/mlrender" "$ML_DEST/mlrender" && ML_BUILT=1
+    elif command -v sudo &>/dev/null; then
+      sudo rm -f "$ML_DEST/mlrender" && sudo cp "$ML_TMP/mlrender" "$ML_DEST/mlrender" \
+        && ML_BUILT=1
+    fi
+  fi
+  if [ "$ML_BUILT" != 1 ] && [ -s "$ML_TMP.log" ]; then
+    tail -n 5 "$ML_TMP.log" | sed 's/^/    /' >&2
+  fi
+  rm -rf "$ML_TMP" "$ML_TMP.log"
+  if [ "$ML_BUILT" = 1 ]; then
+    info "mlrender: $ML_DEST/mlrender"
+  elif command -v mlrender &>/dev/null; then
+    warn "mlrender build failed — the mlrender already installed ($(command -v mlrender)) stays"
+  else
+    warn "mlrender build failed — Musicline Editor tunes uade renders only as silence don't play"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mdxrender (Sharp X68000 MDX) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# Our own small renderer on portable_mdx (soniqboom/native/mdxrender): the
+# MXDRV driver with the X68Sound OPM + ADPCM emulation, fetched at the commit
+# the Docker image builds and built unmodified.  Needs git and a C / C++11
+# compiler, a few seconds.  Without it MDX songs don't play.  An mdxrender of
+# another version or commit is rebuilt.
+section "mdxrender (X68000 MDX)"
+PORTABLE_MDX_COMMIT="$(sed -n 's/^ARG PORTABLE_MDX_COMMIT=//p' "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1)"
+if [ -z "$PORTABLE_MDX_COMMIT" ]; then   # (no Dockerfile: build.sh's own pin)
+  PORTABLE_MDX_COMMIT="$(sed -n 's/^PORTABLE_MDX_COMMIT="\${PORTABLE_MDX_COMMIT:-\([0-9a-f]*\)}"$/\1/p' \
+    "$SCRIPT_DIR/soniqboom/native/mdxrender/build.sh" | head -1)"
+fi
+MDX_VERSION="$(sed -n 's/^#define MDXRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/mdxrender/mdxrender.cpp" | head -1)"
+MDX_BUILT=0
+if [ -n "$PORTABLE_MDX_COMMIT" ] && [ -n "$MDX_VERSION" ] && command -v mdxrender &>/dev/null \
+    && mdxrender --version 2>/dev/null \
+       | grep -qF "mdxrender $MDX_VERSION (portable_mdx ${PORTABLE_MDX_COMMIT:0:12})"; then
+  info "mdxrender already installed: $(command -v mdxrender)"
+else
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+    MDX_DEST="$(brew --prefix)/bin"
+  else
+    MDX_DEST="/usr/local/bin"
+  fi
+  # (Linux: a C++ compiler comes with the source-build toolchain)
+  if [ "$PLATFORM" = "linux" ] && type _ensure_build_deps &>/dev/null \
+      && ! command -v "${CXX:-c++}" &>/dev/null; then
+    _ensure_build_deps
+  fi
+  MDX_TMP="$(mktemp -d)"
+  if PORTABLE_MDX_COMMIT="$PORTABLE_MDX_COMMIT" sh "$SCRIPT_DIR/soniqboom/native/mdxrender/build.sh" "$MDX_TMP" >"$MDX_TMP.log" 2>&1 \
+      && [ -x "$MDX_TMP/mdxrender" ]; then
+    # (the old binary is removed, then the new one copied in)
+    if [ -w "$MDX_DEST" ]; then
+      rm -f "$MDX_DEST/mdxrender" && cp "$MDX_TMP/mdxrender" "$MDX_DEST/mdxrender" && MDX_BUILT=1
+    elif command -v sudo &>/dev/null; then
+      sudo rm -f "$MDX_DEST/mdxrender" && sudo cp "$MDX_TMP/mdxrender" "$MDX_DEST/mdxrender" \
+        && MDX_BUILT=1
+    fi
+  fi
+  if [ "$MDX_BUILT" != 1 ] && [ -s "$MDX_TMP.log" ]; then
+    tail -n 5 "$MDX_TMP.log" | sed 's/^/    /' >&2
+  fi
+  rm -rf "$MDX_TMP" "$MDX_TMP.log"
+  if [ "$MDX_BUILT" = 1 ]; then
+    info "mdxrender: $MDX_DEST/mdxrender"
+  elif command -v mdxrender &>/dev/null; then
+    warn "mdxrender build failed — the mdxrender already installed ($(command -v mdxrender)) stays"
+  else
+    warn "mdxrender build failed — MDX songs don't play"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# gt2reloc (GoatTracker 2), sunvoxrender (SunVox), furnace-headless
+# (FamiTracker) — both platforms, built from source
+# ─────────────────────────────────────────────────────────────────────────────
+# At the versions the Docker image builds (its ARGs; each build.sh's own pin
+# without a Dockerfile), unmodified: GoatTracker's packer (it converts a song
+# to a SID tune sidplayfp plays — SDL 1.2's headers to build, no SDL linked),
+# the SunVox Library (its release archive holds the source; ALSA / JACK
+# headers on Linux) and Furnace's headless player (CMake, ~1 minute).  One
+# whose --version doesn't state the pinned version is rebuilt; gt2reloc
+# states none — an installed one is kept (--clean, then re-run, rebuilds it).
+_dockerfile_arg() { sed -n "s/^ARG $1=//p" "$SCRIPT_DIR/Dockerfile" 2>/dev/null | head -1; }
+
+# _install_native WHAT BINARY STAMP BUILD_SH [VAR=VALUE …] — build BINARY with
+# BUILD_SH (the VARs in its environment) and copy it into the bin dir, unless
+# the BINARY on PATH prints STAMP for --version (with a temp HOME: Furnace
+# writes a config folder there); an empty STAMP keeps any BINARY on PATH.
+_install_native() {
+  local what="$1" bin="$2" stamp="$3" build="$4" dest tmp home built=0
+  shift 4
+  if command -v "$bin" &>/dev/null; then
+    home="$(mktemp -d)"
+    if [ -z "$stamp" ] || env -u XDG_CONFIG_HOME HOME="$home" "$bin" --version 2>/dev/null \
+        | grep -qF "$stamp"; then
+      rm -rf "$home"
+      info "$bin already installed: $(command -v "$bin")"
+      return 0
+    fi
+    rm -rf "$home"
+  fi
+  if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+    dest="$(brew --prefix)/bin"
+  else
+    dest="/usr/local/bin"
+  fi
+  tmp="$(mktemp -d)"
+  if env "$@" sh "$build" "$tmp" >"$tmp.log" 2>&1 && [ -x "$tmp/$bin" ]; then
+    # (the old binary is removed, then the new one copied in)
+    if [ -w "$dest" ]; then
+      rm -f "$dest/$bin" && cp "$tmp/$bin" "$dest/$bin" && built=1
+    elif command -v sudo &>/dev/null; then
+      sudo rm -f "$dest/$bin" && sudo cp "$tmp/$bin" "$dest/$bin" && built=1
+    fi
+  fi
+  if [ "$built" != 1 ] && [ -s "$tmp.log" ]; then
+    tail -n 5 "$tmp.log" | sed 's/^/    /' >&2
+  fi
+  rm -rf "$tmp" "$tmp.log"
+  if [ "$built" = 1 ]; then
+    info "$bin: $dest/$bin"
+  elif command -v "$bin" &>/dev/null; then
+    warn "$bin build failed — the $bin already installed ($(command -v "$bin")) stays"
+  else
+    warn "$bin build failed — $what don't play"
+  fi
+}
+
+section "gt2reloc / sunvoxrender / furnace-headless / xmprender / sawteethrender (GoatTracker, SunVox, FamiTracker, DefleMask, libxmp, Sawteeth)"
+# Their build needs: SDL 1.2's headers (gt2reloc), CMake (Furnace, libxmp), unzip; on
+# Linux also ALSA / JACK headers (SunVox Library) and zlib's.  Best-effort.
+if [ "$PLATFORM" = "macos" ] && command -v brew &>/dev/null; then
+  command -v sdl-config &>/dev/null || brew install sdl12-compat \
+    || warn "sdl12-compat install failed — gt2reloc (GoatTracker) can't be built"
+  command -v cmake &>/dev/null || brew install cmake \
+    || warn "cmake install failed — Furnace (FamiTracker) and xmprender (libxmp) can't be built"
+elif [ "$PLATFORM" = "linux" ] && [ "${PKG:-none}" != "none" ]; then
+  type _ensure_build_deps &>/dev/null && _ensure_build_deps
+  case "$PKG" in
+    apt)    run_pkg apt-get install -y --no-install-recommends unzip cmake zlib1g-dev \
+              libasound2-dev libjack-jackd2-dev || true
+            run_pkg apt-get install -y --no-install-recommends libsdl1.2-compat-dev \
+              || run_pkg apt-get install -y --no-install-recommends libsdl1.2-dev || true ;;
+    dnf)    run_pkg dnf install -y unzip cmake zlib-devel alsa-lib-devel \
+              jack-audio-connection-kit-devel sdl12-compat-devel || true ;;
+    pacman) run_pkg pacman -S --noconfirm --needed unzip cmake zlib alsa-lib jack2 \
+              sdl12-compat || true ;;
+    zypper) run_pkg zypper --non-interactive install unzip cmake zlib-devel alsa-devel \
+              libjack-devel sdl12_compat-devel || true ;;
+  esac
+fi
+_install_native "GoatTracker songs" gt2reloc "" \
+  "$SCRIPT_DIR/soniqboom/native/goattracker/build.sh" \
+  GOATTRACKER_VERSION="$(_dockerfile_arg GOATTRACKER_VERSION)" \
+  GOATTRACKER_SHA256="$(_dockerfile_arg GOATTRACKER_SHA256)"
+SUNVOX_LIB_VERSION="$(_dockerfile_arg SUNVOX_LIB_VERSION)"
+_install_native "SunVox projects" sunvoxrender "SunVox Library ${SUNVOX_LIB_VERSION:-2.1.4d}" \
+  "$SCRIPT_DIR/soniqboom/native/sunvoxrender/build.sh" \
+  SUNVOX_LIB_VERSION="${SUNVOX_LIB_VERSION:-2.1.4d}" \
+  SUNVOX_LIB_SHA256="$(_dockerfile_arg SUNVOX_LIB_SHA256)"
+_install_native "FamiTracker modules" furnace-headless "Furnace version 0.6.8.3" \
+  "$SCRIPT_DIR/soniqboom/native/furnace/build.sh" \
+  FURNACE_COMMIT="$(_dockerfile_arg FURNACE_COMMIT)"
+
+# xmprender — the modules only libxmp plays (Archimedes Tracker, Coconizer,
+# FlexTrax, Funktracker, Liquid Tracker, Megatracker, packed Amiga modules):
+# libxmp at the Docker image's pinned release, built with CMake.
+LIBXMP_VERSION="$(_dockerfile_arg LIBXMP_VERSION)"
+XMP_VERSION="$(sed -n 's/^#define XMPRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/xmprender/xmprender.c" | head -1)"
+_install_native "the libxmp modules (Archimedes Tracker, Funktracker, packed Amiga modules …)" \
+  xmprender "xmprender ${XMP_VERSION:-1.0} (libxmp ${LIBXMP_VERSION:-4.7.4})" \
+  "$SCRIPT_DIR/soniqboom/native/xmprender/build.sh" \
+  LIBXMP_VERSION="${LIBXMP_VERSION:-4.7.4}" LIBXMP_SHA256="$(_dockerfile_arg LIBXMP_SHA256)"
+
+# sawteethrender — Sawteeth songs: NostalgicPlayer's Sawteeth player ported to
+# C (soniqboom/native/sawteethrender), compiled from the source here.
+SAWTEETH_STAMP="$(sed -n 's/^#define SAWTEETHRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/sawteethrender/sawteethrender.c" | head -1)"
+_install_native "Sawteeth songs" sawteethrender "sawteethrender ${SAWTEETH_STAMP:-1.1}" \
+  "$SCRIPT_DIR/soniqboom/native/sawteethrender/build.sh"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# zxtune123 (PSF console-music family: PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF;
+# S98 FM dumps, Farbrausch V2 songs)
 # ─────────────────────────────────────────────────────────────────────────────
 # The only cross-format CLI bundling the reference cores (Highly Experimental,
 # Highly Theoretical, lazyusf2, mGBA, vio2sf).  Linux: official prebuilt from
@@ -829,7 +1192,7 @@ ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5112/linux/${ZXARCH}/
 if command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
 elif [ "$SLIM" = "1" ]; then
-  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF, DSF), MED 2-4 modules and VGM files using chips other than the Sega PSG / YM2612 won't play.  Re-run without --slim to add them."
+  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF; Dreamcast DSF plays through dsfrender), S98 and V2M files, MED 2-4 modules and VGM files using chips other than the Sega PSG / YM2612 won't play.  Re-run without --slim to add them."
 elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   ZX_TMP="$(mktemp -d)"
   if curl -sfL --max-time 300 "$ZXTUNE_LINUX_URL" -o "$ZX_TMP/zx.tar.gz" \
@@ -968,6 +1331,58 @@ fi
 section "Online collections and scene information"
 "$VENV/bin/soniqboom" first-run-setup "${SETUP_ARGS[@]+"${SETUP_ARGS[@]}"}" \
   || warn "Not set up — add them later with:  $VENV/bin/soniqboom collections add  /  scene-info add"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Versions — one line per player / tool, as found on PATH (a renderers.*_path
+# setting in SoniqBoom.conf takes precedence over these at runtime)
+# ─────────────────────────────────────────────────────────────────────────────
+# _tool_version BIN — BIN's version text, or nothing.  Run with no stdin, a
+# temp HOME (CFFIXED_USER_HOME too, on macOS) and no XDG_CONFIG_HOME: Furnace
+# writes a config folder into its home.
+_tool_version() {
+  local bin="$1" home out esc=$'\033'
+  home="$(mktemp -d)"
+  # (|| true: under pipefail a tool's own exit status — lha's without an
+  # archive, for one — mustn't end the install)
+  case "$bin" in
+    lha)    out="$(env HOME="$home" lha </dev/null 2>&1 | head -1 | sed 's/ command line.*//')" \
+              || true ;;
+    ffmpeg) out="$(ffmpeg -version </dev/null 2>&1 | head -1 | sed 's/ Copyright.*//')" || true ;;
+    *)      out="$(env -u XDG_CONFIG_HOME HOME="$home" CFFIXED_USER_HOME="$home" "$bin" --version \
+                    </dev/null 2>&1 | sed "s/${esc}\[[0-9;]*m//g" \
+                    | grep -v -e '^Warning' -e '^\[[a-z]*\]' -e '^[[:space:]]*$' | head -2)" || true
+            case "$bin" in   # (sidplayfp: its library's version is on the 2nd line)
+              sidplayfp) out="$(printf '%s\n' "$out" | sed -n '1p') ($(printf '%s\n' "$out" \
+                           | grep -o 'libsidplayfp [0-9.]*' | head -1))" ;;
+              *)         out="$(printf '%s\n' "$out" | head -1)" ;;
+            esac ;;
+  esac
+  rm -rf "$home"
+  printf '%s' "$out" | sed 's/ (OpenMPT .*//; s/[[:space:]]*$//; s/\.$//' | cut -c1-90 || true
+}
+section "Versions"
+_ver_line() { printf '  %-18s %s\n' "$1" "$2"; }
+_ver_line "python" "$("$VENV/bin/python" --version 2>&1)"
+for _bin in ffmpeg sidplayfp fluidsynth openmpt123 uade123 adplay lha sc68 psgplay \
+    kssrender dsfrender milkyrender mlrender mdxrender gt2reloc sunvoxrender \
+    furnace-headless xmprender sawteethrender zxtune123; do
+  if ! command -v "$_bin" &>/dev/null; then
+    _ver_line "$_bin" "not installed"
+  elif [ "$_bin" = gt2reloc ]; then
+    _ver_line "$_bin" "prints no version — this script builds GoatTracker $(_dockerfile_arg GOATTRACKER_VERSION)  $(command -v gt2reloc)"
+  else
+    _ver_line "$_bin" "$(_tool_version "$_bin")  $(command -v "$_bin")"
+  fi
+done
+_GME_VER="$(pkg-config --modversion libgme 2>/dev/null \
+  || { command -v brew &>/dev/null && brew list --versions game-music-emu 2>/dev/null | awk '{print $2}'; } \
+  || dpkg-query -W -f '${Version}' libgme0 2>/dev/null)" || true
+_ver_line "game-music-emu" "${_GME_VER:-not found}"
+if [ -x "$DATA_DIR/bin/ffmpeg" ]; then
+  _ver_line "ffmpeg (bundled)" "$("$DATA_DIR/bin/ffmpeg" -version </dev/null 2>&1 | head -1 | sed 's/ Copyright.*//')"
+else
+  _ver_line "ffmpeg (bundled)" "not installed"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Done

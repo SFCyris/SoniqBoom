@@ -12,7 +12,7 @@ the reader is not only checked against that writer.
 
 Also the archive layer's member naming: Face The Music modules (``.ftm`` /
 ``FTM.x``, where the installed libopenmpt reads them), modules stored with no
-extension (named by their bytes), FamiTracker's ``.ftm`` left out, and what
+extension (named by their bytes), FamiTracker's ``.ftm`` listed, and what
 ``census`` / ``describe_census`` say of an archive with nothing playable."""
 from __future__ import annotations
 
@@ -225,10 +225,14 @@ def test_face_the_music_members_are_listed(tmp_path):
     assert archive.read_member(p, "FTM.Other.ftm") == _ftm(b"O")
 
 
-def test_a_famitracker_ftm_is_not_listed_where_its_bytes_can_be_read(tmp_path):
+def test_a_famitracker_ftm_is_listed(tmp_path):
+    """A FamiTracker module plays (Furnace): listed by its ``.ftm`` name, and
+    one stored without an extension is named ``.ftm`` by its bytes."""
     p = tmp_path / "nes.lha"
-    p.write_bytes(W.archive([("tune.ftm", b"FamiTracker Module" + b"\0" * 200, "-lh5-")]))
-    assert archive.list_members(p, strict=True) == []
+    fami = b"FamiTracker Module" + b"\0" * 200
+    p.write_bytes(W.archive([("tune.ftm", fami, "-lh5-"), ("Plain", fami, "-lh5-")]))
+    assert sorted(archive.list_members(p, strict=True)) == ["Plain.ftm", "tune.ftm"]
+    assert archive.sniff_ext(fami) == ".ftm"
 
 
 @needs_ftm
@@ -274,11 +278,10 @@ def test_face_the_music_metadata(tmp_path):
 
 
 @needs_ftm
-def test_a_loose_famitracker_ftm_is_not_indexed(tmp_path):
+def test_a_loose_famitracker_ftm_is_indexed_as_one(tmp_path):
     p = tmp_path / "nes.ftm"
     p.write_bytes(b"FamiTracker Module" + b"\0" * 200)
-    with pytest.raises(ValueError):
-        metadata.extract(p, "id2")
+    assert metadata.extract(p, "id2").format == "FamiTracker"
 
 
 @pytest.mark.parametrize("names,heads,says", [
@@ -288,7 +291,6 @@ def test_a_loose_famitracker_ftm_is_not_indexed(tmp_path):
     (["disk.dms"], {}, "an Amiga disk image in DMS format, which SoniqBoom doesn't open"),
     (["disk.lzx"], {}, "an LZX archive, which SoniqBoom doesn't open"),
     (["a.txt", "b.iff", "c.info"], {}, "only text and pictures"),
-    (["x.bin"], {"x.bin": b"FamiTracker Module"}, "a FamiTracker module, a format SoniqBoom doesn't play"),
     (["x.bin"], {}, "no file in a format SoniqBoom plays"),
 ])
 def test_what_an_archive_with_nothing_playable_holds(names, heads, says):

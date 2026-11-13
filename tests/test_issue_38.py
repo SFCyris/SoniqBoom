@@ -170,10 +170,10 @@ async def test_libgme_scan_and_render_agree():
 def test_old_sndh_and_libgme_renders_are_not_reused():
     from soniqboom.core.conversion_cache import _cache_key
     assert _cache_key("t", "sndh", subsong=1) == "t__sub1__r2"
-    assert _cache_key("t", "gme", subsong=0) == "t__sub0__r2"
+    assert _cache_key("t", "gme", subsong=0) == "t__sub0__r3"     # (3: SAP TIMEs)
     assert _cache_key("t", "psf", subsong=0) == "t__r1"      # PSF: the fade (no subsongs)
-    # other render keys are unchanged
-    assert _cache_key("t", "uade", subsong=2) == "t__sub2"
+    # uade's revision: modules played staged (``xpk.stage_for_uade``)
+    assert _cache_key("t", "uade", subsong=2) == "t__sub2__r2"
     assert _cache_key("t", "tracker", subsong=0) == "t__sub0__r2"    # (own float WAV, song-end loops)
 
 
@@ -326,8 +326,9 @@ async def test_purge_drops_the_renders_and_their_transcodes(monkeypatch, tmp_pat
 def test_renders_before_the_revision_are_swept_once(tmp_path, monkeypatch):
     from soniqboom.core import conversion_cache as cc
     base = tmp_path
-    files = {"sndh": ["t__sub0.wav", "t__sub0__r2.wav"], "gme": ["g__sub1.wav", "g__sub1__r2.wav"],
-             "uade": ["u__sub0.wav"], "psf": ["p.wav", "p__r1.wav"]}
+    files = {"sndh": ["t__sub0.wav", "t__sub0__r2.wav"],
+             "gme": ["g__sub1.wav", "g__sub1__r2.wav", "g__sub1__r3.wav"],
+             "uade": ["u__sub0.wav", "u__sub0__r1.wav", "u__sub0__r2.wav"], "psf": ["p.wav", "p__r1.wav"]}
     for fmt, names in files.items():
         d = base / fmt / "xx"
         d.mkdir(parents=True)
@@ -339,14 +340,14 @@ def test_renders_before_the_revision_are_swept_once(tmp_path, monkeypatch):
     keep_t = td / f"t__cmp3__ar0__v{cc.rendered_transcode_variant('t__sub0__r2')}.wav"
     stale_t.write_bytes(b"RIFF")
     keep_t.write_bytes(b"RIFF")
-    assert cc._sweep_unrevised_renders(base) == 4
+    assert cc._sweep_unrevised_renders(base) == 7       # (uade: r1 is older than r2; gme r2 than r3)
     left = sorted(str(p.relative_to(base)) for p in base.rglob("*.wav"))
-    assert left == sorted(["sndh/xx/t__sub0__r2.wav", "gme/xx/g__sub1__r2.wav",
-                           "uade/xx/u__sub0.wav", "psf/xx/p__r1.wav",
+    assert left == sorted(["sndh/xx/t__sub0__r2.wav", "gme/xx/g__sub1__r3.wav",
+                           "uade/xx/u__sub0__r2.wav", "psf/xx/p__r1.wav",
                            str(keep_t.relative_to(base))])
     assert cc._sweep_unrevised_renders(base) == 0          # once
     # Another renderer's later revision sweeps only its own older renders.
-    monkeypatch.setattr(cc, "_RENDER_REVS", {**cc._RENDER_REVS, "gme": 3})
+    monkeypatch.setattr(cc, "_RENDER_REVS", {**cc._RENDER_REVS, "gme": 4})
     assert cc._sweep_unrevised_renders(base) == 1
     assert (base / "psf/xx/p__r1.wav").exists() and (base / "sndh/xx/t__sub0__r2.wav").exists()
 

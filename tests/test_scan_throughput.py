@@ -159,12 +159,15 @@ def test_a_module_duration_matches_the_cli_to_the_millisecond(tmp_path, monkeypa
 
 
 @pytest.mark.skipif(not _HAVE_LIB, reason="needs libopenmpt")
-def test_a_module_libopenmpt_cannot_open_has_no_duration_and_logs_nothing(tmp_path, monkeypatch, capfd):
+def test_a_mod_libopenmpt_cannot_open_is_not_listed_and_logs_nothing(tmp_path, monkeypatch, capfd):
+    if not openmpt_vu.is_available():
+        pytest.skip("libopenmpt unavailable")
     monkeypatch.setattr(metadata, "_LIBOPENMPT_IN_PROCESS", True)
     f = tmp_path / "noise.mod"
     f.write_bytes(os.urandom(3000))
     _no_process(monkeypatch)
-    assert metadata.extract(f, "x").duration == 0.0
+    with pytest.raises(metadata.NotPlayableHere):     # (junk under a module's name)
+        metadata.extract(f, "x")
     assert "openmpt" not in capfd.readouterr().err
 
 
@@ -457,7 +460,16 @@ def test_in_process_and_cli_durations_are_the_same_number(tmp_path, monkeypatch)
                        and not _foreign_ftm(p))
     for m in mods:
         monkeypatch.setattr(metadata, "_LIBOPENMPT_IN_PROCESS", True)
-        a = metadata.extract(m, "x").duration
+        try:
+            a = metadata.extract(m, "x").duration
+        except metadata.NotPlayableHere:
+            # (another format under a libopenmpt suffix — a DeFy AdLib .dtm,
+            # a PollyTracker song saved as .mod: the server's read refuses it
+            # too)
+            monkeypatch.setattr(metadata, "_LIBOPENMPT_IN_PROCESS", False)
+            with pytest.raises(metadata.NotPlayableHere):
+                metadata.extract(m, "x")
+            continue
         monkeypatch.setattr(metadata, "_LIBOPENMPT_IN_PROCESS", False)
         assert metadata.extract(m, "x").duration == a, m
 

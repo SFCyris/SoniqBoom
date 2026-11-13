@@ -11,8 +11,10 @@
 # libopenmpt / openmpt123 in a stage of its own; zxtune123 is a prebuilt fetch)
 # AND pre-builds the vendored StSound (.ym) / HivelyTracker (.hvl) engines.
 # The final runtime stage copies only the results,
-# so it ships NO compiler — smaller, immutable, and quick to start.  Multi-arch:
-#   docker buildx build --platform linux/amd64,linux/arm64 -t <ref> --push .
+# so it ships NO compiler — smaller, immutable, and quick to start.  Build on a
+# machine of the target CPU: cross-building the source-compiled players under
+# emulation can fail (DEPLOY.md, "Does my CPU (ARM vs AMD/Intel) matter?").
+# The release workflow builds each architecture on its own runner.
 
 # ════════════════════════ Stage 1a: libopenmpt / openmpt123 ════════════════════════
 # Tracker modules (MOD, XM, S3M, IT, … and Face The Music, which libopenmpt
@@ -73,8 +75,11 @@ FROM python:3.12-slim-trixie AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git ca-certificates curl cmake \
-        autoconf automake libtool pkg-config zlib1g-dev \
+        autoconf automake libtool pkg-config zlib1g-dev unzip \
+        libsdl1.2-compat-dev libasound2-dev libjack-jackd2-dev \
     && rm -rf /var/lib/apt/lists/*
+# (unzip: the GoatTracker / SunVox Library release archives; SDL 1.2's headers
+# for gt2reloc, which links no SDL; ALSA / JACK headers for the SunVox Library)
 # /out/bin  → binaries copied onto the final image's PATH
 # /out/sc68 → sc68 `make install` DESTDIR (staged /usr/local tree). Pre-create
 #             both so a best-effort renderer failure still leaves a copyable dir.
@@ -89,8 +94,9 @@ RUN mkdir -p /out/bin /out/lib /out/share /out/share/doc/third-party \
 # SLIM=1 skips the two heavy source-compiled renderers (uade123's Amiga
 # "exotica" family and sc68's native .sc68 disks) for a smaller, faster-building
 # image aimed at low-RAM boxes that only want the mainstream + common retro
-# formats.  Everything else — SID, MIDI, trackers, AHX, YM/SNDH, console
-# chiptune, PSF, AdLib, all modern codecs — still ships.
+# formats; AHX plays through uade123, so it is left out too.  Everything else —
+# SID, MIDI, trackers, HivelyTracker, YM/SNDH, console chiptune, PSF, AdLib, all
+# modern codecs — still ships.
 ARG SLIM=0
 
 # YM (.ym) + HVL (.hvl): pre-build the vendored engines the app would otherwise
@@ -145,17 +151,151 @@ RUN set -eux; \
       || echo "NOTE: psgplay build failed — Atari ST SNDH (.sndh) disabled." ; \
     rm -rf /tmp/psgplay
 
-# kssrender — MSX / Sega Master System KSS (soniqboom/native/kssrender): libkss
-# at a pinned commit with its chip cores (MIT) and kmz80 (public domain), never
-# its kss-drivers submodule (not under libkss's licence).
+# kssrender — MSX / Sega Master System KSS and MSX MGSDRV songs
+# (soniqboom/native/kssrender): libkss at a pinned commit with its chip cores
+# (MIT) and kmz80 (public domain); of its kss-drivers (not under libkss's
+# licence) only the MGSDRV header (free, embedded unmodified — Ain./Gigamix),
+# pinned by commit + SHA-256.
 ARG LIBKSS_COMMIT=2ed958823237d054da1ca7965620d8e62a0f9a1d
+ARG KSS_DRIVERS_COMMIT=e8032da38ea8439caca699954fce82b5050bf86f
+ARG MGSDRV_H_SHA256=2e3a3f7f146e1b8e4dc7d5201245114ff2dca8958fc420c222daa2e9c8f799ca
 RUN set -eux; \
-    LIBKSS_COMMIT="$LIBKSS_COMMIT" LICENSE_DIR=/out/share/doc/third-party/libkss \
+    LIBKSS_COMMIT="$LIBKSS_COMMIT" KSS_DRIVERS_COMMIT="$KSS_DRIVERS_COMMIT" \
+    MGSDRV_H_SHA256="$MGSDRV_H_SHA256" LICENSE_DIR=/out/share/doc/third-party/libkss \
       sh /src/native/kssrender/build.sh /out/bin \
-      || echo "NOTE: kssrender build failed — KSS plays through libgme." ; \
+      || echo "NOTE: kssrender build failed — KSS plays through libgme, MGSDRV songs don't play." ; \
     strip --strip-unneeded /out/bin/kssrender 2>/dev/null || true
 
-# zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF).
+# dsfrender — Sega Dreamcast / Naomi DSF (soniqboom/native/dsfrender): Highly
+# Theoretical's Dreamcast sound core (GPL-3.0; none of its 68000 cores) and
+# psflib (MIT) at pinned commits.
+ARG HT_COMMIT=2998a4bf550949cd2daee249e725a64462cf15e0
+ARG PSFLIB_COMMIT=95509e0c6f13d769593bbf51a1b0e0efdc355ba1
+RUN set -eux; \
+    for try in 1 2 3; do \
+      HT_COMMIT="$HT_COMMIT" PSFLIB_COMMIT="$PSFLIB_COMMIT" \
+        LICENSE_DIR=/out/share/doc/third-party/dsfrender \
+        sh /src/native/dsfrender/build.sh /out/bin && break; \
+    done; \
+    [ -x /out/bin/dsfrender ] \
+      || echo "NOTE: dsfrender build failed — Dreamcast DSF plays through zxtune123." ; \
+    strip --strip-unneeded /out/bin/dsfrender 2>/dev/null || true
+
+# milkyrender — early Digital Sound Interface Kit modules ("DSM\x10" .dsm;
+# soniqboom/native/milkyrender): MilkyPlay (BSD-3-Clause) from MilkyTracker at
+# a pinned commit, only the MilkyPlay files the build lists.
+ARG MILKYTRACKER_COMMIT=e3ceb05105e8c5bdc907d6451245bf5a1926b1f9
+RUN set -eux; \
+    for try in 1 2 3; do \
+      MILKYTRACKER_COMMIT="$MILKYTRACKER_COMMIT" LICENSE_DIR=/out/share/doc/third-party/milkyplay \
+        sh /src/native/milkyrender/build.sh /out/bin && break; \
+    done; \
+    [ -x /out/bin/milkyrender ] \
+      || echo "NOTE: milkyrender build failed — early DSIK modules (.dsm, not RIFF) don't play." ; \
+    strip --strip-unneeded /out/bin/milkyrender 2>/dev/null || true
+
+# mlrender — Musicline Editor tunes uade renders only as silence
+# (soniqboom/native/mlrender): musicline_playback, the C++ port of the Musicline
+# Editor 1.16 replayer, from DEViLBOX at a pinned commit — only the port's
+# replayer sources and DEViLBOX's licence files are fetched.
+ARG DEVILBOX_COMMIT=57b3e19d2f312c70501f9675436062b947f94acb
+RUN set -eux; \
+    for try in 1 2 3; do \
+      DEVILBOX_COMMIT="$DEVILBOX_COMMIT" LICENSE_DIR=/out/share/doc/third-party/musicline_playback \
+        sh /src/native/mlrender/build.sh /out/bin && break; \
+    done; \
+    [ -x /out/bin/mlrender ] \
+      || echo "NOTE: mlrender build failed — Musicline Editor tunes uade renders only as silence don't play." ; \
+    strip --strip-unneeded /out/bin/mlrender 2>/dev/null || true
+
+# mdxrender — Sharp X68000 MDX songs and their PDX samples
+# (soniqboom/native/mdxrender): portable_mdx (MXDRV + X68Sound) at a pinned
+# commit, built unmodified; its readme (with its licence terms) is kept, with
+# the Apache-2.0 text its own files are under (portable_mdx ships none).
+ARG PORTABLE_MDX_COMMIT=dc50b060405a9e82c3b64573b4e524cd8ba83ff3
+RUN set -eux; \
+    for try in 1 2 3; do \
+      PORTABLE_MDX_COMMIT="$PORTABLE_MDX_COMMIT" LICENSE_DIR=/out/share/doc/third-party/portable_mdx \
+        sh /src/native/mdxrender/build.sh /out/bin && break; \
+    done; \
+    [ -x /out/bin/mdxrender ] \
+      && cp /usr/share/common-licenses/Apache-2.0 /out/share/doc/third-party/portable_mdx/Apache-2.0 \
+      || echo "NOTE: mdxrender build failed — MDX songs don't play." ; \
+    strip --strip-unneeded /out/bin/mdxrender 2>/dev/null || true
+
+# gt2reloc — GoatTracker 2 songs (soniqboom/native/goattracker): GoatTracker's
+# packer from the pinned release archive (GPL-2.0-or-later), linked without
+# SDL (sdlstub.c); it converts a song to a PSID that sidplayfp plays.  Its
+# example song is kept in /selftest for the render check below (never copied
+# into the image).
+ARG GOATTRACKER_VERSION=2.77
+ARG GOATTRACKER_SHA256=96c2bd6a6ab3aca2f5bb18b1c764ac6ea69ac245cae14002a72cd87c554561ef
+RUN set -eux; \
+    for i in 1 2 3; do \
+      GOATTRACKER_VERSION="$GOATTRACKER_VERSION" GOATTRACKER_SHA256="$GOATTRACKER_SHA256" \
+      LICENSE_DIR=/out/share/doc/third-party/goattracker SELFTEST_DIR=/selftest \
+        sh /src/native/goattracker/build.sh /out/bin && break; \
+      sleep 5; done; \
+    [ -x /out/bin/gt2reloc ] \
+      || echo "NOTE: gt2reloc build failed — GoatTracker songs don't play." ; \
+    strip --strip-unneeded /out/bin/gt2reloc 2>/dev/null || true
+
+# sunvoxrender — SunVox projects (soniqboom/native/sunvoxrender): the SunVox
+# Library built from the source in its pinned release archive (MIT; its use
+# terms ask for the "Powered by SunVox" credit and its licence texts), linked
+# statically.
+ARG SUNVOX_LIB_VERSION=2.1.4d
+ARG SUNVOX_LIB_SHA256=abe851de9d65a10e06673bf33257154591a2ff63ad2bb298488a5941cc5f4057
+RUN set -eux; \
+    for i in 1 2 3; do \
+      SUNVOX_LIB_VERSION="$SUNVOX_LIB_VERSION" SUNVOX_LIB_SHA256="$SUNVOX_LIB_SHA256" \
+      LICENSE_DIR=/out/share/doc/third-party/sunvox SELFTEST_DIR=/selftest \
+        sh /src/native/sunvoxrender/build.sh /out/bin && break; \
+      sleep 5; done; \
+    [ -x /out/bin/sunvoxrender ] \
+      || echo "NOTE: sunvoxrender build failed — SunVox projects don't play." ; \
+    strip --strip-unneeded /out/bin/sunvoxrender 2>/dev/null || true
+
+# furnace — FamiTracker modules (soniqboom/native/furnace): Furnace's
+# headless player (GPL-2.0-or-later) at the pinned v0.6.8.3 commit.
+ARG FURNACE_COMMIT=f2619dbd988c92bf9c7173648d191648f60aecbf
+RUN set -eux; \
+    for i in 1 2 3; do \
+      FURNACE_COMMIT="$FURNACE_COMMIT" LICENSE_DIR=/out/share/doc/third-party/furnace \
+      SELFTEST_DIR=/selftest \
+        sh /src/native/furnace/build.sh /out/bin && break; \
+      sleep 5; done; \
+    [ -x /out/bin/furnace-headless ] \
+      || echo "NOTE: furnace build failed — FamiTracker modules don't play." ; \
+    strip --strip-unneeded /out/bin/furnace-headless 2>/dev/null || true
+
+# xmprender — the modules only libxmp plays (Archimedes Tracker, Coconizer,
+# FlexTrax, Funktracker, Liquid Tracker, Megatracker, packed Amiga modules;
+# soniqboom/native/xmprender): libxmp (MIT) from its pinned release archive,
+# built unmodified as a static library with CMake.
+ARG LIBXMP_VERSION=4.7.4
+ARG LIBXMP_SHA256=a25583aa3b031c78ba0b4e83387fa596fb05742622e60f60d1540ee2af79b8d9
+RUN set -eux; \
+    for i in 1 2 3; do \
+      LIBXMP_VERSION="$LIBXMP_VERSION" LIBXMP_SHA256="$LIBXMP_SHA256" \
+      LICENSE_DIR=/out/share/doc/third-party/libxmp \
+        sh /src/native/xmprender/build.sh /out/bin && break; \
+      sleep 5; done; \
+    [ -x /out/bin/xmprender ] \
+      || echo "NOTE: xmprender build failed — the libxmp-only modules don't play." ; \
+    strip --strip-unneeded /out/bin/xmprender 2>/dev/null || true
+
+# sawteethrender — Sawteeth songs (soniqboom/native/sawteethrender):
+# NostalgicPlayer's Sawteeth player (MIT) ported to C, compiled from the
+# source in this repository.
+RUN set -eux; \
+    LICENSE_DIR=/out/share/doc/third-party/sawteethrender \
+      sh /src/native/sawteethrender/build.sh /out/bin \
+      || echo "NOTE: sawteethrender build failed — Sawteeth songs don't play." ; \
+    strip --strip-unneeded /out/bin/sawteethrender 2>/dev/null || true
+
+# zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF),
+# S98 FM dumps and Farbrausch V2 songs.
 # Official prebuilt; fetch the arch that matches the build — BOTH x86_64 and
 # arm64 are published on storage.zxtune.ru (built against glibc 2.35; Debian 13
 # ships 2.41, so it runs).
@@ -185,10 +325,10 @@ RUN set -eux; \
         && tar tzf /tmp/zxsrc.tar.gz \
            | grep -E '/(LICEN[CS]E[^/]*|COPYING[^/]*|license\.txt|LICENSES|AUTHORS)$' > /tmp/zxlic \
         && tar xzf /tmp/zxsrc.tar.gz -C /out/share/doc/third-party/zxtune --strip-components=1 -T /tmp/zxlic ) \
-        || echo "NOTE: zxtune123 fetch failed — PSF family (.psf/.usf/.gsf/…) disabled." ; \
+        || echo "NOTE: zxtune123 fetch failed — PSF family (.psf/.usf/.gsf/…), S98 and V2M disabled." ; \
       rm -rf /tmp/zx /tmp/zx.tar.gz /tmp/zxsrc.tar.gz /tmp/zxlic ; \
     else \
-      echo "NOTE: no zxtune123 prebuilt for $(uname -m) — PSF family disabled." ; \
+      echo "NOTE: no zxtune123 prebuilt for $(uname -m) — PSF family, S98 and V2M disabled." ; \
     fi
 
 # sc68 — Atari ST .sc68.  Built from the 2.2.1 release tarball (autotools) and
@@ -343,6 +483,21 @@ RUN set -eu; \
     req="/out/bin/zxtune123 /out/bin/psgplay /out/bin/ym2wav /out/bin/hvl2wav \
          /out/bin/kssrender \
          /out/share/doc/third-party/libkss/libkss-LICENSE.md /out/share/doc/third-party/libkss/kmz80.txt \
+         /out/bin/dsfrender \
+         /out/share/doc/third-party/dsfrender/Highly_Theoretical-LICENSE.TXT \
+         /out/share/doc/third-party/dsfrender/psflib-LICENSE \
+         /out/bin/milkyrender /out/share/doc/third-party/milkyplay/milkyplay-LICENSE \
+         /out/bin/mlrender /out/share/doc/third-party/musicline_playback/DEViLBOX-LICENSE \
+         /out/share/doc/third-party/musicline_playback/DEViLBOX-THIRD_PARTY_NOTICES.md \
+         /out/share/doc/third-party/libkss/MGSDRV-NOTICE.txt \
+         /out/bin/gt2reloc /out/share/doc/third-party/goattracker/COPYING \
+         /out/bin/sunvoxrender /out/share/doc/third-party/sunvox/LICENSE.txt \
+         /out/share/doc/third-party/sunvox/lib_sunvox-LICENSE \
+         /out/bin/furnace-headless /out/share/doc/third-party/furnace/LICENSE \
+         /out/bin/xmprender /out/share/doc/third-party/libxmp/libxmp-LICENSE \
+         /out/bin/sawteethrender /out/share/doc/third-party/sawteethrender/NostalgicPlayer-LICENSE \
+         /out/bin/mdxrender /out/share/doc/third-party/portable_mdx/portable_mdx-readme.md \
+         /out/share/doc/third-party/portable_mdx/Apache-2.0 \
          /out/bin/sidplayfp /out/lib/libsidplayfp.so /out/lib/libresidfp.so \
          /out/share/doc/third-party/libresidfp/COPYING /out/share/doc/third-party/libresidfp/AUTHORS \
          /out/share/doc/third-party/libsidplayfp/COPYING /out/share/doc/third-party/libsidplayfp/AUTHORS.md \
@@ -379,6 +534,23 @@ RUN set -eu; \
     fi; \
     echo "All required renderers present in /out (SLIM=${SLIM})."
 
+# ── Gate: GoatTracker, SunVox and Furnace example songs must render ──────────
+# Here, in the builder: the example songs their own sources ship (/selftest —
+# a GoatTracker 2 example, a SunVox Library example project, a Furnace NES
+# demo) are rendered by gt2reloc → sidplayfp, sunvoxrender and furnace as the
+# server does and must come out audible, as must a synthesized GoatTracker
+# song and FamiTracker module; none of them reaches the image.
+RUN --mount=type=bind,source=scripts/render_selftest.py,target=/tmp/render_selftest.py \
+    set -eu; \
+    export LD_LIBRARY_PATH=/out/lib; \
+    for n in gt2reloc sunvoxrender furnace; do \
+      b="/out/bin/$n"; [ "$n" = furnace ] && b=/out/bin/furnace-headless; \
+      python3 -B -I /tmp/render_selftest.py --only "$n" --"$n" "$b" \
+          --sidplayfp /out/bin/sidplayfp --examples /selftest \
+        || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
+             && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2 || exit 1; }; \
+    done
+
 # ═══════════════════════════════ Stage 2: runtime ═══════════════════════════════
 FROM python:3.12-slim-trixie
 
@@ -393,7 +565,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   ffmpeg            transcoding + DSD/ALAC/etc.
 #   fluidsynth (+gm)  MIDI, with a General-MIDI SoundFont
 #   adplay            AdLib / OPL2 FM  libgme0     ffmpeg's (SoniqBoom loads the libgme built above)
-#   libasound2t64/zlib1g runtime libs for the copied-in renderers (zxtune/sc68)
+#   libasound2t64/zlib1g runtime libs for the copied-in renderers (zxtune/sc68,
+#                     sunvoxrender; furnace's zlib)
+#   lhasa             the reference ``lha`` program: an LHA archive packed with a
+#                     method the built-in readers don't decode (-lh2-, -lh3-,
+#                     PMarc, LHark)
 #   libao4            runtime lib for the source-built uade123
 #   libmpg123-0t64 libogg0 libvorbis0a libvorbisfile3 libsndfile1 libflac14
 #   libportaudio2 libpulse0
@@ -410,11 +586,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2t64 zlib1g libao4 \
         libmpg123-0t64 libogg0 libvorbis0a libvorbisfile3 \
         libsndfile1 libflac14 libportaudio2 libpulse0 \
+        lhasa \
         curl ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Renderers built in the builder stage: psgplay/zxtune123/ym2wav/hvl2wav/uade123/
-# sidplayfp/openmpt123/kssrender onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
+# sidplayfp/openmpt123/kssrender/dsfrender/milkyrender/mlrender/mdxrender/gt2reloc/
+# sunvoxrender/furnace-headless/xmprender/sawteethrender onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
 # no runtime compiler); libsidplayfp / libresidfp / libstilview into /usr/local/lib,
 # libopenmpt into /usr/local/lib/<multiarch>;
 # uade's libzakalwe/bencodetools .so + its eagleplayer/score data into /usr/local;
@@ -445,10 +623,17 @@ RUN --mount=type=bind,source=scripts/openmpt_selftest.py,target=/tmp/openmpt_sel
     || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
          && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2; }
 
-# ── Gate: AdLib and KSS tunes must render ────────────────────────────────────
-# A synthesized IMF through adplay and a synthesized KSS through kssrender must
-# each come out audible — a renderer that starts but can't read its format
-# fails the build.
+# ── Gate: AdLib, KSS, DSF, DSIK, Musicline, MDX, GoatTracker, FamiTracker, libxmp, Sawteeth
+# A synthesized IMF through adplay, a synthesized KSS through kssrender, a
+# synthesized Dreamcast DSF through dsfrender, a synthesized DSIK v1 module
+# through milkyrender, a synthesized Musicline Editor module through
+# mlrender, a synthesized MDX song through mdxrender, a synthesized
+# GoatTracker song through gt2reloc → sidplayfp, a synthesized FamiTracker
+# module through furnace, a synthesized ProTracker module through
+# xmprender and a synthesized Sawteeth song through sawteethrender must each
+# come out audible — a renderer that starts but can't
+# read its format fails the build.  sunvoxrender must start (a
+# SunVox example project is rendered in the builder's gate).
 RUN --mount=type=bind,source=scripts/render_selftest.py,target=/tmp/render_selftest.py \
     python -B -I /tmp/render_selftest.py \
     || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \

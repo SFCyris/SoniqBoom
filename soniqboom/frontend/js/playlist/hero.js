@@ -20,8 +20,9 @@ import {
 } from '../utils.js';
 
 // ── Format labels ────────────────────────────────────────────────────────────
-const LOSSLESS = new Set(['FLAC', 'ALAC', 'WAV', 'WAVE', 'AIFF', 'AIF', 'WV', 'WAVPACK', 'APE', 'DSF', 'DFF', 'DSD', 'TTA']);
-const LOSSY = new Set(['MP3', 'AAC', 'M4A', 'OGG', 'OPUS', 'MPC', 'WMA', 'MP2']);
+const LOSSLESS = new Set(['FLAC', 'ALAC', 'WAV', 'WAVE', 'AIFF', 'AIF', 'WV', 'WAVPACK', 'APE', 'DSF', 'DFF', 'DSD', 'TTA',
+  'TRUEHD', 'MLP', 'DTS-HD MA']);
+const LOSSY = new Set(['MP3', 'AAC', 'M4A', 'OGG', 'OPUS', 'MPC', 'WMA', 'MP2', 'AC-3', 'E-AC-3', 'DTS', 'DTS-HD HRA']);
 const TRACKER_EXT = new Set(['mod', 'xm', 's3m', 'it', 'mtm', 'med', 'okt', '669', 'ahx', 'hvl', 'mptm', 'stm', 'far', 'ult', 'dbm', 'mo3', 'umx']);
 
 function _ext(t) {
@@ -63,7 +64,7 @@ export function fmtFamily(t) {
     if (F === 'SID' || F === 'PSID' || F === 'RSID') return 'sid';
     if (F === 'MIDI' || F === 'MID' || s === 'MID' || s === 'MIDI') return 'midi';
     if (LOSSLESS.has(F) || LOSSLESS.has(s)) return 'lossless';
-    if (LOSSY.has(s) || F.includes('VORBIS')) return 'lossy';
+    if (LOSSY.has(F) || LOSSY.has(s) || F.includes('VORBIS')) return 'lossy';
     if (TRACKER_FORMAT_NAMES.has(f) || TRACKER_EXT.has(_ext(t)) || isUadeAmigaTrack(t)) return 'tracker';
     if (CHIP_FORMAT_NAMES.has(f) || ATARI_FORMAT_NAMES.has(f) || PSF_FORMAT_NAMES.has(f)) return 'chip';
     return 'other';

@@ -113,6 +113,28 @@ def _read_cache(key: str) -> dict | None:
     return rec
 
 
+def forget_misses() -> int:
+    """Drop the remembered misses (songs no source had a cover for), so they
+    are looked up again — after a Discogs token is saved.  Covers already
+    found are kept.  Returns how many were dropped.  Blocking (a folder of
+    small files)."""
+    for k in [k for k, rec in _mem.items() if not (rec or {}).get("found")]:
+        _mem.pop(k, None)
+    dropped = 0
+    try:
+        files = list(_cache_dir().glob("*.json"))
+    except OSError:
+        return 0
+    for p in files:
+        try:
+            if not json.loads(p.read_text()).get("found"):
+                p.unlink()
+                dropped += 1
+        except (OSError, ValueError, AttributeError):
+            continue
+    return dropped
+
+
 def _write_cache(key: str, rec: dict) -> None:
     rec["v"] = _VER
     rec["fetched_at"] = time.time()
@@ -255,25 +277,75 @@ async def _musicbrainz_cover(artist: str, title: str) -> dict | None:
 
 # ── Source: Discogs (hook — only when a token is configured) ─────────────────
 
+DISCOGS_IDENTITY_URL = "https://api.discogs.com/oauth/identity"
+_DISCOGS_TOKEN_RE = re.compile(r"[A-Za-z0-9]{8,128}")
+
+
+def _discogs_headers(token: str) -> dict:
+    """The request headers of a Discogs API call made with the personal
+    access token ``token`` (sent in the Authorization header, never in the
+    URL)."""
+    return {"User-Agent": _UA, "Authorization": f"Discogs token={token}"}
+
+
+def discogs_token_ok(token: str) -> bool:
+    """Is ``token`` shaped like a Discogs personal access token (8–128
+    letters and digits)?  Pure."""
+    return bool(_DISCOGS_TOKEN_RE.fullmatch(token or ""))
+
+
+async def discogs_identity(token: str) -> dict:
+    """Check the personal access token ``token`` with Discogs
+    (``GET /oauth/identity``): ``{"ok": True, "username": …}`` when Discogs
+    accepts it, else ``{"ok": False, "error": …}`` — the token refused, Discogs
+    not reached, or offline mode (``netpolicy``: nothing is sent)."""
+    import httpx
+    from soniqboom.core import netpolicy
+    if not discogs_token_ok(token):
+        return {"ok": False, "error": "That isn't a Discogs personal access token "
+                                      "(8–128 letters and digits)."}
+    if netpolicy.blocked(DISCOGS_IDENTITY_URL):
+        return {"ok": False, "error": "Offline mode is on: Discogs isn't contacted."}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=_discogs_headers(token)) as cx:
+            r = await cx.get(DISCOGS_IDENTITY_URL)
+    except Exception as exc:                                    # noqa: BLE001
+        log.debug("discogs identity check failed: %s", type(exc).__name__)
+        return {"ok": False, "error": "Couldn't reach Discogs."}
+    if r.status_code == 200:
+        try:
+            j = r.json()
+        except ValueError:
+            j = None
+        name = j.get("username") if isinstance(j, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            return {"ok": False, "error": "Discogs answered, but not with an account — "
+                                          "try again later."}
+        return {"ok": True, "username": name.strip()[:100]}
+    if r.status_code in (401, 403):
+        return {"ok": False, "error": "Discogs refused this token."}
+    if r.status_code == 429:
+        return {"ok": False, "error": "Discogs is limiting requests — try again in a minute."}
+    return {"ok": False, "error": f"Discogs answered HTTP {r.status_code}."}
+
 async def _discogs_cover(artist: str, title: str, token: str) -> dict | None:
     """Discogs release search → cover image.  Requires a personal access token
     (anonymous search 401s).  Confidence-gated on the artist.  Returns the same
     shape as :func:`_musicbrainz_cover`, or None."""
-    if not token:
+    if not discogs_token_ok(token):
         return None
     import httpx
     na = _norm(artist)
     q = quote(f"{artist} {title}")
-    url = (f"https://api.discogs.com/database/search?q={q}&type=release"
-           f"&token={quote(token)}&per_page=8")
+    url = f"https://api.discogs.com/database/search?q={q}&type=release&per_page=8"
     try:
-        async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": _UA}) as cx:
+        async with httpx.AsyncClient(timeout=12.0, headers=_discogs_headers(token)) as cx:
             r = await cx.get(url)
         if r.status_code != 200:
             return None
         results = r.json().get("results", [])
     except Exception as exc:
-        log.debug("discogs search failed: %s", exc)
+        log.debug("discogs search failed: %s", type(exc).__name__)
         return None
     for res in results:
         # Discogs result titles are "Artist - Release"; require the artist part.

@@ -115,10 +115,12 @@ _tune_exts: "frozenset | None" = None
 # "Amiga" / "Module").
 _AUDIO_EXTS = frozenset({".mp3", ".flac", ".m4a", ".mp4", ".m4b", ".aac", ".alac", ".ogg",
                          ".oga", ".opus", ".wav", ".wave", ".aif", ".aiff", ".aifc", ".wma",
-                         ".ape", ".wv", ".mpc", ".dff", ".wsd", ".caf", ".mka", ".webm"})
+                         ".ape", ".wv", ".mpc", ".dff", ".wsd", ".caf", ".mka", ".webm",
+                         ".ac3", ".eac3", ".ec3", ".dts", ".dtshd", ".thd", ".truehd", ".mlp",
+                         ".mp1", ".mp2", ".m2a", ".8svx", ".16sv"})
 # libgme formats whose stated lengths (``tune_lengths``) are stored with the
 # renderer's fixed fade added (``gme_render.FADE_S``).
-_GME_FADED_EXTS = frozenset({".spc", ".vgm", ".vgz", ".nsfe", ".ay"})
+_GME_FADED_EXTS = frozenset({".spc", ".vgm", ".vgz", ".nsfe", ".ay", ".sap"})
 _GME_FADE_S = 8.0
 
 
@@ -128,7 +130,9 @@ def _exts() -> frozenset:
         from soniqboom.core import metadata as m
         _tune_exts = frozenset(
             m.SID_EXTS | m._MIDI_EXTS | m._TRACKER_EXTS | m._GME_EXTS | m._ADLIB_EXTS
-            | m._ATARI_EXTS | m._PSF_EXTS | m._UADE_SUFFIX_EXTS | {".imf", ".hvl", ".ahx"})
+            | m._ATARI_EXTS | m._PSF_EXTS | m._ZXTUNE_EXTS | m._MDX_EXTS | m._UADE_SUFFIX_EXTS
+            | m._SUNVOX_EXTS | m._MGS_EXTS | {".ftm", ".sng", ".dmf", ".st"}
+            | {".imf", ".hvl", ".ahx", ".mus"} | set(m.XMP_EXT_NAMES) | set(m.PW_EXT_NAMES))
     return _tune_exts
 
 
@@ -153,13 +157,18 @@ def is_tune_file(t: dict) -> bool:
     return str(t.get("format") or "").upper() == "DSF (DREAMCAST)"
 
 
-def _fade(t: dict, stated: bool = False) -> float:
-    """The fade-out included in a stored length of ``t``: its ``fade_s`` (a
-    PSF rip's), and for a length the file states (``stated``: its
-    ``tune_lengths``) a libgme rip's fixed fade.  (A libgme file's
+def _fade(t: dict, stated: bool = False, k: "int | None" = None) -> float:
+    """The fade-out included in a stored length of ``t``: tune ``k``'s
+    ``tune_fades`` entry (a SAP file whose tunes end — ``stated`` only), its
+    ``fade_s`` (a PSF rip's), and for a length the file states (``stated``:
+    its ``tune_lengths``) a libgme rip's fixed fade.  (A libgme file's
     ``duration`` may be its render's length since its first play — no fade
     in it when the tune ended by itself; its stated length is in
     ``tune_lengths``.)"""
+    fades = t.get("tune_fades")
+    if stated and k is not None and isinstance(fades, list) and 0 <= k < len(fades) \
+            and type(fades[k]) in (int, float):
+        return max(0.0, float(fades[k]))
     f = t.get("fade_s")
     if type(f) in (int, float):
         return max(0.0, float(f))
@@ -248,7 +257,7 @@ def known_len(t: dict, wire: int, ph: "tuple | None" = None) -> float:
         if isinstance(lens, list) and 0 <= k < len(lens):
             v = lens[k]
             if type(v) in (int, float) and 0 < v <= _MAX_LEN_S:
-                v = float(v) - (_fade(t, stated=True) if f == "tune_lengths" else 0.0)
+                v = float(v) - (_fade(t, stated=True, k=k) if f == "tune_lengths" else 0.0)
                 return v if v > 0 else 0.0
     if wire == 0:
         d = t.get("duration")

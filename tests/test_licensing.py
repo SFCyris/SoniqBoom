@@ -21,7 +21,11 @@ def test_collector_reads_every_pin_from_the_dockerfile():
     assert used == {"PSGPLAY_COMMIT", "ZXTUNE_REV", "SC68_URL", "SC68_SHA256",
                     "UADE_URL", "UADE_SHA256", "BENCODETOOLS_REF", "LIBZAKALWE_REF",
                     "LIBGME_URL", "LIBGME_SHA256", "LIBOPENMPT_VERSION", "LIBOPENMPT_SHA256",
-                    "LIBKSS_COMMIT"}
+                    "LIBKSS_COMMIT", "HT_COMMIT", "PSFLIB_COMMIT", "MILKYTRACKER_COMMIT",
+                    "DEVILBOX_COMMIT", "PORTABLE_MDX_COMMIT", "KSS_DRIVERS_COMMIT",
+                    "MGSDRV_H_SHA256", "GOATTRACKER_VERSION", "GOATTRACKER_SHA256",
+                    "SUNVOX_LIB_VERSION", "SUNVOX_LIB_SHA256", "FURNACE_COMMIT",
+                    "LIBXMP_VERSION", "LIBXMP_SHA256"}
     # (the SID chain's pins are read in a loop: ``arg "${key}_VERSION"``)
     assert 'for c in libresidfp:RESIDFP libsidplayfp:LIBSIDPLAYFP sidplayfp:SIDPLAYFP' in COLLECTOR
     used |= {f"{k}_{f}" for k in ("RESIDFP", "LIBSIDPLAYFP", "SIDPLAYFP") for f in ("VERSION", "SHA256")}
@@ -43,6 +47,41 @@ def test_dockerfile_uses_the_pins_it_declares():
     kss_default = re.search(r'LIBKSS_COMMIT="\$\{LIBKSS_COMMIT:-(\w+)\}"',
                             (ROOT / "soniqboom/native/kssrender/build.sh").read_text())
     assert kss_default and kss_default.group(1) == _docker_args()["LIBKSS_COMMIT"]
+    # dsfrender likewise builds the Highly Theoretical and psflib commits the
+    # collector bundles.
+    assert 'HT_COMMIT="$HT_COMMIT" PSFLIB_COMMIT="$PSFLIB_COMMIT"' in DOCKERFILE
+    dsf_build = (ROOT / "soniqboom/native/dsfrender/build.sh").read_text()
+    for name in ("HT_COMMIT", "PSFLIB_COMMIT"):
+        default = re.search(r'%s="\$\{%s:-(\w+)\}"' % (name, name), dsf_build)
+        assert default and default.group(1) == _docker_args()[name], name
+    # milkyrender likewise builds the MilkyTracker commit the collector bundles.
+    assert 'MILKYTRACKER_COMMIT="$MILKYTRACKER_COMMIT"' in DOCKERFILE
+    milky_default = re.search(r'MILKYTRACKER_COMMIT="\$\{MILKYTRACKER_COMMIT:-(\w+)\}"',
+                              (ROOT / "soniqboom/native/milkyrender/build.sh").read_text())
+    assert milky_default and milky_default.group(1) == _docker_args()["MILKYTRACKER_COMMIT"]
+    # mlrender likewise builds the DEViLBOX commit the collector bundles.
+    assert 'DEVILBOX_COMMIT="$DEVILBOX_COMMIT"' in DOCKERFILE
+    ml_default = re.search(r'DEVILBOX_COMMIT="\$\{DEVILBOX_COMMIT:-(\w+)\}"',
+                           (ROOT / "soniqboom/native/mlrender/build.sh").read_text())
+    assert ml_default and ml_default.group(1) == _docker_args()["DEVILBOX_COMMIT"]
+    # mdxrender likewise builds the portable_mdx commit the collector bundles.
+    assert 'PORTABLE_MDX_COMMIT="$PORTABLE_MDX_COMMIT"' in DOCKERFILE
+    mdx_default = re.search(r'PORTABLE_MDX_COMMIT="\$\{PORTABLE_MDX_COMMIT:-(\w+)\}"',
+                            (ROOT / "soniqboom/native/mdxrender/build.sh").read_text())
+    assert mdx_default and mdx_default.group(1) == _docker_args()["PORTABLE_MDX_COMMIT"]
+    assert '"https://github.com/yosshin4004/portable_mdx/archive/${PORTABLE_MDX_COMMIT}.tar.gz"' in COLLECTOR
+    # kssrender's MGSDRV header, gt2reloc, sunvoxrender and furnace build what
+    # the collector bundles (each build.sh's own default the same pin).
+    native = ROOT / "soniqboom/native"
+    for name, build in (("KSS_DRIVERS_COMMIT", "kssrender"), ("MGSDRV_H_SHA256", "kssrender"),
+                        ("GOATTRACKER_VERSION", "goattracker"), ("GOATTRACKER_SHA256", "goattracker"),
+                        ("SUNVOX_LIB_VERSION", "sunvoxrender"), ("SUNVOX_LIB_SHA256", "sunvoxrender"),
+                        ("FURNACE_COMMIT", "furnace"),
+                        ("LIBXMP_VERSION", "xmprender"), ("LIBXMP_SHA256", "xmprender")):
+        assert f'{name}="${name}"' in DOCKERFILE, name
+        default = re.search(r'%s="\$\{%s:-([\w.]+)\}"' % (name, name),
+                            (native / build / "build.sh").read_text())
+        assert default and default.group(1) == _docker_args()[name], name
     # A missing tag must fail the step, not silently build the default branch.
     assert 'git checkout -q "$BENCODETOOLS_REF" \\' in DOCKERFILE
     assert 'git checkout -q "$LIBZAKALWE_REF" &&' in DOCKERFILE
@@ -79,7 +118,8 @@ def test_release_attaches_sources_and_debian_manifest():
 def test_downloads_are_hash_checked():
     for name in ("ZXTUNE_SHA256_X86_64", "ZXTUNE_SHA256_ARM64", "SC68_SHA256", "UADE_SHA256",
                  "LIBGME_SHA256", "RESIDFP_SHA256", "LIBSIDPLAYFP_SHA256", "SIDPLAYFP_SHA256",
-                 "LIBOPENMPT_SHA256"):
+                 "LIBOPENMPT_SHA256", "MGSDRV_H_SHA256", "GOATTRACKER_SHA256", "SUNVOX_LIB_SHA256",
+                 "LIBXMP_SHA256"):
         assert re.search(rf"^ARG {name}=[0-9a-f]{{64}}$", DOCKERFILE, re.M), name
     for f in ("/tmp/zx.tar.gz", "/tmp/sc68.tar.gz", "/tmp/uade.tar.bz2", "/tmp/libgme.tar.gz",
               "/tmp/libopenmpt.tar.gz"):
@@ -97,7 +137,10 @@ def test_image_carries_third_party_licence_texts():
                  "libresidfp/COPYING", "libsidplayfp/COPYING", "sidplayfp/COPYING",
                  "libsidplayfp/hashlib-LICENSE", "sidplayfp/ghc-filesystem-LICENSE",
                  "libopenmpt/LICENSE", "libopenmpt/LICENSE.BSD-3-Clause.txt",
-                 "libopenmpt/LICENSE.BSL-1.0.txt", "libopenmpt/TinyFFT-NOTICE"):
+                 "libopenmpt/LICENSE.BSL-1.0.txt", "libopenmpt/TinyFFT-NOTICE",
+                 "libkss/MGSDRV-NOTICE.txt", "goattracker/COPYING", "sunvox/LICENSE.txt",
+                 "sunvox/lib_sunvox-LICENSE", "furnace/LICENSE", "libxmp/libxmp-LICENSE",
+                 "sawteethrender/NostalgicPlayer-LICENSE"):
         assert f"{doc}/{path}" in gate, path
     assert "COPY --from=builder /out/share/                /usr/local/share/" in DOCKERFILE
     ignored = {l.strip() for l in (ROOT / ".dockerignore").read_text().splitlines()
@@ -110,6 +153,10 @@ def test_vendored_code_ships_its_licence():
     hvl = (ROOT / "soniqboom" / "native" / "hvl" / "LICENSE").read_text()
     assert "BSD 3-Clause" in hvl and "Pete Gordon" in hvl
     assert (ROOT / "soniqboom" / "native" / "stsound" / "LICENSE").is_file()
+    np_lic = (ROOT / "soniqboom" / "native" / "sawteethrender" / "NostalgicPlayer-LICENSE").read_text()
+    assert "MIT" in np_lic and "Thomas Neumann" in np_lic
+    assert "NostalgicPlayer-LICENSE" in (ROOT / "soniqboom" / "native" / "sawteethrender"
+                                         / "sawteethrender.c").read_text()
 
 
 def test_sid_wasm_corresponds_to_its_committed_source():
@@ -147,3 +194,25 @@ def test_debian_sources_come_from_the_images_release():
     assert f"-w /w debian:{release} \\" in RELEASE
     debsrc = (ROOT / "scripts" / "collect_debian_sources.sh").read_text()
     assert f"debian:{release}" in debsrc
+
+
+def test_the_source_bundle_and_builds_leave_out_unlicensed_parts():
+    """Furnace's demos, instruments and wavetables state no licence: the
+    source bundle drops them (a demo is only the builder's render check,
+    never installed).  Of kss-drivers only MGSDRV's header is fetched —
+    hash-checked — by the build and the bundle; libkss's kss-drivers
+    submodule is never initialised and the other drivers are compiled out."""
+    assert re.search(r'rm -rf "\$\{FURNACE_DIR:\?\}/demos" "\$\{FURNACE_DIR:\?\}/instruments" '
+                     r'"\$\{FURNACE_DIR:\?\}/wavetables"', COLLECTOR)
+    assert "submodule update -q --init --depth 1 extern/fmt extern/adpcm" in COLLECTOR
+    kss_build = (ROOT / "soniqboom" / "native" / "kssrender" / "build.sh").read_text()
+    for text in (COLLECTOR, kss_build):
+        assert "kss-drivers/" in text and "/mgsdrv.h" in text
+        assert "modules/kss-drivers" not in text and "submodule update --init --recursive" not in text
+    assert "MGSDRV_H_SHA256" in COLLECTOR and '!= "$MGSDRV_H_SHA256"' in kss_build
+    for drv in ("KINROU", "MBR143", "MPK106", "OPX4KSS"):
+        assert f"-DEXCLUDE_DRIVER_{drv}" in kss_build, drv
+    furnace_build = (ROOT / "soniqboom" / "native" / "furnace" / "build.sh").read_text()
+    assert 'cp "$src/demos/' in furnace_build.split('if [ "${SELFTEST_DIR:-}" ]')[1]
+    assert "COPY --from=builder /selftest" not in DOCKERFILE and "/selftest " not in \
+        DOCKERFILE.split("FROM python:3.12-slim-trixie\n")[-1]

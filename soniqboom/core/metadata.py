@@ -9,14 +9,17 @@ Supported: MP3, FLAC, ALAC/M4A, AAC, Ogg Vorbis, Opus, AIFF, WAV, WavPack, Musep
 from __future__ import annotations
 
 import base64
+import contextlib
 import contextvars
 import hashlib
+import json
 import logging
 import math
 import os
 import re
 import struct
 import subprocess
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -58,9 +61,31 @@ def register_easy_game_key() -> None:
 
 register_easy_game_key()
 
+# Raw Dolby / DTS / TrueHD audio streams (``_extract_surround_stream``).
+_SURROUND_STREAM_EXTS = (".ac3", ".eac3", ".ec3", ".dts", ".dtshd", ".thd", ".truehd", ".mlp")
+
+# Tracker modules libopenmpt plays under these names too (it reads them by
+# content): PolyTracker and ProTracker IFF ``.ptm`` (as the ``ptm.`` prefix
+# name inside archives already was — ``archive._AMIGA_PREFIX_EXT``),
+# OctaMED's ``.md0``–``.md3`` / ``.mmd3`` / ``.omed`` / ``.ocss``,
+# ChipTracker's ``.chp`` / ``.chip``.
+_TRACKER_ALT_EXTS = {
+    ".ptm": "ProTracker IFF",
+    ".md0": "OctaMED", ".md1": "OctaMED", ".md2": "OctaMED", ".md3": "OctaMED",
+    ".mmd3": "OctaMED", ".omed": "OctaMED", ".ocss": "OctaMED",
+    ".chp": "ChipTracker", ".chip": "ChipTracker",
+}
+
 SUPPORTED_EXTENSIONS = {
     ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus",
     ".aiff", ".aif", ".wav", ".wv", ".mpc",
+    # Windows Media Audio (1, 2, Pro, Lossless), MPEG audio layer 1 / 2, Ogg
+    # Vorbis as ``.oga``, Amiga IFF samples (8SVX, also Fibonacci-delta
+    # packed, and 16SV): converted by ffmpeg.
+    ".wma", ".mp1", ".mp2", ".m2a", ".oga", ".8svx", ".16sv",
+    # Dolby Digital (Plus), DTS and Dolby TrueHD / MLP elementary streams
+    # (surround rips): converted by ffmpeg with all their channels.
+    *_SURROUND_STREAM_EXTS,
     # SID (C64): PSID / RSID files, whatever the suffix (``SID_EXTS``)
     ".sid", ".psid", ".rsid",
     # MIDI
@@ -69,6 +94,9 @@ SUPPORTED_EXTENSIONS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
+    # (libopenmpt too: PolyTracker / ProTracker IFF ``.ptm``, OctaMED's other
+    # names, ChipTracker's)
+    *_TRACKER_ALT_EXTS,
     # Retro chiptune via libgme (E-14): NES, SNES, Game Boy,
     # Master System / Genesis, ZX Spectrum, MSX.
     ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
@@ -100,6 +128,20 @@ SUPPORTED_EXTENSIONS = {
     ".usf", ".miniusf", ".gsf", ".minigsf",
     ".2sf", ".mini2sf", ".ssf", ".minissf",
     ".minidsf", ".ncsf", ".minincsf",
+    # zxtune123 too: S98 FM-chip dumps (PC-98, X68000 …) and Farbrausch V2
+    # synth songs (``_ZXTUNE_EXTS``).
+    ".s98", ".v2m",
+    # Sharp X68000 MDX songs (mdxrender: MXDRV + X68Sound); their PDX sample
+    # banks are companions, never listed.
+    ".mdx",
+    # SunVox projects (sunvoxrender) and MSX MGSDRV songs (kssrender); a
+    # FamiTracker module (.ftm, Furnace) and a GoatTracker 2 song (.sng,
+    # gt2reloc + sidplayfp) — both decided by content (``extract``): the
+    # suffixes are Face The Music's (libopenmpt) and uade's too.
+    ".sunvox", ".mgs", ".ftm", ".sng",
+    # A DefleMask module (.dmf, Furnace) — by content too: the suffix is also
+    # X-Tracker's / DSMI's / Software Visions' (libopenmpt).
+    ".dmf",
 }
 
 FORMAT_NAMES = {
@@ -110,6 +152,10 @@ FORMAT_NAMES = {
     ".mp3": "MP3", ".flac": "FLAC", ".m4a": "M4A", ".aac": "AAC",
     ".ogg": "Ogg Vorbis", ".opus": "Opus", ".aiff": "AIFF", ".aif": "AIFF",
     ".wav": "WAV", ".wv": "WavPack", ".mpc": "Musepack",
+    ".wma": "WMA", ".mp1": "MP1", ".mp2": "MP2", ".m2a": "MP2", ".oga": "Ogg Vorbis",
+    ".8svx": "IFF 8SVX", ".16sv": "IFF 16SV",
+    ".ac3": "AC-3", ".eac3": "E-AC-3", ".ec3": "E-AC-3", ".dts": "DTS", ".dtshd": "DTS-HD",
+    ".thd": "TrueHD", ".truehd": "TrueHD", ".mlp": "MLP",
     # SID
     ".sid": "SID", ".psid": "SID", ".rsid": "SID",
     # MIDI
@@ -123,6 +169,7 @@ FORMAT_NAMES = {
     ".gdm": "General DigiMusic", ".imf": "Imago Orpheus",
     ".okt": "Oktalyzer", ".sfx": "SoundFX", ".wow": "Grave Composer",
     ".dsm": "DSIK",
+    **_TRACKER_ALT_EXTS,
     # libgme-rendered (E-14)
     ".nsf":  "NSF",  ".nsfe": "NSFe", ".spc": "SPC", ".gbs": "GBS",
     ".vgm":  "VGM",  ".vgz":  "VGZ",  ".ay":  "AY",  ".kss": "KSS",
@@ -144,6 +191,12 @@ FORMAT_NAMES = {
     ".usf": "USF", ".miniusf": "USF", ".gsf": "GSF", ".minigsf": "GSF",
     ".2sf": "2SF", ".mini2sf": "2SF", ".ssf": "SSF", ".minissf": "SSF",
     ".minidsf": "DSF (Dreamcast)", ".ncsf": "NCSF", ".minincsf": "NCSF",
+    # zxtune123 (S98 dumps, Farbrausch V2)
+    ".s98": "S98", ".v2m": "V2M",
+    # mdxrender (Sharp X68000)
+    ".mdx": "MDX",
+    # sunvoxrender, kssrender (MGSDRV)
+    ".sunvox": "SunVox", ".mgs": "MGSDRV",
 }
 
 _ATARI_EXTS = {".sndh", ".ym", ".sc68"}
@@ -160,6 +213,14 @@ _PSF_VERSION_NAMES = {
     0x21: "USF", 0x22: "GSF", 0x24: "2SF", 0x25: "NCSF",
 }
 
+# zxtune123-played files that are not PSF rips (no ``[TAG]`` block, no
+# libraries): S98 register dumps and Farbrausch V2 songs.  The scan reads their
+# length from the file (``_extract_zxtune``).
+_ZXTUNE_EXTS = {".s98", ".v2m"}
+# Sharp X68000 MDX songs (mdxrender); the length comes from mdxrender itself
+# (``_extract_mdx``).
+_MDX_EXTS = {".mdx"}
+
 _DSD_EXTS = {".dsf", ".dff", ".wsd"}
 
 # C64 SID tunes (sidplayfp): THE one list of their file extensions — the
@@ -172,11 +233,26 @@ _TRACKER_EXTS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
     ".amf", ".gdm", ".imf", ".okt", ".sfx", ".wow", ".dsm",
+    *_TRACKER_ALT_EXTS,
 }
-# Tracker formats libopenmpt reads only from some version on — listed only
-# when the installed libopenmpt reads them (Face The Music: libopenmpt 0.8;
-# an older one leaves them out, so nothing is listed that can't play).
-_OPENMPT_OPTIONAL = {".ftm": "Face The Music"}
+# Tracker formats listed only when the installed libopenmpt reads them (its
+# own list of extensions — Face The Music from libopenmpt 0.8; an older one
+# leaves those out, so nothing is listed that can't play).  libopenmpt tells
+# the format by content: a ``.dmf`` is an X-Tracker module or a Software
+# Visions one (a MOD layout), a ``.umx`` an Unreal package holding a module.
+_OPENMPT_OPTIONAL = {
+    ".ftm": "Face The Music",
+    ".xmf": "Astroidea XMF", ".dsym": "Digital Symphony", ".dtm": "Digital Tracker",
+    ".dmf": "X-Tracker", ".mdl": "Digitrakker", ".umx": "Unreal Music",
+    ".psm": "Epic MegaGames MASI", ".j2b": "Galaxy Music System", ".mo3": "MO3",
+    ".oxm": "OggMod", ".mptm": "OpenMPT MPTM", ".rtm": "Real Tracker", ".stx": "STMIK",
+    ".sfx2": "SoundFX",
+}
+# The formats of ``_OPENMPT_OPTIONAL`` whose suffix another format uses too —
+# not indexed unless libopenmpt opens the file (``_extract_tracker``):
+# DeFy AdLib Tracker ``.dtm``, ZX Spectrum Pro Sound Maker ``.psm``, the
+# Extensible Music Format's ``.xmf`` (Modland files all three).
+_OPENMPT_OPENS_ONLY = frozenset(set(_OPENMPT_OPTIONAL) - {".ftm"})
 
 
 def _openmpt_extensions() -> frozenset:
@@ -356,7 +432,43 @@ _MOD_MAGIC_CHANNELS = {
     b"26CH": 26, b"28CH": 28, b"30CH": 30, b"32CH": 32,
     b"CD81": 8, b"TDZ1": 1, b"TDZ2": 2, b"TDZ3": 3,
     b"5CHN": 5, b"7CHN": 7, b"9CHN": 9,
+    # (Digital Tracker / Octalyser)
+    b"FA04": 4, b"FA06": 6, b"FA08": 8,
 }
+
+
+def _openmpt_opens(path: Path) -> bool:
+    """Does libopenmpt open the file ``path``: in a scan worker libopenmpt
+    in-process (``openmpt_vu.module_meta``), elsewhere ``openmpt123 --info``
+    (it prints the module's "Type" line for one it reads — its exit status
+    is 0 either way)?  True when neither is there to ask (the render then
+    decides)."""
+    if _LIBOPENMPT_IN_PROCESS:
+        try:
+            from soniqboom.core import openmpt_vu
+            raw = _read_head(path, 64 * 1024 * 1024)
+            return openmpt_vu.module_meta(raw) is not None
+        except Exception:                               # noqa: BLE001
+            return True
+    try:
+        from soniqboom.config import settings
+        import shutil
+        binary = settings.openmpt123_path or shutil.which("openmpt123")
+    except Exception:                                   # noqa: BLE001
+        binary = None
+    if not binary:
+        return True
+    try:
+        r = forksafe.run([binary, "--info", str(path)], capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return any(line.startswith(b"Type") for line in (r.stdout or b"").splitlines())
+
+
+def _tracker_name(data: bytes) -> str:
+    """A sample / instrument name of a module header: decoded, its control
+    bytes dropped (a stray one used to drop the whole name)."""
+    return "".join(c for c in _decode_tracker_str(data) if c.isprintable()).strip()
 
 # ── Partial-fetch header budgets ──────────────────────────────────────────────
 #
@@ -414,6 +526,9 @@ HEADER_BUDGET: dict[str, int | None] = {
     # and the "looks incomplete" check can't tell, so fetch the whole file.
     ".aiff": None,
     ".aif":  None,
+    # Raw Dolby / DTS / TrueHD streams: no tags, and the length of a part of
+    # one is that part's — read whole (``_extract_surround_stream``).
+    **{e: None for e in _SURROUND_STREAM_EXTS},
     ".wav":  128 * 1024,
     # Tracker formats — header at start, small
     ".mod":  64 * 1024,    # MOD samples can inflate; 64 KB covers most
@@ -983,6 +1098,9 @@ def _cover_b64(data: bytes, mime: str = "image/jpeg") -> str:
 _LOSSLESS_FORMATS = {
     "FLAC", "ALAC", "WAV", "AIFF", "WavPack", "DSD",
     "DSD64", "DSD128", "DSD256", "DSD512", "TTA",
+    "TrueHD", "MLP", "DTS-HD MA", "WMA Lossless",
+    # (Amiga IFF samples: PCM — a Fibonacci-packed 8SVX says otherwise per file)
+    "IFF 8SVX", "IFF 16SV",
 }
 
 
@@ -1059,25 +1177,37 @@ def _replaygain_from_vorbis(tags) -> dict:
         val = parser(raw)
         if val is not None:
             out[f"replaygain_{dst}"] = val
-    # Opus uses R128_TRACK_GAIN (Q7.8 integer dB × 256, per the Opus spec
-    # extension).  Convert to a plain dB float for consistency with the
-    # other tag families.
-    r128 = None
-    try:
-        r128 = tags.get("R128_TRACK_GAIN") or tags.get("r128_track_gain")
-    except Exception:
+    # Opus uses R128_TRACK_GAIN / R128_ALBUM_GAIN (RFC 7845: a Q7.8 integer
+    # dB, the gain to EBU R128's −23 LUFS).  ReplayGain aims at −18 LUFS: the
+    # same track's ReplayGain is the R128 gain + 5 dB.
+    for key, dst in (("R128_TRACK_GAIN", "replaygain_track_gain"),
+                     ("R128_ALBUM_GAIN", "replaygain_album_gain")):
         r128 = None
-    if r128 is not None:
+        try:
+            r128 = tags.get(key) or tags.get(key.lower())
+        except Exception:
+            r128 = None
+        if r128 is None:
+            continue
         if isinstance(r128, list) and r128:
             r128 = r128[0]
         try:
-            iv = int(str(r128).strip())
-            # Q7.8 → dB.  Opus's R128 tag is signed Q7.8 with -127 dB at 0
-            # and the reference loudness at 0 dB.
-            out.setdefault("replaygain_track_gain", iv / 256.0)
+            out.setdefault(dst, int(str(r128).strip()) / 256.0 + 5.0)
         except ValueError:
             pass
     return out
+
+
+def _vorbis_total(g, pair: str, *keys: str) -> "int | None":
+    """The total of a "n/total" value, else the first of the separate total
+    comments (``TRACKTOTAL`` / ``TOTALTRACKS``, ``DISCTOTAL`` / ``TOTALDISCS``)."""
+    t = _total(pair)
+    if t is None:
+        for k in keys:
+            t = _int(g(k) or None)
+            if t is not None:
+                break
+    return t
 
 
 def _replaygain_from_id3(tags) -> dict:
@@ -1238,6 +1368,322 @@ def _aiff(path: Path, track_id: str) -> dict:
         "bit_depth": info.bits_per_sample,
     }
     d.update(_id3_fields(tags))
+    # (the AIFF text chunks — NAME / AUTH / ANNO / "(c) " — where the ID3
+    # chunk has no such field)
+    texts = _iff_texts(path, (b"AIFF", b"AIFC"))
+    for cid, field in (("NAME", "title"), ("AUTH", "artist")):
+        if texts.get(cid) and not d.get(field):
+            d[field] = texts[cid]
+    if not d.get("comment") and (texts.get("ANNO") or texts.get("(c) ")):
+        d["comment"] = " / ".join(t for t in (texts.get("ANNO"), texts.get("(c) ")) if t)
+    return d
+
+
+def _iff_texts(path: Path, form_types: "tuple[bytes, ...]") -> dict:
+    """The text chunks of an IFF ``FORM`` file (AIFF: NAME / AUTH / ANNO /
+    "(c) "), walked chunk by chunk (the sound data skipped, never read)."""
+    out: dict = {}
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+            if head[:4] != b"FORM" or head[8:12] not in form_types:
+                return out
+            for _ in range(256):
+                h = fh.read(8)
+                if len(h) < 8:
+                    break
+                cid, size = h[:4], struct.unpack(">I", h[4:8])[0]
+                if cid in (b"NAME", b"AUTH", b"ANNO", b"(c) ") and size <= 65536:
+                    text = _decode_tracker_str(fh.read(size), latin1_native=True).strip()
+                    if text:
+                        out.setdefault(cid.decode(), text)
+                    fh.seek(size & 1, 1)
+                else:
+                    fh.seek(size + (size & 1), 1)
+    except OSError as exc:
+        _swallow_io(exc)
+    return out
+
+
+# ── WAV (RIFF / RF64) ────────────────────────────────────────────────────────
+
+# ``fmt `` format tags whose samples are stored as they are (lossless).
+_WAV_PCM_TAGS = frozenset({1, 3})              # PCM, IEEE float
+_WAV_INFO = {b"INAM": "title", b"IART": "artist", b"IPRD": "album", b"ICMT": "comment",
+             b"ICRD": "year", b"IGNR": "genre", b"ITRK": "track", b"IPRT": "track",
+             b"ICOP": "copyright", b"ISRC": "isrc_src"}
+
+
+def _riff_text(data: bytes) -> str:
+    data = data.split(b"\0", 1)[0]
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return data.decode("latin-1").strip()
+
+
+def _wav_chunks(fh, size_on_disk: int) -> dict:
+    """The RIFF / RF64 WAVE chunks of the open file ``fh`` (``size_on_disk``
+    bytes — the whole file's, also when ``fh`` holds only its front): the
+    ``fmt `` fields, the ``fact`` count, the ``data`` size and offset, the
+    ``LIST/INFO`` texts and whether an ``id3 `` chunk is there.  Raises
+    ValueError for no RIFF WAVE header."""
+    fmt_tag = channels = rate = avg = align = bits = 0
+    fact = None
+    data_size = data_off = None
+    info: dict = {}
+    has_id3 = False
+    rf64_data = None
+    head = fh.read(12)
+    if head[:4] not in (b"RIFF", b"RF64", b"BW64") or head[8:12] != b"WAVE":
+        raise ValueError("not a RIFF WAVE file")
+    for _ in range(512):
+        h = fh.read(8)
+        if len(h) < 8:
+            break
+        cid, size = h[:4], struct.unpack("<I", h[4:8])[0]
+        body_at = fh.tell()
+        skip = size
+        if cid == b"ds64" and size >= 16:
+            rf64_data = struct.unpack("<Q", fh.read(16)[8:16])[0]
+        elif cid == b"fmt " and size >= 16:
+            raw = fh.read(min(size, 64))
+            if len(raw) >= 16:
+                fmt_tag, channels, rate, avg, align, bits = struct.unpack("<HHIIHH", raw[:16])
+                if fmt_tag == 0xFFFE and len(raw) >= 26:
+                    fmt_tag = struct.unpack("<H", raw[24:26])[0]   # (the sub-format GUID)
+        elif cid == b"fact" and size >= 4:
+            raw = fh.read(4)
+            if len(raw) == 4:
+                fact = struct.unpack("<I", raw)[0]
+        elif cid == b"data":
+            data_off = body_at
+            data_size = rf64_data if (size == 0xFFFFFFFF and rf64_data) else size
+            skip = data_size
+            if data_off + data_size >= size_on_disk:
+                break                            # (the last chunk, or a cut file)
+        elif cid == b"LIST" and 4 <= size <= 1 << 20:
+            raw = fh.read(size)
+            if raw[:4] == b"INFO":
+                pos = 4
+                while pos + 8 <= len(raw):
+                    sid, ssz = raw[pos:pos + 4], struct.unpack("<I", raw[pos + 4:pos + 8])[0]
+                    field = _WAV_INFO.get(sid)
+                    if field:
+                        text = _riff_text(raw[pos + 8:pos + 8 + ssz])
+                        if text:
+                            info.setdefault(field, text)
+                    pos += 8 + ssz + (ssz & 1)
+        elif cid in (b"id3 ", b"ID3 "):
+            has_id3 = True
+        fh.seek(body_at + skip + (skip & 1))
+        if fh.tell() >= size_on_disk:
+            break
+    return {"fmt_tag": fmt_tag, "channels": channels, "rate": rate, "avg": avg,
+            "align": align, "bits": bits, "fact": fact, "data_size": data_size,
+            "data_off": data_off, "info": info, "has_id3": has_id3}
+
+
+def _wav_seconds(c: dict, size_on_disk: int) -> float:
+    """The length of a WAV of ``size_on_disk`` bytes whose chunks are ``c``
+    (``_wav_chunks``): its samples (PCM / float: bytes ÷ block size; a
+    compressed stream by its ``fact`` count, else its byte rate), only what
+    the file holds."""
+    data_size, rate = c["data_size"], c["rate"]
+    avail = max(0, min(data_size, size_on_disk - (c["data_off"] or 0)))
+    if c["fmt_tag"] in _WAV_PCM_TAGS and c["align"]:
+        return avail // c["align"] / rate
+    if c["fact"] is not None:
+        # (a cut file: the samples it holds — in proportion)
+        return c["fact"] / rate * (avail / data_size if data_size else 1.0)
+    return avail / c["avg"] if c["avg"] else 0.0
+
+
+def wav_window_length(head: bytes, size: int) -> "float | None":
+    """The length of a ``size``-byte WAV file from its front ``head`` (a
+    remote scan's window): the chunks there, the data chunk as long as the
+    file is.  None when the window holds no ``fmt `` and ``data`` header."""
+    import io
+    try:
+        c = _wav_chunks(io.BytesIO(head), size)
+    except (ValueError, struct.error):
+        return None
+    if not c["rate"] or not c["channels"] or c["data_size"] is None:
+        return None
+    return _wav_seconds(c, size)
+
+
+def _wav_or_none(path: Path, track_id: str) -> "dict | None":
+    """``_wav``, or None for a file it can't read (mutagen then tries)."""
+    try:
+        return _wav(path, track_id)
+    except OSError:
+        raise
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _wav(path: Path, track_id: str) -> dict:
+    """WAV: the RIFF (or RF64) chunks read directly (``_wav_chunks``) — the
+    ``fmt `` stream description, the ``fact`` sample count, the ``data``
+    size (capped at what the file really holds: a cut file plays what it
+    has), the ``LIST/INFO`` texts — and an ``id3 `` chunk's tags (mutagen),
+    which win over INFO.  The length is ``_wav_seconds``'; only PCM / float
+    is lossless and has a bit depth."""
+    size_on_disk = path.stat().st_size
+    with open(path, "rb") as fh:
+        c = _wav_chunks(fh, size_on_disk)
+    rate, channels, avg, bits = c["rate"], c["channels"], c["avg"], c["bits"]
+    info, has_id3 = c["info"], c["has_id3"]
+    if not rate or c["data_size"] is None or not channels:
+        raise ValueError(f"a WAV file without a fmt or data chunk: {path.name}")
+    lossless = c["fmt_tag"] in _WAV_PCM_TAGS
+    duration = _wav_seconds(c, size_on_disk)
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "WAV",
+        "is_lossless": lossless,
+        "duration": duration,
+        "bitrate": avg * 8 if avg else None,
+        "channels": channels,
+        "sample_rate": rate,
+        "bit_depth": bits if lossless and bits else None,
+    }
+    if info:
+        d["title"] = info.get("title") or ""
+        d["artist"] = info.get("artist") or ""
+        d["album"] = info.get("album") or ""
+        d["comment"] = info.get("comment") or info.get("copyright") or ""
+        d["year"] = _year(info.get("year"))
+        d["genre"] = split_genres([info["genre"]]) if info.get("genre") else []
+        d["track_number"] = _int(info.get("track"))
+        d["total_tracks"] = _total(info.get("track"))
+        if info.get("isrc_src"):
+            d["isrc"] = info["isrc_src"]
+    if has_id3:
+        try:
+            from mutagen.wave import WAVE
+            tags = WAVE(path).tags
+        except Exception as exc:                       # noqa: BLE001
+            _swallow_io(exc)
+            tags = None
+        if tags is not None:
+            for k, v in _id3_fields(tags).items():
+                if v not in (None, "", [], {}):
+                    d[k] = v
+    return d
+
+
+# ── Raw AAC (ADTS) ───────────────────────────────────────────────────────────
+
+def _adts(path: Path, track_id: str) -> dict:
+    """A raw AAC stream (``.aac``: ADTS frames, an ID3 tag possibly before
+    them): mutagen's AAC reader for the stream, the ID3 tag's fields."""
+    from mutagen.aac import AAC
+    audio = AAC(path)
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": "AAC",
+        "duration": audio.info.length,
+        "bitrate": getattr(audio.info, "bitrate", None),
+        "channels": getattr(audio.info, "channels", None),
+        "sample_rate": getattr(audio.info, "sample_rate", None),
+    }
+    try:
+        tags = ID3(path)
+    except Exception:                                  # noqa: BLE001
+        tags = None
+    if tags is not None:
+        d.update({k: v for k, v in _id3_fields(tags).items() if v not in (None, "", [], {})})
+    return d
+
+
+# ── APEv2-tagged formats (WavPack, Musepack, Monkey's Audio, TTA) ───────────
+
+def _apev2_fields(tags) -> dict:
+    """The track fields of an APEv2 tag (keys are case-insensitive): text,
+    "n/total" track and disc, ReplayGain, the front cover (``Cover Art
+    (Front)``: a file name, a NUL, the image)."""
+    def g(*keys: str) -> str:
+        for k in keys:
+            try:
+                v = tags.get(k)
+            except Exception:                          # noqa: BLE001
+                v = None
+            if v is not None and getattr(v, "kind", 0) == 0:     # (text)
+                vals = [x.strip() for x in list(v) if str(x).strip()]
+                if vals:
+                    return vals
+        return []
+
+    def one(*keys: str) -> str:
+        v = g(*keys)
+        return v[0] if v else ""
+    trck, disc = one("Track"), one("Disc")
+    d: dict = {
+        "title": join_values(g("Title"), TEXT_SEP),
+        "artist": join_values(g("Artist"), NAME_SEP),
+        "album_artist": join_values(g("Album Artist", "AlbumArtist"), NAME_SEP),
+        "album": join_values(g("Album"), TEXT_SEP),
+        "composer": join_values(g("Composer"), NAME_SEP),
+        "comment": one("Comment", "Description"),
+        "label": one("Label", "Publisher"),
+        "isrc": one("ISRC"),
+        "genre": split_genres(g("Genre")),
+        "year": _year(one("Year", "Date") or None),
+        "track_number": _int(trck or None),
+        "total_tracks": _total(trck),
+        "disc_number": _int(disc or None),
+        "total_discs": _total(disc),
+        "bpm": _float(one("BPM") or None),
+    }
+    d.update(_replaygain_from_vorbis({k.lower(): [str(x) for x in g(k)] for k in (
+        "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_ALBUM_GAIN",
+        "REPLAYGAIN_TRACK_PEAK", "REPLAYGAIN_ALBUM_PEAK") if g(k)}))
+    try:
+        cov = tags.get("Cover Art (Front)")
+        raw = bytes(cov.value) if cov is not None and getattr(cov, "kind", 0) == 1 else b""
+        img = raw.split(b"\0", 1)[1] if b"\0" in raw[:256] else raw
+        if img[:3] == b"\xff\xd8\xff" or img[:8] == b"\x89PNG\r\n\x1a\n":
+            d["cover_art"] = _cover_b64(img, "image/png" if img[:4] == b"\x89PNG" else "image/jpeg")
+    except Exception:                                  # noqa: BLE001
+        pass
+    return d
+
+
+def _apev2_audio(path: Path, track_id: str, ext: str) -> "dict | None":
+    """WavPack / Musepack / Monkey's Audio / TTA: the stream (mutagen) and an
+    APEv2 tag's fields (an ID3 tag's on a TTA without one); None when
+    mutagen can't open the file."""
+    audio = MutagenFile(path)
+    if audio is None:
+        return None
+    info = audio.info
+    length = getattr(info, "length", 0) or 0
+    bitrate = getattr(info, "bitrate", None)
+    if not bitrate and length > 0:
+        try:
+            bitrate = int(path.stat().st_size * 8 / length)
+        except OSError:
+            bitrate = None
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": FORMAT_NAMES.get(ext, ext.lstrip(".").upper()),
+        "duration": length,
+        "bitrate": bitrate,
+        "channels": getattr(info, "channels", None),
+        "sample_rate": getattr(info, "sample_rate", None),
+        "bit_depth": getattr(info, "bits_per_sample", None),
+    }
+    tags = audio.tags
+    if tags is not None:
+        from mutagen.apev2 import APEv2
+        fields = (_apev2_fields(tags) if isinstance(tags, APEv2)
+                  else _id3_fields(tags) if isinstance(tags, ID3) else {})
+        d.update({k: v for k, v in fields.items() if v not in (None, "", [], {})})
     return d
 
 
@@ -1284,7 +1730,7 @@ def _flac(path: Path, track_id: str) -> dict:
         "album_artist": gm("albumartist", NAME_SEP) or gm("album artist", NAME_SEP),
         "album": gm("album", TEXT_SEP),
         "composer": gm("composer", NAME_SEP),
-        "comment": g("comment"),
+        "comment": g("comment") or g("description"),
         "label": g("organization") or g("label"),
         "isrc": g("isrc"),
         "game": (g("game") or "").strip(),
@@ -1292,9 +1738,9 @@ def _flac(path: Path, track_id: str) -> dict:
         "genre": split_genres(audio.get("genre", [])),
         "year": _year(g("date", None)),
         "track_number": _int(trck),
-        "total_tracks": _total(trck),
+        "total_tracks": _vorbis_total(g, trck, "tracktotal", "totaltracks"),
         "disc_number": _int(tpos),
-        "total_discs": _total(tpos),
+        "total_discs": _vorbis_total(g, tpos, "disctotal", "totaldiscs"),
     }
     if audio.pictures:
         pic = audio.pictures[0]
@@ -1304,6 +1750,170 @@ def _flac(path: Path, track_id: str) -> dict:
 
 
 # ── ALAC / AAC / M4A (MP4 container) ─────────────────────────────────────────
+
+# Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3, which carries Dolby
+# Atmos music) in an MP4 / M4A file: the codec mutagen reads from the sample
+# entry, and the name ffprobe gives it.
+_MP4_DOLBY = {"ac-3": "AC-3", "ec-3": "E-AC-3"}
+_FFPROBE_DOLBY = {"ac3": "AC-3", "eac3": "E-AC-3"}
+
+
+def _dolby_mp4_channels(path: Path) -> "int | None":
+    """The channel count of the Dolby Digital (Plus) stream in the MP4 file
+    at ``path``, read by ffprobe: the sample entry mutagen reads states 2
+    whatever the stream holds (the real count is in its ``dac3`` / ``dec3``
+    box).  None when ffprobe can't tell."""
+    try:
+        r = forksafe.run(["ffprobe", "-v", "quiet", "-select_streams", "a:0",
+                          "-show_entries", "stream=channels", "-of", "csv=p=0", str(path)],
+                         capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        return int((r.stdout or "").strip().splitlines()[0].split(",")[0])   # ("6," with side data)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError, IndexError):
+        return None
+
+
+def _ogg_is_opus(path: Path) -> bool:
+    """Does the Ogg file at ``path`` hold Opus (its first page's packet is
+    ``OpusHead``) rather than Vorbis?  False when it can't be read."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return False
+    return head[:4] == b"OggS" and b"OpusHead" in head[:300]
+
+
+# A raw stream's format label by ffprobe's codec name (DTS by its profile:
+# ``_dts_label``).
+_SURROUND_CODEC_LABEL = {"ac3": "AC-3", "eac3": "E-AC-3", "truehd": "TrueHD", "mlp": "MLP"}
+_PROBE_TIMEOUT_S = 30
+# A scan worker that finishes nothing for 90 s is taken for hung
+# (``scanner._EXTRACT_STUCK_S``): the walk stays well under that, and a
+# stream it can't walk in time gets ``_head_rate_seconds``'s estimate.
+_WALK_TIMEOUT_S = 60
+_HEAD_SECONDS = 120
+
+
+def _dts_label(profile: str) -> str:
+    """The format label of a DTS stream by ffprobe's profile: "DTS-HD MA"
+    (lossless — "DTS-HD MA + DTS:X" too), "DTS-HD HRA", else "DTS"."""
+    p = (profile or "").upper()
+    if p.startswith("DTS-HD MA"):
+        return "DTS-HD MA"
+    if p.startswith("DTS-HD HRA"):
+        return "DTS-HD HRA"
+    return "DTS"
+
+
+def _stream_walk_seconds(path: Path) -> "float | None":
+    """The length of the first audio stream of ``path``, read by copying it
+    through ffmpeg (no decoding) — for a stream whose header states none
+    (TrueHD, MLP) or only a bitrate estimate (DTS-HD).  None on failure."""
+    from soniqboom.config import settings
+    try:
+        r = forksafe.run(
+            [settings.ffmpeg_path or "ffmpeg", "-hide_banner", "-v", "error", "-nostats",
+             "-i", str(path), "-map", "0:a:0", "-c", "copy", "-f", "null", "-",
+             "-progress", "pipe:1"],
+            capture_output=True, text=True, timeout=_WALK_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    secs = None
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("out_time_us="):
+            try:
+                secs = int(line.split("=", 1)[1]) / 1_000_000
+            except ValueError:
+                pass
+    return secs if secs and secs > 0 else None
+
+
+def _head_rate_seconds(path: Path) -> "float | None":
+    """The length of ``path``'s first audio stream estimated from the bytes
+    per second of its first ``_HEAD_SECONDS`` (ffprobe's packet sizes and
+    times) and the file's size — for a stream too long to walk in time.
+    None on failure."""
+    try:
+        r = forksafe.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "a:0",
+             "-read_intervals", f"%+{_HEAD_SECONDS}",
+             "-show_entries", "packet=pts_time,size", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+        size = os.stat(path).st_size
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    total, last = 0, 0.0
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(",")
+        try:
+            last = max(last, float(parts[0]))
+            total += int(parts[1])
+        except (ValueError, IndexError):
+            continue
+    if total <= 0 or last <= 0:
+        return None
+    return size / (total / last)
+
+
+def _extract_surround_stream(path: Path, track_id: str) -> dict:
+    """A raw Dolby Digital (Plus), DTS or Dolby TrueHD / MLP stream
+    (``_SURROUND_STREAM_EXTS``), read with ffprobe: its codec (the format
+    label), channels, sample rate, bit depth, bitrate and length.  Such a
+    file has no tags: the title is its file name.  The length of a TrueHD,
+    MLP or DTS-HD stream — or of one whose header states none — is read by
+    walking the stream (``_stream_walk_seconds``)."""
+    import json as _json
+    try:
+        r = forksafe.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format",
+             "-show_streams", "-select_streams", "a:0", str(path)],
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+    except FileNotFoundError as exc:            # (ffprobe itself: not the file missing)
+        raise RuntimeError(f"ffprobe is not installed: {exc}") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ffprobe timed out on {path}") from None
+    info = _json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+    streams = info.get("streams") or []
+    if not streams:
+        raise ValueError(f"no audio stream ffprobe can read: {path}")
+    st, fmt_info = streams[0], info.get("format") or {}
+    codec = (st.get("codec_name") or "").lower()
+    if codec == "dts":
+        label = _dts_label(st.get("profile") or "")
+    else:
+        label = _SURROUND_CODEC_LABEL.get(codec) or FORMAT_NAMES.get(path.suffix.lower(), codec.upper())
+
+    def _num(*vals):
+        for v in vals:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if f > 0:
+                return f
+        return None
+
+    duration = _num(st.get("duration"), fmt_info.get("duration"))
+    if duration is None or codec in ("truehd", "mlp") or label.startswith("DTS-HD"):
+        duration = _stream_walk_seconds(path) or duration or _head_rate_seconds(path)
+    bits = _num(st.get("bits_per_raw_sample"), st.get("bits_per_sample"))
+    bitrate = _num(st.get("bit_rate"), fmt_info.get("bit_rate"))
+    rate = _num(st.get("sample_rate"))
+    ch = _num(st.get("channels"))
+    return {
+        "id": track_id,
+        "path": str(path),
+        "format": label,
+        "duration": duration or 0.0,
+        "bitrate": int(bitrate) if bitrate else None,
+        "channels": int(ch) if ch else None,
+        "sample_rate": int(rate) if rate else None,
+        "bit_depth": int(bits) if bits else None,
+        "title": title_from_filename(path.name),
+    }
+
 
 def _mp4(path: Path, track_id: str) -> dict:
     audio = MP4(path)
@@ -1345,6 +1955,8 @@ def _mp4(path: Path, track_id: str) -> dict:
     fmt: str | None = None
     if codec.startswith("alac"):
         fmt = "ALAC"
+    elif codec in _MP4_DOLBY:
+        fmt = _MP4_DOLBY[codec]          # Dolby Digital (Plus): not AAC
     elif codec not in ("", "mp4a"):
         fmt = "AAC"
     else:
@@ -1361,6 +1973,8 @@ def _mp4(path: Path, track_id: str) -> dict:
                 codec_name = (probed.stdout or "").strip().lower()
                 if codec_name == "alac":
                     fmt = "ALAC"
+                elif codec_name in _FFPROBE_DOLBY:
+                    fmt = _FFPROBE_DOLBY[codec_name]
                 elif codec_name == "aac":
                     fmt = "AAC"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -1372,15 +1986,26 @@ def _mp4(path: Path, track_id: str) -> dict:
         # canonical.
         fmt = "ALAC" if codec.startswith("alac") else "AAC"
 
+    bitrate = getattr(audio.info, "bitrate", None)
+    if fmt == "ALAC" and (audio.info.length or 0) > 0:
+        # (mutagen states ALAC's uncompressed rate: the file's real one, as
+        # for FLAC)
+        try:
+            bitrate = int(path.stat().st_size * 8 / audio.info.length)
+        except OSError:
+            pass
     d: dict = {
         "id": track_id,
         "path": str(path),
         "format": fmt,
         "duration": audio.info.length,
-        "bitrate": getattr(audio.info, "bitrate", None),
-        "channels": audio.info.channels,
+        "bitrate": bitrate,
+        "channels": ((_dolby_mp4_channels(path) if fmt in ("AC-3", "E-AC-3") else None)
+                     or audio.info.channels),
         "sample_rate": audio.info.sample_rate,
-        "bit_depth": getattr(audio.info, "bits_per_sample", None),
+        # (a bit depth only for ALAC: a lossy codec has none — the sample
+        # entry's 16 is no property of the audio)
+        "bit_depth": getattr(audio.info, "bits_per_sample", None) if fmt == "ALAC" else None,
         "title": gm("\xa9nam", TEXT_SEP) or path.stem,
         "artist": gm("\xa9ART", NAME_SEP),
         "album_artist": gm("aART", NAME_SEP),
@@ -1393,14 +2018,20 @@ def _mp4(path: Path, track_id: str) -> dict:
         "bpm": _float(g("tmpo", None)),
         "genre": _list(tags.get("\xa9gen", [])),
         "year": _year(g("\xa9day", None)),
-        "track_number": trkn[0],
-        "total_tracks": trkn[1],
-        "disc_number": disk[0],
-        "total_discs": disk[1],
+        "track_number": trkn[0] or None,
+        "total_tracks": trkn[1] or None,            # (0: not stated)
+        "disc_number": disk[0] or None,
+        "total_discs": disk[1] or None,
     }
     covers = tags.get("covr", [])
     if covers:
         d["cover_art"] = _cover_b64(bytes(covers[0]))
+    # ReplayGain as iTunes-style freeform atoms (any case of the name)
+    freeform = {k.split(":", 2)[-1].lower(): v for k, v in tags.items()
+                if isinstance(k, str) and k.startswith("----:")}
+    d.update(_replaygain_from_vorbis(
+        {k: [x.decode("utf-8", "replace") if isinstance(x, bytes) else str(x) for x in v]
+         for k, v in freeform.items()}))
     return d
 
 
@@ -1419,12 +2050,15 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
 
     trck = g("tracknumber")
     tpos = g("discnumber")
+    # (a nominal bitrate of 0 stays none: the remote length check
+    # — ``partial_length`` — takes such a file as one to read whole)
+    bitrate = getattr(audio.info, "bitrate", None)
     out: dict = {
         "id": track_id,
         "path": str(path),
         "format": fmt,
         "duration": audio.info.length,
-        "bitrate": getattr(audio.info, "bitrate", None),
+        "bitrate": bitrate,
         "channels": audio.info.channels,
         # (Opus has no sample-rate field: it always decodes at 48 kHz —
         # reading ``info.sample_rate`` raised and dropped every tag)
@@ -1434,7 +2068,7 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         "album_artist": gm("albumartist", NAME_SEP) or gm("album_artist", NAME_SEP),
         "album": gm("album", TEXT_SEP),
         "composer": gm("composer", NAME_SEP),
-        "comment": g("comment"),
+        "comment": g("comment") or g("description"),
         "label": g("organization") or g("label"),
         "isrc": g("isrc"),
         "game": (g("game") or "").strip(),
@@ -1442,9 +2076,9 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         "genre": split_genres(tags.get("genre", [])),
         "year": _year(g("date", None)),
         "track_number": _int(trck),
-        "total_tracks": _total(trck),
+        "total_tracks": _vorbis_total(g, trck, "tracktotal", "totaltracks"),
         "disc_number": _int(tpos),
-        "total_discs": _total(tpos),
+        "total_discs": _vorbis_total(g, tpos, "disctotal", "totaldiscs"),
     }
     out.update(_replaygain_from_vorbis(tags))
     return out
@@ -1699,6 +2333,32 @@ _SPC_XID6_OFFSET = 0x10200
 _SPC_XID6_MAX = 0x4000          # the real chunk is a few hundred bytes
 
 
+def _spc_xid6_year(path: Path) -> "int | None":
+    """The year an SPC's extended ID666 (``xid6``) tag states (sub-chunk
+    0x14: its value in the header's length field), or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(_SPC_XID6_OFFSET)
+            blob = f.read(_SPC_XID6_MAX)
+    except OSError as exc:
+        _swallow_io(exc)
+        return None
+    if len(blob) < 8 or blob[:4] != b"xid6":
+        return None
+    end = min(8 + struct.unpack_from("<I", blob, 4)[0], len(blob))
+    pos = 8
+    while pos + 4 <= end:
+        sid, typ = blob[pos], blob[pos + 1]
+        length = struct.unpack_from("<H", blob, pos + 2)[0]
+        pos += 4
+        if typ == 0:
+            if sid == 0x14 and 1980 <= length <= 2100:
+                return length
+            continue
+        pos += (length + 3) & ~3
+    return None
+
+
 def _spc_xid6_game(path: Path) -> str:
     """The game name from an SPC's extended ID666 (``xid6``) chunk, or ``""``.
 
@@ -1784,7 +2444,8 @@ def _vgm_gd3(path: Path) -> dict[str, str]:
                     return v
         return ""
 
-    return {"track": pick(0, 1), "game": pick(2, 3), "author": pick(6, 7)}
+    return {"track": pick(0, 1), "game": pick(2, 3), "author": pick(6, 7),
+            "date": pick(8, 8)}
 
 
 def _extract_gme(path: Path, track_id: str) -> dict:
@@ -1808,14 +2469,28 @@ def _extract_gme(path: Path, track_id: str) -> dict:
     game = ""
     duration = float(getattr(settings, "sid_default_duration", 180))
     subsongs = None
+    default_tune = None
+    year = None
+    comment = ""
+    sap_fades = None
     try:
         with open(path, "rb") as f:
             hdr = f.read(256)
-            # The tune count: NSF / NSFe / GBS / AY / SAP state it (NSFe and
-            # SAP a little further in) — what the tune picker lists.
+            # The tune count and the default tune: NSF / NSFe / GBS / AY /
+            # SAP state them (NSFe and SAP a little further in) — what the
+            # tune picker lists and a bare play starts with.
             if ext in (".nsf", ".nsfe", ".gbs", ".ay", ".sap"):
                 from soniqboom.core.gme_render import header_tunes
-                subsongs, _ = header_tunes(hdr + f.read(64 * 1024 - 256))
+                more = f.read(64 * 1024 - 256)
+                subsongs, default_tune = header_tunes(hdr + more)
+                if ext == ".sap":
+                    from soniqboom.core.gme_render import sap_header
+                    sap = sap_header(hdr + more)
+                    from soniqboom.core.gme_render import tune_fades
+                    sap_fades = tune_fades(hdr + more, subsongs or 1)
+                    title = sap.get("name") or title
+                    artist = sap.get("author") or ""
+                    year = _year_in(sap.get("date") or "")
     except OSError as exc:
         _swallow_io(exc)
         hdr = b""
@@ -1826,6 +2501,7 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         title  = _decode_tracker_str(hdr[0x0E:0x2E])
         artist = _decode_tracker_str(hdr[0x2E:0x4E])
         game   = _game_name(title)
+        year = _year_in(_decode_tracker_str(hdr[0x4E:0x6E]))     # (the copyright)
     # NSFe — chunked; the game/artist live in the ``auth`` chunk.
     elif ext in (".nsf", ".nsfe") and hdr[:4] == b"NSFE":
         g, a = _nsfe_auth(path)
@@ -1836,7 +2512,15 @@ def _extract_gme(path: Path, track_id: str) -> dict:
     # Byte 0x23 = 27 means "no ID666 tag" (the fields are then garbage).
     elif ext == ".spc" and hdr[:33] == b"SNES-SPC700 Sound File Data v0.30":
         title  = _decode_tracker_str(hdr[0x2E:0x4E])
-        artist = _decode_tracker_str(hdr[0xB1:0xD1])
+        # The ID666 tag comes as text (the seconds / fade fields digits: the
+        # artist at 0xB1) or binary (the artist at 0xB0).  Its date (0x9E) is
+        # the day the SPC was dumped — the game's year only in the extended
+        # tag (xid6 0x14).
+        text_tag = all(c in b"0123456789 \0" for c in hdr[0xA9:0xB1])
+        artist = _decode_tracker_str(hdr[0xB1:0xD1] if text_tag else hdr[0xB0:0xD0])
+        if hdr[0x23] != 27 and len(hdr) >= 0xD0:
+            comment = _decode_tracker_str(hdr[0x7E:0x9E])
+            year = _spc_xid6_year(path)
         if len(hdr) > 0x6E and hdr[0x23] != 27:
             game = _game_name(_decode_tracker_str(hdr[0x4E:0x6E]))
             if game and b"\x00" not in hdr[0x4E:0x6E]:
@@ -1847,7 +2531,8 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         title  = _decode_tracker_str(hdr[0x10:0x30])
         artist = _decode_tracker_str(hdr[0x30:0x50])
         game   = _game_name(title)
-    # VGM / VGZ — GD3 tag (track, game, author).
+        year = _year_in(_decode_tracker_str(hdr[0x50:0x70]))     # (the copyright)
+    # VGM / VGZ — GD3 tag (track, game, author, date).
     elif ext in (".vgm", ".vgz"):
         gd3 = _vgm_gd3(path)
         if gd3.get("track"):
@@ -1855,6 +2540,7 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         if gd3.get("author"):
             artist = gd3["author"]
         game = _game_name(gd3.get("game", ""))
+        year = _year_in(gd3.get("date") or "")
     # GYM (Mega Drive register dump): a GYMX header names the song and the
     # game; its length is its frame count (60 per second) — read off the
     # unpacked dump (a packed GYMX is zlib inside), plus the 8 s fade a looped
@@ -1892,12 +2578,22 @@ def _extract_gme(path: Path, track_id: str) -> dict:
         d["album"] = game
         d["album_source"] = "tag"
         d["game_by_tag"] = game                # the header's own game name
+    if year:
+        d["year"] = year
+    if comment and _game_name(comment):
+        d["comment"] = comment
     if subsongs and subsongs > 1:
+        # (the header's default tune is no ``start_subsong``: that maps the
+        # wire for SID / SNDH only — ``stream._header_tuned``; a bare play of
+        # these plays the default its probe decides)
         d["subsongs"] = subsongs
         if tune_lens:
             d["tune_lengths"] = tune_lens
     elif tune_lens is not None and gme_render_available():
         d["tune_lengths"] = tune_lens
+    if sap_fades and d.get("tune_lengths"):
+        # (a SAP tune that ends at its TIME has no fade in its length)
+        d["tune_fades"] = sap_fades
     return d
 
 
@@ -1928,7 +2624,7 @@ _GME_LENGTH_MAX_BYTES = 32 * 1024 * 1024
 # libgme formats that can state a length (SPC ID666, VGM, NSFe, AY); plain
 # NSF / GBS / KSS / HES never do, and libgme reads no SAP TIME tag — not
 # worth reading at scan.
-_GME_STATED_EXTS = frozenset({".spc", ".vgm", ".vgz", ".nsfe", ".ay"})
+_GME_STATED_EXTS = frozenset({".spc", ".vgm", ".vgz", ".nsfe", ".ay", ".sap"})
 
 
 def _gme_stated_duration(path: Path, default: float) -> float:
@@ -2031,7 +2727,7 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
         out = forksafe.run(
             [probe, "-v", "error",
              "-show_entries",
-             "stream=sample_rate,channels,duration:format=duration,size,bit_rate:format_tags",
+             "stream=codec_name,sample_rate,channels,duration:format=duration,size,bit_rate:format_tags",
              "-of", "json", str(path)],
             capture_output=True, text=True, timeout=15,
         )
@@ -2045,6 +2741,10 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
         s = streams[0] if streams else {}
         sr = _int(s.get("sample_rate"))
         ch = _int(s.get("channels"))
+        if sr and sr < 1_000_000 and str(s.get("codec_name") or "").startswith("dsd"):
+            # (ffmpeg states a DSD stream's rate in bytes — the bit rate ÷ 8:
+            # DSD64 is 2,822,400 Hz, not 352,800)
+            sr *= 8
 
         # Duration fallback chain — DFF in particular often omits
         # format.duration in ffprobe output (no fixed-size header), so the
@@ -2083,6 +2783,7 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
             "duration": duration,
             "format": _dsd_quality_label(sr),
             "bit_depth": 1,
+            "bitrate": sr * ch if sr and ch else None,
         })
         # Tags: prefer mutagen over ffprobe.
         #
@@ -2117,7 +2818,10 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
                     "TSRC": "isrc",
                 }
                 for frame_id, dst in _ID3_MAP.items():
-                    frame = mf.tags.get(frame_id)
+                    # (a COMM frame is keyed "COMM:<desc>:<lang>")
+                    frame = (next(iter(mf.tags.getall("COMM") or []), None)
+                             if frame_id == "COMM" and hasattr(mf.tags, "getall")
+                             else mf.tags.get(frame_id))
                     if not frame:
                         continue
                     # ID3 frames expose ``.text`` as a list.  COMM has
@@ -2135,6 +2839,12 @@ def _extract_dsd(path: Path, track_id: str) -> dict:
                     if not val:
                         continue
                     mutagen_tags[dst] = val
+                if hasattr(mf.tags, "getall"):
+                    # (the ID3 tag's cover and ReplayGain)
+                    pic = id3_picture(mf.tags)
+                    if pic is not None:
+                        d["cover_art"] = _cover_b64(pic.data, pic.mime or "image/jpeg")
+                    d.update(_replaygain_from_id3(mf.tags))
         except Exception as exc:
             log.debug("DSD mutagen tag read failed for %s: %s", path, exc)
 
@@ -2252,47 +2962,56 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     channels: int | None = None
     patterns: int | None = None
     ftm_artist = ""
+    tracker_subsongs: int | None = None  # (AHX / HivelyTracker: their header's count)
     file_bytes: bytes | None = None     # the file as read: duration + scene MD5 use it too
 
     try:
         with open(path, "rb") as f:
             raw = f.read()  # read full file for instrument headers
         file_bytes = raw
-        if raw[:4] == b"XPKF":
-            # An XPK-packed module: parse the unpacked one (uade plays one
-            # unpacked too — ``api.stream._xpk_unpacked``; openmpt unpacks
-            # XPK itself).
+        if raw[:4] in (b"XPKF", b"PP20"):
+            # An XPK- or PowerPacker-packed module: parse the unpacked one
+            # (uade plays one unpacked too — ``api.stream._xpk_unpacked``;
+            # openmpt unpacks both itself).
             from soniqboom.core import xpk as _xpk
             try:
                 raw = _xpk.unpack(raw)
             except _xpk.XpkError as exc:
                 log.debug("XPK unpack failed for %s: %s", path, exc)
 
-        if ext == ".mod" and len(raw) >= 1084:
-            title = _decode_tracker_str(raw[0:20])
+        if ext == ".mod" and len(raw) >= 600:
+            title = "".join(c for c in _decode_tracker_str(raw[0:20]) if c.isprintable()).strip()
 
-            # Channel count from magic bytes at offset 1080
-            magic = raw[1080:1084]
+            # Channel count from magic bytes at offset 1080; none there: an
+            # original 15-sample Soundtracker module (4 channels)
+            magic = raw[1080:1084] if len(raw) >= 1084 else b""
             channels = _MOD_MAGIC_CHANNELS.get(magic, 4)
+            # (15 samples: no magic — nor any other four-letter tag there,
+            # FEST, NSMS, LARD, xxCN … — and a song length + 128 orders right
+            # after them; a 31-sample module without a tag has a sample
+            # header there)
+            tagged = len(magic) == 4 and all(0x20 < c < 0x7F for c in magic)
+            n_samples = (15 if not tagged and 1 <= raw[470] <= 128
+                         and max(raw[472:600]) < 128 else 31)
+            orders_at = 20 + n_samples * 30          # (song length, restart, 128 orders)
 
-            # 31 sample headers at bytes 20-949 (each 30 bytes)
-            for i in range(31):
+            for i in range(n_samples):
                 offset = 20 + i * 30
                 if offset + 30 > len(raw):
                     break
                 try:
-                    name = _decode_tracker_str(raw[offset:offset + 22])
-                    if name and name.isprintable():
+                    name = _tracker_name(raw[offset:offset + 22])
+                    if name:
                         instruments.append(name)
                 except Exception:
                     pass
 
-            # Pattern count: highest pattern number in the order table + 1
+            # Pattern count: the highest pattern any of the 128 order slots
+            # names + 1 (the patterns the file holds — orders past the song
+            # length may name more)
             try:
-                song_length = raw[950]
-                order_table = raw[952:952 + 128]
-                if song_length > 0:
-                    patterns = max(order_table[:song_length]) + 1
+                if raw[orders_at] > 0:
+                    patterns = max(raw[orders_at + 2:orders_at + 2 + 128]) + 1
             except Exception:
                 pass
 
@@ -2319,8 +3038,8 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 try:
                     ptr = struct.unpack("<H", raw[para_offset + i * 2:para_offset + i * 2 + 2])[0] * 16
                     if ptr + 48 <= len(raw):
-                        name = _decode_tracker_str(raw[ptr + 48:ptr + 76])
-                        if name and name.isprintable():
+                        name = _tracker_name(raw[ptr + 48:ptr + 76])
+                        if name:
                             instruments.append(name)
                 except Exception:
                     pass
@@ -2335,15 +3054,25 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
             patterns = struct.unpack("<H", raw[70:72])[0]
             num_instruments = struct.unpack("<H", raw[72:74])[0]
 
-            # Walk instrument headers to get names
+            # Walk instrument headers to get names — after the patterns:
+            # each a header (its length first) and its packed data (size at
+            # +7 of the header)
             inst_offset = 60 + header_size
+            for _p in range(patterns):
+                if inst_offset + 9 > len(raw):
+                    break
+                ph_len = struct.unpack("<I", raw[inst_offset:inst_offset + 4])[0]
+                packed = struct.unpack("<H", raw[inst_offset + 7:inst_offset + 9])[0]
+                inst_offset += ph_len + packed
             for i in range(num_instruments):
                 if inst_offset + 29 > len(raw):
                     break
                 try:
                     inst_hdr_size = struct.unpack("<I", raw[inst_offset:inst_offset + 4])[0]
-                    name = _decode_tracker_str(raw[inst_offset + 4:inst_offset + 26])
-                    if name and name.isprintable():
+                    if inst_hdr_size < 29:
+                        break
+                    name = _tracker_name(raw[inst_offset + 4:inst_offset + 26])
+                    if name:
                         instruments.append(name)
                     num_samples = struct.unpack("<H", raw[inst_offset + 27:inst_offset + 29])[0]
                     if num_samples > 0 and inst_offset + inst_hdr_size <= len(raw):
@@ -2385,9 +3114,11 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                         break
                     try:
                         ptr = struct.unpack("<I", raw[ptr_off:ptr_off + 4])[0]
-                        if ptr + 32 <= len(raw):
-                            name = _decode_tracker_str(raw[ptr + 4:ptr + 30])
-                            if name and name.isprintable():
+                        # (an IMPI header: its DOS file name at +4, the
+                        # instrument's name — 26 bytes — at +0x20)
+                        if ptr + 0x3A <= len(raw) and raw[ptr:ptr + 4] == b"IMPI":
+                            name = _tracker_name(raw[ptr + 0x20:ptr + 0x3A])
+                            if name:
                                 instruments.append(name)
                     except Exception:
                         pass
@@ -2401,9 +3132,10 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                             break
                         try:
                             ptr = struct.unpack("<I", raw[ptr_off:ptr_off + 4])[0]
-                            if ptr + 30 <= len(raw):
-                                name = _decode_tracker_str(raw[ptr + 4:ptr + 30])
-                                if name and name.isprintable():
+                            # (an IMPS header: the sample's name at +0x14)
+                            if ptr + 0x2E <= len(raw) and raw[ptr:ptr + 4] == b"IMPS":
+                                name = _tracker_name(raw[ptr + 0x14:ptr + 0x2E])
+                                if name:
                                     instruments.append(name)
                         except Exception:
                             pass
@@ -2422,6 +3154,13 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 if end == -1:
                     end = min(name_off + 128, len(raw))
                 title = _decode_tracker_str(raw[name_off:end])
+            if len(raw) >= 14 and raw[:3] in (b"THX", b"HVL"):
+                # (byte 13: the subsongs besides the main song —
+                # ``ht_SubsongNr``; HivelyTracker's channels: byte 8's top
+                # six bits + 4 — ``ht_Channels``)
+                if raw[13]:
+                    tracker_subsongs = raw[13] + 1
+                channels = (raw[8] >> 2) + 4 if raw[:3] == b"HVL" else 4
 
         elif ext == ".ftm" and raw[:4] == b"FTMN" and len(raw) >= 82:
             # Face The Music: title and artist at 16 / 48 (32 bytes each),
@@ -2437,10 +3176,45 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 if name and name.isprintable():
                     instruments.append(name)
 
+        elif raw[:4] == b"DSM\x10":
+            # An early DSIK module (``core/milkyrender.header``): its title
+            # (often in quotes), channel / pattern counts, instrument names.
+            from soniqboom.core import milkyrender as _milky
+            h = _milky.header(raw)
+            if h:
+                fmt = FORMAT_NAMES[".dsm"]
+                title = _decode_tracker_str(h["name"])
+                if len(title) > 1 and title[0] == title[-1] == '"':
+                    title = title[1:-1].strip()
+                channels = h["channels"] or None
+                patterns = h["patterns"]
+                for nb in h["instruments"]:
+                    name = _decode_tracker_str(nb)
+                    if name and name.isprintable():
+                        instruments.append(name)
+
         elif raw[:3] == b"MMD" and raw[3:4] in (b"0", b"1", b"2", b"3"):
             # OctaMED: offset 0 is the magic "MMD0" — the song name is in the
             # MMD0exp block (GitHub #24).
             title = _mmd_song_name(raw)
+
+        elif ext == ".ptm" and raw[44:48] == b"PTMF":
+            # PolyTracker (a ".ptm" without "PTMF" is ProTracker IFF): the
+            # song name at 0, the channel count at 38.
+            fmt = "Poly Tracker"
+            title = _decode_tracker_str(raw[0:28])
+            channels = struct.unpack("<H", raw[38:40])[0] or None
+
+        elif ext == ".dmf":
+            # X-Tracker ("DDMF"), DSMI Compact ("DMF" + its version) or
+            # Software Visions (a MOD layout: its title at 0)
+            if raw[:4] == b"DDMF":
+                fmt = "X-Tracker"
+            elif raw[:3] == b"DMF":
+                fmt = "DSMI Compact"
+            else:
+                fmt = "Software Visions"
+                title = _decode_tracker_str(raw[0:20])
 
         elif ext in _TITLE_AT_ZERO_EXTS and len(raw) >= 20:
             # Other formats keep their title at offset 0 only in these; the
@@ -2452,10 +3226,32 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
 
     except Exception as exc:
         log.debug("Tracker header parse failed for %s: %s", path, exc)
-    # A stand-in stored as the song name ("<unnamed>", as The Mod Archive's
-    # MOD / XM uploads carry it) is no title: the file name is used instead.
-    if is_placeholder_title(title):
-        title = ""
+    by_openmpt = (file_bytes is not None and ext not in (".ahx", ".hvl")
+                  and file_bytes[:4] != b"DSM\x10")
+    meta = None
+    if by_openmpt and _LIBOPENMPT_IN_PROCESS:
+        # What libopenmpt — the engine that plays these — reads (in a scan
+        # worker, in-process): the channel count it plays (a header's own
+        # counts can't tell: IT writers enable all 64 channels) and the
+        # instrument / sample names, for every format; the title and artist
+        # where the header parse found none.
+        try:
+            from soniqboom.core import openmpt_vu
+            meta = openmpt_vu.module_meta(file_bytes)
+        except Exception:                                   # noqa: BLE001
+            meta = None
+        if meta:
+            title = title or meta.get("title") or ""
+            ftm_artist = ftm_artist or meta.get("artist") or ""
+            if meta.get("channels"):
+                channels = meta["channels"]
+            if meta.get("patterns"):
+                patterns = meta["patterns"]
+            names = [n for n in (_tracker_name(x.encode("latin-1", "replace"))
+                                 if not x.isprintable() else x
+                                 for x in meta.get("instruments") or []) if n]
+            if names:
+                instruments = names
 
     # Duration: in a scan worker, libopenmpt in-process
     # (``openmpt_vu.module_duration`` — the value ``openmpt123 --info``
@@ -2466,7 +3262,16 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
     # 30.72 s → 30).
     duration = 0.0
     lib_duration = None
-    if file_bytes is not None and _LIBOPENMPT_IN_PROCESS:
+    dsik_missing = 0
+    if file_bytes is not None and file_bytes[:4] == b"DSM\x10":
+        # An early DSIK module (libopenmpt can't read it): milkyrender's
+        # length of the song to its natural end (``--length``, mixing off);
+        # 0 without milkyrender or when it refuses the file.
+        from soniqboom.core import milkyrender as _milky
+        _mr = _milky.find()
+        _secs, dsik_missing = (_milky.length_info(_mr, path, fade_ms=0) if _mr else (None, 0))
+        lib_duration = _secs or 0.0
+    elif file_bytes is not None and _LIBOPENMPT_IN_PROCESS:
         try:
             from soniqboom.core import openmpt_vu
             lib_duration = openmpt_vu.module_duration(file_bytes)
@@ -2474,6 +3279,23 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
             lib_duration = None
     if lib_duration is not None:
         duration = lib_duration
+    # (a plain ``.mod`` — not an Amiga prefix name, not packed — that
+    # libopenmpt refuses: in a worker, no meta and no length from the loaded
+    # library; in the server, openmpt123's "error loading".  No player here
+    # reads it — another tracker's song under ``.mod``, or junk: not listed,
+    # as ``_OPENMPT_OPENS_ONLY``'s suffixes; ``extract``'s catch-all passes
+    # NotPlayableHere on.)
+    plain_mod = (ext == ".mod" and file_bytes is not None
+                 and file_bytes[:4] not in (b"XPKF", b"PP20")
+                 and _uade.classify(path.name) is None)
+    if plain_mod and _LIBOPENMPT_IN_PROCESS and meta is None and not lib_duration:
+        try:
+            from soniqboom.core import openmpt_vu
+            refused = openmpt_vu.is_available()
+        except Exception:                                   # noqa: BLE001
+            refused = False
+        if refused:
+            raise NotPlayableHere(f"not a module libopenmpt reads: {path.name}")
     try:
         from soniqboom.config import settings
         import shutil
@@ -2487,9 +3309,23 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                 [binary, "--info", str(path)],
                 capture_output=True, text=True, timeout=10,
             )
-            # Parse "Duration" line from info output
+            if plain_mod and "error loading" in (result.stdout or ""):
+                raise NotPlayableHere(f"not a module libopenmpt reads: {path.name}")
+            # Parse "Duration" line from info output — and, in the server's
+            # own threads (no libopenmpt in-process), the title and channel
+            # count it reads, as a scan worker's ``module_meta`` would
+            got_duration = False
             for line in result.stdout.splitlines():
-                if "duration" in line.lower():
+                key, _sep, val = line.partition(":")
+                key = key.strip(". ").lower()
+                if by_openmpt and meta is None and _sep:
+                    if key == "title" and not title and val.strip():
+                        title = val.strip()
+                    elif key == "channels" and val.strip().isdigit() and int(val) > 0:
+                        channels = int(val)
+                    elif key == "patterns" and val.strip().isdigit() and int(val) > 0:
+                        patterns = int(val)
+                if not got_duration and "duration" in line.lower():
                     # Try to find seconds value — formats vary
                     m = re.search(r"(?:(\d+):)?(\d+):(\d+)(?:\.(\d+))?", line)
                     if m:
@@ -2497,13 +3333,22 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                         ms = ((int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60
                                + int(m.group(3))) * 1000 + int((m.group(4) or "").ljust(3, "0")[:3]))
                         duration = ms / 1000
-                        break
+                        got_duration = True
+                        continue
                     m = re.search(r"([\d.]+)\s*s", line, re.IGNORECASE)
                     if m:
                         duration = float(m.group(1))
-                        break
+                        got_duration = True
+    except NotPlayableHere:
+        raise
     except Exception:
         pass  # openmpt123 not available or failed — duration stays 0
+
+    # A stand-in stored as the song name ("<unnamed>", as The Mod Archive's
+    # MOD / XM uploads carry it) is no title: the file name is used instead
+    # (after openmpt123's Title line too).
+    if is_placeholder_title(title):
+        title = ""
 
     # Fallback title from the INNER filename for zip-virtual paths
     # ("a.zip::b.zip::song.hvl" → "song"); plain path.stem would otherwise
@@ -2523,8 +3368,15 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         d["channels"] = channels
     if patterns is not None:
         d["patterns"] = patterns
+    if tracker_subsongs:
+        d["subsongs"] = tracker_subsongs
     if ftm_artist and ftm_artist.isprintable():
         d["artist"] = ftm_artist
+    if dsik_missing:
+        # milkyrender plays a module whose last sample data is cut short,
+        # the missing part silent: it plays only in part.
+        d["defect"] = "partial"
+        d["defect_detail"] = f"sample data cut short ({dsik_missing} bytes missing)"
     if file_bytes is not None and len(file_bytes) <= _SCENE_MD5_MAX:
         # The scene MD5 ``extract`` would otherwise read the file again for.
         d["file_md5"] = hashlib.md5(file_bytes).hexdigest()
@@ -2561,9 +3413,9 @@ def uade_get_info(path: Path) -> dict:
     Returns the parsed key/value lines (playername, modulename, subsongs, …)
     plus ``_ok``: True iff uade accepted the file.  ``_ok`` False covers
     unknown formats, corrupt modules, MISSING COMPANION halves (TFMX without
-    its ``smpl.``), and uade123 not being installed at all.  An XPK-SQSH
-    packed module is probed unpacked (``xpk``); another XPK method, or
-    damaged packed data, is ``_ok`` False.
+    its ``smpl.``), and uade123 not being installed at all.  An XPK-SQSH or
+    PowerPacker packed module is probed unpacked (``xpk.stage_for_uade``);
+    another XPK method, or damaged packed data, is ``_ok`` False.
     """
     import shutil as _shutil
     import subprocess as _sp
@@ -2571,25 +3423,29 @@ def uade_get_info(path: Path) -> dict:
     binary = _find_uade123()
     if not binary:
         return {"_ok": False, "_error": "uade123 not installed"}
-    # uade refuses an XPK-packed module ("Please depack first"): probe an
-    # unpacked copy (in a temp folder, with its companion halves linked).
+    # uade refuses an XPK- or PowerPacker-packed module ("Please depack
+    # first" / "module check failed"): probe an unpacked copy (in a temp
+    # folder, with its companion halves linked).  Also staged: a module named
+    # for the player that plays it (an Atari ST ``.soc``) and a YM-ST
+    # module's replay routine spelled otherwise beside it
+    # (``xpk.stage_for_uade``).
     probe = Path(path)
     unpacked = None
     try:
-        with open(probe, "rb") as fh:
-            packed = _xpk.xpk_method(fh.read(12)) is not None
+        unpacked = _xpk.stage_for_uade(probe, binary)
+    except _xpk.XpkError as exc:
+        return {"_ok": False, "_error": f"XPK: {exc}"}
     except OSError:
-        packed = False
-    if packed:
-        try:
-            unpacked = probe = _xpk.write_unpacked(
-                probe, _xpk.unpack_file(probe), _uade.companion_sibling_names(probe.name))
-        except (_xpk.XpkError, OSError) as exc:
-            return {"_ok": False, "_error": f"XPK: {exc}"}
+        unpacked = None
+    if unpacked is not None:
+        probe = unpacked
     try:
         r = forksafe.run(
-            [binary, "-g", str(probe)],
-            capture_output=True, text=True, timeout=_UADE123_INFO_TIMEOUT_S,
+            [binary, "-g", *_uade.player_args(probe, binary), str(probe)],
+            # (errors="replace": a module name in Latin-1 — «« UFO »» — must
+            # not fail the whole probe)
+            capture_output=True, text=True, errors="replace",
+            timeout=_UADE123_INFO_TIMEOUT_S,
         )
     except (_sp.TimeoutExpired, OSError) as exc:
         return {"_ok": False, "_error": str(exc)}
@@ -2619,8 +3475,53 @@ def uade_get_info(path: Path) -> dict:
 _UADE_SUBSONGS_RE = re.compile(r"min\s+(-?\d+)\s+max\s+(-?\d+)")
 
 
+# uade player names stored under another spelling: uade's own typo for the
+# Ben Daglish players.  Tracks stored before are relabelled once
+# (``repair.rename_formats_once``).
+UADE_FORMAT_RENAMES = {"Benn Daglish": "Ben Daglish", "Benn Daglish SID": "Ben Daglish SID"}
+
+
+def _amiga_header_tags(path: Path) -> dict:
+    """``{"title", "artist", "year"}`` the header of an Amiga module states
+    where uade reports none: a Sonix score's IFF ``NAME`` / ``AUTH`` chunks,
+    an Art Of Noise module's ``NAME`` / ``AUTH`` / ``DATE`` chunks (after its
+    "AON4" / "AON8" magic and the tracker's 42-byte credit line); empty for
+    any other module.  Reads the first 4 KB (a Sonix score: its chunks up to
+    ``NAME`` / ``AUTH``, ``_iff_texts``)."""
+    head = _read_head(path, 4096)
+    out: dict = {}
+    if head[:4] == b"FORM" and head[8:12] == b"SMUS":
+        tags = _iff_texts(path, (b"SMUS",))
+        if tags.get("NAME"):
+            out["title"] = tags["NAME"]
+        if tags.get("AUTH"):
+            out["artist"] = tags["AUTH"]
+    elif head[:4] in (b"AON4", b"AON8"):
+        pos = 46
+        while pos + 8 <= len(head):
+            cid, size = head[pos:pos + 4], struct.unpack(">I", head[pos + 4:pos + 8])[0]
+            if cid not in (b"NAME", b"AUTH", b"DATE", b"RMRK") or size > 1024:
+                break                            # (the song data starts)
+            text = "".join(c for c in _decode_tracker_str(head[pos + 8:pos + 8 + size],
+                                                          latin1_native=True)
+                           if c.isprintable()).strip()
+            if text and cid == b"NAME":
+                out["title"] = text
+            elif text and cid == b"AUTH":
+                out["artist"] = text
+            elif text and cid == b"DATE":
+                y = _year_in(text)
+                if y:
+                    out["year"] = y
+            pos += 8 + size
+    return {k: v for k, v in out.items()
+            if k == "year" or (_game_name(v) and not _PLACEHOLDER_TITLE_RE.match(v))}
+
+
 def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
-    """Metadata for a uade-rendered Amiga module, from a prior ``-g`` probe."""
+    """Metadata for a uade-rendered Amiga module, from a prior ``-g`` probe;
+    a title, artist and year the module's header states when uade reports
+    none (``_amiga_header_tags``)."""
     name = Path(str(path).split("::")[-1]).name
     cls = _uade.classify(name)
     # Format: uade's own playername ("TFMX Pro", "SoundMon 2.0") is already
@@ -2634,13 +3535,18 @@ def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
     # extractor; uade's AbyssHighestExperience reports "AHX v1/v2").
     if fmt.startswith("AHX"):
         fmt = "AHX"
+    fmt = UADE_FORMAT_RENAMES.get(fmt, fmt)
     # Title: embedded modulename when the format stores one, else the name
     # BODY (``mdat.acieed1`` → "acieed1"; ``legendcrack.fc`` → "legendcrack").
     title = (info.get("modulename") or "").strip()
     if _PLACEHOLDER_TITLE_RE.match(title):        # "<no songtitle>": none stored (GitHub #24)
         title = ""
+    try:
+        own = _amiga_header_tags(path) if "::" not in str(path) else {}
+    except Exception:                                   # noqa: BLE001
+        own = {}
     if not title:
-        title = title_from_filename(name)
+        title = own.get("title") or title_from_filename(name)
     d: dict = {
         "id": track_id,
         "path": str(path),
@@ -2649,6 +3555,19 @@ def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
         "duration": 0.0,          # render-only — backfilled from the WAV
         "genre": ["Amiga", "Module"],
     }
+    if own.get("artist"):
+        d["artist"] = own["artist"]
+    if own.get("year"):
+        d["year"] = own["year"]
+    # A Delta Music 2 module's length is worked out from the song itself (the
+    # length its render is stopped at — ``stream._render_uade``).
+    from soniqboom.core import dm2_length as _dm2
+    _dm2_s = _dm2.song_seconds(path) if "::" not in str(path) else None
+    if _dm2_s:
+        d["duration"] = _dm2_s
+        # (the render is capped at exactly this length: a current-revision one)
+        from soniqboom.core.conversion_cache import _RENDER_REVS
+        d["duration_rev"] = int(_RENDER_REVS.get("uade", 0))
     m = _UADE_SUBSONGS_RE.search(info.get("subsongs", ""))
     if m:
         lo, hi = int(m.group(1)), int(m.group(2))
@@ -2658,6 +3577,22 @@ def _extract_uade(path: Path, track_id: str, info: dict) -> dict:
             # it, so picker index N can map to replayer subsong N + lo.
             if lo:
                 d["subsong_base"] = lo
+    # A known damaged rip that plays only in part once repaired (``rip_repairs``).
+    from soniqboom.core import rip_repairs as _rip_repairs
+    known = _rip_repairs.known_defect(path)
+    if known:
+        d["defect"], d["defect_detail"] = known
+    # A Hippel COSO song played with a shared instrument file plays the tunes
+    # left in its cut tune table (``rip_repairs.coso_with_bank``), whatever
+    # uade's probe of the song alone counted (a catalogue tune is read
+    # without the file beside it).
+    tunes = _rip_repairs.coso_song_tunes(path)
+    if tunes and 1 <= tunes[0] < tunes[1]:
+        if tunes[0] == 1:
+            d.pop("subsongs", None)
+            d.pop("subsong_base", None)
+        else:
+            d["subsongs"] = tunes[0]
     return d
 
 
@@ -2977,8 +3912,12 @@ def _extract_ym(path: Path, track_id: str) -> dict:
 
 
 def _extract_sc68(path: Path, track_id: str) -> dict:
-    """SC68 metadata: track count via ``info68 -#``; durations are embedded
-    and honoured by the renderer (backfilled from the WAV on first play)."""
+    """SC68 metadata, as ``info68`` reads the file: the track count, the
+    disk's name (the title), its author and each track's length (the time
+    the file states — what the renderer plays: the first track's is the
+    duration, a bare play renders track 1; all of them the tune lengths).
+    The file name and 0 (backfilled from the WAV on first play) without
+    info68."""
     import subprocess as _sp
     name = Path(str(path).split("::")[-1]).stem
     subsongs = None
@@ -2987,15 +3926,6 @@ def _extract_sc68(path: Path, track_id: str) -> dict:
     if binary:
         sib = Path(binary).with_name("info68")
         info68 = str(sib) if sib.exists() else _find_atari_binary("", "info68")
-    if info68:
-        try:
-            r = forksafe.run([info68, str(path), "-#"], capture_output=True,
-                             text=True, timeout=15)
-            n = int((r.stdout or "").strip().splitlines()[-1])
-            if n > 1:
-                subsongs = n
-        except (ValueError, IndexError, _sp.TimeoutExpired, OSError):
-            pass
     d: dict = {
         "id": track_id,
         "path": str(path),
@@ -3004,6 +3934,32 @@ def _extract_sc68(path: Path, track_id: str) -> dict:
         "duration": 0.0,          # render-only; backfilled from the WAV
         "genre": ["Chiptune", "Atari ST"],
     }
+    if info68:
+        try:
+            # (one line each: count, default track (unused), disk name,
+            # author, then every track's seconds)
+            r = forksafe.run([info68, str(path), "-#", "-L", "-?", "-L", "-N", "-L", "-A", "-L",
+                              "-1-0", "-t", "-L"],
+                             capture_output=True, timeout=15)
+            lines = (r.stdout or b"").decode("latin-1", "replace").splitlines()
+            n = int(lines[0])
+            if n > 1:
+                subsongs = n
+            disk, author = lines[2].strip(), lines[3].strip()
+            if _game_name(disk):
+                d["title"] = disk
+            if _game_name(author):
+                d["artist"] = author
+            secs = [int(x) for x in lines[4:4 + n] if x.strip().isdigit()]
+            if len(secs) == n and any(secs):
+                if n > 1:
+                    d["tune_lengths"] = [float(x) for x in secs]
+                # (the first track's: a bare play renders track 1 —
+                # ``start_subsong`` maps the wire for SID / SNDH only)
+                if secs[0] > 0:
+                    d["duration"] = float(secs[0])
+        except (ValueError, IndexError, _sp.TimeoutExpired, OSError):
+            pass
     if subsongs:
         d["subsongs"] = subsongs
     return d
@@ -3108,6 +4064,1203 @@ def _extract_psf(path: Path, track_id: str) -> dict:
     return d
 
 
+# ── S98 / Farbrausch V2 (zxtune123) ──────────────────────────────────────────
+
+_ZXTUNE_FILE_MAX = 64 * 1024 * 1024     # (S98 / V2M files are KBs; a cap all the same)
+
+
+def _s98_header(raw: bytes) -> "tuple[float, int, int] | None":
+    """``(seconds per sync, tag offset, dump offset)`` of an S98 file, None
+    when ``raw`` isn't one (no ``S98`` + version, or a dump that starts
+    inside the 32-byte header).  The timer is TIMER INFO / TIMER INFO2
+    seconds (10 / 1000 when 0; version 1 has no TIMER INFO2)."""
+    if len(raw) < 0x20 or raw[:3] != b"S98" or raw[3:4] not in (b"0", b"1", b"2", b"3"):
+        return None
+    num, den, _comp, tag, dump = struct.unpack_from("<5I", raw, 4)
+    if dump < 0x20:
+        return None
+    if raw[3:4] in (b"0", b"1") or den == 0:
+        den = 1000
+    return (num or 10) / den, tag, dump
+
+
+def s98_seconds(raw: bytes) -> float:
+    """The length of the S98 dump ``raw`` in seconds: its waits (``FF`` one
+    sync, ``FE`` + a 7-bit little-endian count n for n + 2 syncs) up to its
+    end mark (``FD``) or the end of the data — the length zxtune123 renders
+    (it plays the dump once; a loop point is not repeated).  0 when ``raw``
+    isn't an S98 file.  Pure."""
+    head = _s98_header(raw)
+    if head is None:
+        return 0.0
+    per_sync, _tag, i = head
+    syncs = 0
+    end = len(raw)
+    while i < end:
+        c = raw[i]
+        if c == 0xFF:
+            syncs += 1
+            i += 1
+        elif c == 0xFE:
+            i += 1
+            n = shift = 0
+            while i < end:
+                b = raw[i]
+                i += 1
+                n |= (b & 0x7F) << shift
+                shift += 7
+                if not b & 0x80 or shift > 35:
+                    break
+            syncs += n + 2
+        elif c == 0xFD:
+            break
+        else:
+            i += 3                      # device/port, register, value
+    secs = syncs * per_sync
+    return secs if math.isfinite(secs) and 0 < secs <= _PSF_MAX_S else 0.0
+
+
+def s98_tags(raw: bytes) -> "dict[str, str]":
+    """An S98 file's tags (lower-case keys, first wins): version 3's
+    ``[S98]`` block of ``key=value`` lines, or the title earlier versions
+    store at the tag offset.  The text is UTF-8 when it starts with a BOM or
+    decodes as UTF-8, else Shift-JIS; control characters are dropped.  A tag
+    offset inside the header is no tag.  Pure."""
+    head = _s98_header(raw)
+    if head is None:
+        return {}
+    tag = head[1]
+    if not 0x20 <= tag < len(raw):
+        return {}
+    end = raw.find(b"\0", tag)
+    blob = raw[tag:end if end != -1 else len(raw)][:65536]
+
+    def _text(b: bytes) -> str:
+        if b.startswith(b"\xef\xbb\xbf"):
+            t = b[3:].decode("utf-8", "replace")
+        else:
+            try:
+                t = b.decode("utf-8")
+            except UnicodeDecodeError:
+                t = b.decode("cp932", "replace")
+        return "".join(c for c in t if c in "\n\r" or not unicodedata.category(c).startswith("C"))
+
+    if not blob.startswith(b"[S98]"):
+        title = _text(blob).strip()
+        return {"title": title} if title and raw[3:4] != b"3" else {}
+    tags: dict[str, str] = {}
+    for line in _text(blob[5:]).splitlines():
+        k, sep, v = line.partition("=")
+        if sep and v.strip():
+            tags.setdefault(k.strip().lower(), v.strip())
+    return tags
+
+
+def v2m_seconds(raw: bytes) -> float:
+    """The length of the Farbrausch V2 song ``raw`` in seconds: its last tick
+    (``maxtime``) at its tempo map — the header's ticks per beat
+    (``timediv``), then ``gdnum`` tempo events (their tick deltas as three
+    byte columns, then each event's µs per beat as 32 bits) — the length
+    zxtune123 renders.  Ticks before the first event (real songs start at
+    tick 0) are counted at its tempo.  0 when ``raw`` isn't one it can read.
+    Pure."""
+    if len(raw) < 12:
+        return 0.0
+    timediv, maxtime, n = struct.unpack_from("<3I", raw, 0)
+    if not timediv or not maxtime or not 0 < n <= 65536 or len(raw) < 12 + 10 * n:
+        return 0.0
+    g = raw[12:12 + 10 * n]
+    secs = 0.0
+    pos = 0
+    tempo = struct.unpack_from("<I", g, 3 * n)[0]       # (before the first event)
+    for k in range(n):
+        nxt = min(pos + (g[k] | g[n + k] << 8 | g[2 * n + k] << 16), maxtime)
+        secs += (nxt - pos) * tempo / timediv / 1e6
+        pos = nxt
+        tempo = struct.unpack_from("<I", g, 3 * n + 4 * k)[0]
+    secs += (maxtime - pos) * tempo / timediv / 1e6
+    return secs if math.isfinite(secs) and 0 < secs <= _PSF_MAX_S else 0.0
+
+
+def _extract_zxtune(path: Path, track_id: str) -> dict:
+    """S98 / V2M metadata: the length read from the file (``s98_seconds`` /
+    ``v2m_seconds``; 0 when it can't be read — backfilled from the render),
+    and an S98 file's tags (``s98_tags``: title, artist, game, year,
+    comment).  A V2M song has no tags (title = file name)."""
+    name = Path(str(path).split("::")[-1]).stem
+    ext = path.suffix.lower()
+    raw = b""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_ZXTUNE_FILE_MAX)
+    except OSError as exc:
+        _swallow_io(exc)
+    s98 = ext == ".s98"
+    tags = s98_tags(raw) if s98 else {}
+    dur = s98_seconds(raw) if s98 else v2m_seconds(raw)
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": FORMAT_NAMES[ext],
+        "title": tags.get("title") or name,
+        "duration": round(dur, 2),
+        "genre": ["Chiptune", "Game Rip"] if s98 else ["Chiptune"],
+    }
+    if tags.get("artist"):
+        d["artist"] = tags["artist"]
+    if tags.get("game"):
+        d["album"] = tags["game"]
+        d["album_source"] = "tag"
+        d["game_by_tag"] = tags["game"]
+    year = tags.get("year", "")[:4]
+    if year.isdigit():
+        d["year"] = int(year)
+    if tags.get("comment"):
+        d["comment"] = tags["comment"]
+    return d
+
+
+# ── Sharp X68000 MDX (mdxrender) ──────────────────────────────────────────────
+
+MDX_LOOPS = 2                      # loops an MDX song plays before MXDRV fades it out
+_MDX_INFO_TIMEOUT_S = 10
+
+
+def mdx_header(raw: bytes) -> "tuple[str, str] | None":
+    """``(title, PDX file name)`` of the MDX song ``raw``: its title (the
+    bytes up to the first CR or LF, Shift-JIS — UTF-8 when it decodes as
+    UTF-8 —, control characters dropped, runs of white space as one space)
+    and the PDX sample file it names after the ``1A`` that follows (``""``
+    for none; ".PDX" added to a name without an extension, a DOS path in it
+    dropped, as mdxrender does).  None when the title doesn't end within the
+    first 4 KB or no ``1A`` and NUL follow it.  Pure."""
+    ends = [i for i in (raw.find(b"\r", 0, 4096), raw.find(b"\n", 0, 4096)) if i != -1]
+    if not ends:
+        return None
+    end = min(ends)
+    mark = raw.find(b"\x1a", end, end + 512)
+    if mark == -1:
+        return None
+    stop = raw.find(b"\0", mark + 1, mark + 1 + 512)
+    if stop == -1:
+        return None
+    try:
+        title = raw[:end].decode("utf-8")
+    except UnicodeDecodeError:
+        title = raw[:end].decode("cp932", "replace")
+    title = " ".join("".join(c if not unicodedata.category(c).startswith("C") else " "
+                             for c in title).split())
+    pdx = raw[mark + 1:stop].decode("cp932", "replace")
+    pdx = re.split(r"[\\/:]", pdx)[-1]
+    if pdx and not pdx.lower().endswith(".pdx"):
+        pdx += ".PDX"
+    return title, pdx
+
+
+def find_mdx_renderer() -> "str | None":
+    """The mdxrender binary: the ``mdxrender_path`` setting, else on PATH."""
+    return _find_atari_binary("mdxrender_path", "mdxrender")
+
+
+def mdx_info(path: "Path | str", binary: "str | None" = None,
+             timeout: float = _MDX_INFO_TIMEOUT_S) -> "dict[str, str]":
+    """``mdxrender -i -l MDX_LOOPS`` of the MDX file ``path``: its
+    ``seconds`` (MXDRV's measure: ``MDX_LOOPS`` loops, its fade-out, 2 s for
+    the release), ``pdx`` (decoded as Shift-JIS) and ``pdx_found``; empty
+    when mdxrender isn't installed, fails or times out.  Blocking (a short
+    subprocess)."""
+    binary = binary or find_mdx_renderer()
+    if not binary:
+        return {}
+    try:
+        r = forksafe.run([binary, "-i", "-l", str(MDX_LOOPS), str(path)],
+                         capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    # (the PDX name is printed as the song spells it: Shift-JIS)
+    for line in (r.stdout or b"").decode("cp932", "replace").splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def mdx_seconds(info: "dict[str, str]") -> float:
+    """The length ``mdx_info`` measured, capped at the SID duration setting
+    (the cap a render plays to — ``api.stream._render_mdx``); 0 for none."""
+    try:
+        secs = float(info.get("seconds") or 0)
+    except ValueError:
+        return 0.0
+    if not (math.isfinite(secs) and secs > 0):
+        return 0.0
+    try:
+        from soniqboom.config import settings as _settings
+        cap = max(5, min(int(_settings.sid_default_duration), 3600))
+    except Exception:                                   # noqa: BLE001
+        cap = 180
+    return min(secs, float(cap))
+
+
+def _extract_mdx(path: Path, track_id: str) -> dict:
+    """MDX metadata: the title from the song's header (``mdx_header``; the
+    file name when it has none or no header) and the length mdxrender
+    measures (``mdx_info``; 0 without mdxrender or for a file it can't read —
+    backfilled from a render)."""
+    name = Path(str(path).split("::")[-1]).stem
+    raw = b""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(8192)
+    except OSError as exc:
+        _swallow_io(exc)
+    head = mdx_header(raw) if raw else None
+    title = head[0] if head else ""
+    dur = 0.0
+    if head and "::" not in str(path):
+        dur = mdx_seconds(mdx_info(path))
+    return {
+        "id": track_id,
+        "path": str(path),
+        "format": "MDX",
+        "title": title or name,
+        "duration": round(dur, 2),
+        "genre": ["Chiptune"],
+    }
+
+
+# ── GoatTracker 2, FamiTracker, SunVox, MGSDRV ────────────────────────────────
+# Four one-tune-per-play formats on the PSF route (``api.stream``):
+#   GoatTracker 2 .sng (a "GTS" header — the suffix is also uade's Amiga
+#     ZoundMonitor / RJP name): gt2reloc converts it to a C64 .sid, sidplayfp
+#     plays that; it loops, so it plays for the SID duration setting.
+#   FamiTracker .ftm (a "FamiTracker Module" header — the suffix is also Face
+#     The Music's, libopenmpt's): Furnace's headless player renders it; the
+#     length is the render's (it plays once and its loop once more).
+#   SunVox .sunvox: sunvoxrender (the SunVox Library) — the project's length.
+#   MGSDRV .mgs (MSX): kssrender with libkss's MGSDRV driver, ``MGS_LOOPS``
+#     loops then a fade, cut at the SID duration setting.
+# A GoatTracker song / FamiTracker module is named by the record's ``format``
+# (these two strings) wherever routing has no file to read.
+
+GOATTRACKER_FORMAT = "GoatTracker"
+FAMITRACKER_FORMAT = "FamiTracker"
+DEFLEMASK_FORMAT = "DefleMask"
+_SUNVOX_EXTS = {".sunvox"}
+_MGS_EXTS = {".mgs"}
+_GOAT_IDENTS = (b"GTS!", b"GTS2", b"GTS3", b"GTS4", b"GTS5")
+_FAMI_MAGIC = b"FamiTracker Module"
+_DEFLE_MAGIC = b".DelekDefleMask."
+_DEFLE_HEAD_MAX = 64 * 1024         # the compressed head read for the magic, title and author
+MGS_LOOPS = 2                       # loops an MGSDRV song plays before its fade
+_ONE_TUNE_INFO_TIMEOUT_S = 20
+_SUNVOX_MAX_S = 1800                # the longest SunVox project rendered (then cut)
+
+
+# The start of a song saved in the Fred Editor's own format (not its compiled
+# replay modules, which uade plays): not indexed (``extract``).
+FRED_EDITOR_MAGIC = b"Fred Editor "
+
+
+class NotPlayableHere(ValueError):
+    """A file whose format this install has no player for — an Amiga
+    ``.sng`` without uade, a Face The Music ``.ftm`` with a libopenmpt older
+    than 0.8 (the suffix is also GoatTracker's / FamiTracker's, so the name
+    alone can't tell).  The scan skips it without counting an error, as it
+    skips a suffix the install doesn't play (``scanner._not_playable_here``
+    reads the error text's ``NOT_PLAYABLE_HERE`` prefix)."""
+
+
+NOT_PLAYABLE_HERE = "NotPlayableHere: "
+# What a NotPlayableHere for a file libopenmpt refuses says — a judgement of
+# the bytes it was given: a remote scan's front window of a module can be
+# refused where the whole file is read (a 15-sample module cut before its
+# samples), so the scan fetches more on it (``scanner``).
+LIBOPENMPT_REFUSAL = "module libopenmpt reads: "
+
+
+def is_goattracker_song(head: bytes) -> bool:
+    """Does ``head`` (a file's first bytes) start a GoatTracker 2 song —
+    "GTS5" / "GTS4" / "GTS3" (2.x), "GTS2" or "GTS!" (1.x, which GoatTracker
+    2 imports)?  Pure."""
+    return head[:4] in _GOAT_IDENTS
+
+
+def is_famitracker_module(head: bytes) -> bool:
+    """Does ``head`` start a FamiTracker module ("FamiTracker Module")?"""
+    return head[:len(_FAMI_MAGIC)] == _FAMI_MAGIC
+
+
+# DefleMask's system byte → the system it writes for (the DMF format's codes).
+_DEFLE_SYSTEMS = {
+    0x02: "Sega Genesis", 0x42: "Sega Genesis (extended channel 3)",
+    0x03: "Sega Master System", 0x43: "Sega Master System + FM", 0x04: "Game Boy",
+    0x05: "PC Engine", 0x06: "NES", 0x46: "NES + Konami VRC7", 0x86: "Famicom Disk System",
+    0x07: "Commodore 64 (8580)", 0x47: "Commodore 64 (6581)", 0x08: "Arcade (YM2151)",
+    0x09: "Neo Geo", 0x49: "Neo Geo (extended channel 2)",
+}
+
+
+def _deflemask_plain(raw: bytes) -> bytes:
+    """The start of the DefleMask module ``raw`` uncompressed (a saved module
+    is zlib data; a plain one is taken as is), at most ``_DEFLE_HEAD_MAX``
+    bytes — b"" for data that is neither.  Pure, bounded."""
+    if raw[:len(_DEFLE_MAGIC)] == _DEFLE_MAGIC:
+        return raw[:_DEFLE_HEAD_MAX]
+    if len(raw) < 2 or raw[0] & 0x0F != 8 or (raw[0] << 8 | raw[1]) % 31:
+        return b""                      # (no zlib header)
+    import zlib
+    try:
+        return zlib.decompressobj().decompress(raw, _DEFLE_HEAD_MAX)
+    except zlib.error:
+        return b""
+
+
+def is_deflemask_module(head: bytes) -> bool:
+    """Does ``head`` (a file's first bytes) start a DefleMask module — zlib
+    data whose start is ".DelekDefleMask."?  Pure."""
+    return _deflemask_plain(head[:4096])[:len(_DEFLE_MAGIC)] == _DEFLE_MAGIC
+
+
+def deflemask_header(raw: bytes) -> "dict | None":
+    """``{"title", "author", "system", "version"}`` of the DefleMask module
+    ``raw`` (its compressed head): the version byte after the 16-byte magic,
+    then (version 9 on) the system byte, then the song name and author, each
+    a length byte and its text — as Furnace reads them (``loadDMF``).  An
+    old Yamaha YMU759 module (before version 9, or that system before version
+    16) carries more texts first: its name and author are the 4th and 5th.
+    ``system`` is the system's name ("" for a code not in ``_DEFLE_SYSTEMS``).
+    None for data that isn't a DefleMask module.  Pure."""
+    d = _deflemask_plain(raw)
+    if d[:len(_DEFLE_MAGIC)] != _DEFLE_MAGIC or len(d) < 18:
+        return None
+    version, pos, system = d[16], 17, ""
+    ymu = version < 0x09
+    if not ymu:
+        sys_code = d[17]
+        pos = 18
+        ymu = sys_code == 0x01
+        system = "Yamaha YMU759" if ymu else _DEFLE_SYSTEMS.get(sys_code, "")
+    else:
+        system = "Yamaha YMU759"
+    texts = []
+    for _ in range(5 if ymu and version < 0x10 else 2):
+        if pos >= len(d):
+            break
+        n = d[pos]
+        texts.append(d[pos + 1:pos + 1 + n])
+        pos += 1 + n
+    texts = texts[3:5] if ymu and version < 0x10 else texts
+
+    def _txt(b: bytes) -> str:
+        t = b.decode("latin-1", "replace")
+        return "".join(c for c in t if c.isprintable()).strip()
+    return {"title": _txt(texts[0]) if texts else "",
+            "author": _txt(texts[1]) if len(texts) > 1 else "",
+            "system": system, "version": version}
+
+
+def goattracker_header(raw: bytes) -> "dict | None":
+    """``{"title", "author", "copyright", "tunes"}`` of the GoatTracker song
+    ``raw`` (its first 101 bytes suffice): the three 32-byte info texts after
+    the 4-byte ident (Latin-1, as the C64 tools write them; empty when
+    unset) and the song's subtune count (the byte after them).  None for a
+    file that isn't one.  Pure."""
+    if not is_goattracker_song(raw) or len(raw) < 101:
+        return None
+    title, author, copyright_ = (_decode_tracker_str(raw[o:o + 32], latin1_native=True)
+                                 for o in (4, 36, 68))
+    return {"title": title, "author": author, "copyright": copyright_,
+            "tunes": max(1, raw[100])}
+
+
+_GOAT_FIRSTNOTE, _GOAT_LASTNOTE = 0x60, 0xBC     # GoatTracker 2's note range (C-0 … G#7)
+_GOAT_V1_LASTNOTE = _GOAT_LASTNOTE - _GOAT_FIRSTNOTE   # a 1.x note is stored 0-based
+
+
+def goattracker_has_notes(raw: bytes) -> bool:
+    """Does the GoatTracker song ``raw`` (the whole file) hold a note in one
+    of its patterns?  Walks the layout GoatTracker 2's loader reads
+    (gsong.c ``loadsong``): the info texts, the order lists, the
+    instruments, the tables (4 from GTS3 on, 3 in GTS2; a 1.x "GTS!" song
+    keeps its wavetables inside its 31 instruments), then the patterns —
+    4-byte rows (3-byte in 1.x) whose first byte is the note.  False for an
+    empty or truncated song with no note before its end, or a file that
+    isn't one.  Pure."""
+    ident = raw[:4]
+    if ident not in _GOAT_IDENTS:
+        return False
+    pos = 100
+    n = len(raw)
+
+    def u8() -> int:                              # (read into a local first: ``pos += u8()``
+        nonlocal pos                              # would add to the pos read before the call)
+        if pos >= n:
+            raise IndexError
+        pos += 1
+        return raw[pos - 1]
+
+    try:
+        for _ in range(u8() * 3):                 # each subtune's 3 order lists
+            k = u8()
+            pos += k + 1
+        if ident == b"GTS!":
+            for _ in range(31):                   # ADSR, pulse, filter: 7 bytes; wavetable; name
+                pos += 7
+                pairs = u8() // 2
+                pos += 16 + pairs * 2
+            for _ in range(u8()):
+                rows = u8() // 3
+                for i in range(rows):
+                    if pos + i * 3 < n and raw[pos + i * 3] <= _GOAT_V1_LASTNOTE:
+                        return True
+                pos += rows * 3
+        else:
+            k = u8()
+            pos += k * (9 + 16)                   # instruments: 9 parameters + name
+            for _ in range(4 if ident != b"GTS2" else 3):
+                k = u8()
+                pos += k * 2                      # each table's left and right sides
+            for _ in range(u8()):
+                rows = u8()
+                for i in range(rows):
+                    if pos + i * 4 < n and _GOAT_FIRSTNOTE <= raw[pos + i * 4] <= _GOAT_LASTNOTE:
+                        return True
+                pos += rows * 4
+    except IndexError:
+        pass
+    return False
+
+
+def famitracker_header(raw: bytes) -> "dict | None":
+    """``{"title", "author", "copyright", "tracks"}`` of the FamiTracker
+    module ``raw``: its INFO block's three 32-byte texts and the track count
+    its HEADER block states (version 2 on: the first byte, count − 1; 1
+    before).  Walks the blocks after the 22-byte file header (16-byte id,
+    version, size) until "END", the end of ``raw`` or a block that doesn't
+    fit.  None for a file that isn't one.  Pure."""
+    if not is_famitracker_module(raw) or len(raw) < 22:
+        return None
+    out = {"title": "", "author": "", "copyright": "", "tracks": 1}
+    pos = 22
+    while pos + 24 <= len(raw):
+        bid = raw[pos:pos + 16].split(b"\0", 1)[0]
+        if bid == b"END":
+            break
+        ver, size = struct.unpack("<II", raw[pos + 16:pos + 24])
+        body = raw[pos + 24:pos + 24 + size]
+        if len(body) < size:
+            break
+        if bid == b"INFO" and size >= 96:
+            out["title"], out["author"], out["copyright"] = (
+                _decode_tracker_str(body[o:o + 32], latin1_native=True) for o in (0, 32, 64))
+        elif bid == b"HEADER" and ver >= 2 and size >= 1:
+            out["tracks"] = body[0] + 1
+        pos += 24 + size
+    return out
+
+
+def _year_in(text: str) -> "int | None":
+    """A four-digit year (19xx / 20xx) in ``text``, as a SID's ``released``
+    field is read (``_extract_sid``); None."""
+    m = re.search(r"\b(19|20)\d{2}\b", text or "")
+    return int(m.group()) if m else None
+
+
+def _one_tune_cap() -> int:
+    """The SID duration setting, 5 s – 1 h: what a looping one-tune song
+    (GoatTracker, MGSDRV, MDX) plays to at most."""
+    try:
+        from soniqboom.config import settings as _settings
+        return max(5, min(int(_settings.sid_default_duration), 3600))
+    except Exception:                                   # noqa: BLE001
+        return 180
+
+
+def _run_info(cmd: list[str], timeout: float, encoding: str = "utf-8",
+              env: "dict | None" = None) -> "dict[str, str]":
+    """``key=value`` lines a renderer's info mode prints; empty when it
+    fails, isn't there or times out.  Blocking (a short subprocess)."""
+    try:
+        r = forksafe.run(cmd, capture_output=True, timeout=timeout,
+                         **({"env": env} if env is not None else {}))
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in (r.stdout or b"").decode(encoding, "replace").splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            out.setdefault(k.strip(), v.strip())
+    return out
+
+
+def _info_seconds(info: "dict[str, str]") -> float:
+    try:
+        secs = float(info.get("seconds") or 0)
+    except ValueError:
+        return 0.0
+    return secs if math.isfinite(secs) and secs > 0 else 0.0
+
+
+def sunvox_info(path: "Path | str", binary: "str | None" = None,
+                timeout: float = _ONE_TUNE_INFO_TIMEOUT_S) -> "dict[str, str]":
+    """``sunvoxrender -i`` of the SunVox project ``path``: ``seconds`` (the
+    project's length) and ``title`` (its name); empty when sunvoxrender isn't
+    installed, can't load it or times out."""
+    binary = binary or _find_atari_binary("sunvoxrender_path", "sunvoxrender")
+    return _run_info([binary, "-i", str(path)], timeout, env=sunvox_env()) if binary else {}
+
+
+def sunvox_env() -> dict:
+    """The environment sunvoxrender runs in: its TMPDIR — where it makes the
+    SunVox Library's temp home — the render temp folder
+    (``core.render_tmp``), which the server removes, so a run that was
+    stopped leaves nothing behind."""
+    from soniqboom.core import render_tmp
+    return {**os.environ, "TMPDIR": render_tmp.tmp_dir()}
+
+
+def sunvox_seconds(info: "dict[str, str]") -> float:
+    """The length a render of the project plays (``sunvox_info``'s, cut at
+    ``_SUNVOX_MAX_S``); 0 for none."""
+    return min(_info_seconds(info), float(_SUNVOX_MAX_S))
+
+
+def mgs_info(path: "Path | str", binary: "str | None" = None,
+             timeout: float = _ONE_TUNE_INFO_TIMEOUT_S) -> "dict[str, str]":
+    """``kssrender -i -l MGS_LOOPS -m <cap>`` of the MGSDRV song ``path``:
+    ``seconds``, the length its render has (``MGS_LOOPS`` loops and the
+    fade, or the cap); empty when kssrender isn't installed (or is older
+    than 1.2, which has no ``-i``), fails or times out."""
+    binary = binary or _find_atari_binary("kssrender_path", "kssrender")
+    if not binary:
+        return {}
+    return _run_info([binary, "-i", *mgs_render_args()] + [str(path)], timeout)
+
+
+MGS_FADE_MS = 8000                   # an MGSDRV song's fade (as a KSS song's)
+
+
+def mgs_render_args() -> list[str]:
+    """The kssrender options an MGSDRV song is measured and rendered with:
+    ``MGS_LOOPS`` loops, the SID duration cap, ``MGS_FADE_MS``, 44.1 kHz — the
+    same for ``mgs_info`` and ``api.stream._render_mgs``, so the measure is
+    the render's length."""
+    return ["-l", str(MGS_LOOPS), "-m", str(_one_tune_cap()), "-f", str(MGS_FADE_MS),
+            "-r", "44100"]
+
+
+def mgs_title(raw: bytes) -> str:
+    """The title text of the MGSDRV song ``raw`` ("MGS" + a version + CR LF,
+    then the text up to its 1A): Shift-JIS (UTF-8 when it decodes as such),
+    control characters and runs of white space as one space; "" when there
+    is none.  Pure."""
+    if raw[:3] != b"MGS":
+        return ""
+    start = raw.find(b"\n", 0, 16)
+    end = raw.find(b"\x1a", 0, 4096)
+    if start == -1 or end == -1 or end <= start:
+        return ""
+    text = raw[start + 1:end]
+    try:
+        title = text.decode("utf-8")
+    except UnicodeDecodeError:
+        title = text.decode("cp932", "replace")
+    return " ".join("".join(c if not unicodedata.category(c).startswith("C") else " "
+                            for c in title).split())
+
+
+def _read_head(path: Path, size: int) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(size)
+    except OSError as exc:
+        _swallow_io(exc)
+        return b""
+
+
+def _extract_goattracker(path: Path, track_id: str) -> dict:
+    """GoatTracker 2 song metadata from its header (``goattracker_header``):
+    the title (the file name when unset), the author, the copyright text as
+    the comment and a year in it; the length is the SID duration setting
+    (the song loops — a render plays that long).  The first subtune is the
+    one played."""
+    name = Path(str(path).split("::")[-1]).stem
+    head = goattracker_header(_read_head(path, 128)) or {}
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": GOATTRACKER_FORMAT,
+        "title": head.get("title") or name,
+        "duration": float(_one_tune_cap()),
+        "genre": ["Chiptune", "C64"],
+    }
+    if head.get("author"):
+        d["artist"] = head["author"]
+    if head.get("copyright"):
+        d["comment"] = head["copyright"]
+        if _year_in(head["copyright"]):
+            d["year"] = _year_in(head["copyright"])
+    return d
+
+
+_FAMI_HEAD_MAX = 256 * 1024          # the module's head read for its INFO / HEADER blocks
+
+
+def _extract_famitracker(path: Path, track_id: str) -> dict:
+    """FamiTracker module metadata from its INFO block
+    (``famitracker_header``): title (the file name when unset), author,
+    copyright as the comment and a year in it.  The length is 0 until the
+    first play (Furnace's render is the length — backfilled); the first
+    track is the one played."""
+    name = Path(str(path).split("::")[-1]).stem
+    head = famitracker_header(_read_head(path, _FAMI_HEAD_MAX)) or {}
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": FAMITRACKER_FORMAT,
+        "title": head.get("title") or name,
+        "duration": 0.0,
+        "genre": ["Chiptune"],
+    }
+    if head.get("author"):
+        d["artist"] = head["author"]
+    if head.get("copyright"):
+        d["comment"] = head["copyright"]
+        if _year_in(head["copyright"]):
+            d["year"] = _year_in(head["copyright"])
+    return d
+
+
+def _extract_deflemask(path: Path, track_id: str) -> dict:
+    """DefleMask module metadata from its header (``deflemask_header``): the
+    song name (the file name when unset), the author and the system it was
+    written for as the comment.  The length is 0 until the first play
+    (Furnace's render is the length — backfilled)."""
+    name = Path(str(path).split("::")[-1]).stem
+    head = deflemask_header(_read_head(path, _DEFLE_HEAD_MAX)) or {}
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": DEFLEMASK_FORMAT,
+        "title": head.get("title") or name,
+        "duration": 0.0,
+        "genre": ["Chiptune"],
+    }
+    if head.get("author"):
+        d["artist"] = head["author"]
+    if head.get("system"):
+        d["comment"] = head["system"]
+    return d
+
+
+def _extract_sunvox(path: Path, track_id: str) -> dict:
+    """SunVox project metadata: its name and length from ``sunvox_info``
+    (the file name and 0 — backfilled from a render — without sunvoxrender,
+    for a project it can't load, or inside an archive)."""
+    name = Path(str(path).split("::")[-1]).stem
+    info = sunvox_info(path) if "::" not in str(path) else {}
+    return {
+        "id": track_id,
+        "path": str(path),
+        "format": "SunVox",
+        "title": info.get("title") or name,
+        "duration": round(sunvox_seconds(info), 2),
+        "genre": ["Tracker"],
+    }
+
+
+def _extract_mgs(path: Path, track_id: str) -> dict:
+    """MGSDRV song metadata: the title text after its header (``mgs_title``;
+    the file name when there is none) and the length kssrender measures
+    (``mgs_info``; 0 — backfilled from a render — without kssrender or inside
+    an archive)."""
+    name = Path(str(path).split("::")[-1]).stem
+    raw = _read_head(path, 4096)
+    dur = _info_seconds(mgs_info(path)) if "::" not in str(path) else 0.0
+    return {
+        "id": track_id,
+        "path": str(path),
+        "format": "MGSDRV",
+        "title": mgs_title(raw) or name,
+        "duration": round(dur, 2),
+        "genre": ["Chiptune"],
+    }
+
+
+# ── libxmp (xmprender), ProWizard packers, C64 Sidplayer, IFF samples ────────
+# Modules libxmp plays that no other engine here reads, by suffix (libxmp
+# tells the module by content; a file it can't load is not indexed):
+XMP_EXT_NAMES = {
+    ".musx": "Archimedes Tracker", ".coco": "Coconizer", ".flx": "FlexTrax",
+    ".fnk": "Funktracker", ".liq": "Liquid Tracker", ".mgt": "Megatracker",
+    ".tip": "Titanics Player", ".sti": "STIM", ".tdd": "The Dark Demon",
+    ".eureka": "Eureka Packer",
+}
+_XMP_EXTS = frozenset(XMP_EXT_NAMES)
+XMP_MAX_S = 1800                    # the longest module xmprender plays (then cut)
+XMP_FADE_MS = 8000
+# Packed Amiga modules ``core/prowizard`` converts to a ProTracker module,
+# which xmprender plays: their suffixes (a file whose content isn't the
+# packer's is not indexed).
+from soniqboom.core import prowizard as _prowizard   # noqa: E402
+PW_EXT_NAMES = {f".{tok}": name for name, toks in _prowizard.FORMATS.items() for tok in toks}
+PW_EXTS = frozenset(PW_EXT_NAMES)
+# C64 Sidplayer songs (Compute!'s Sidplayer, Craig Chamberlain): a ``.mus``
+# — also uade's Amiga UFO suffix, told apart by content (``is_c64_sidplayer``)
+# — that sidplayfp plays, with a ``.str`` of the same name beside it for a
+# Stereo Sidplayer song's second SID.
+C64_SIDPLAYER_FORMAT = "C64 Sidplayer"
+SIDPLAYER_MAX_S = 1800              # the longest Sidplayer song rendered (then cut)
+_MUS_HLT = b"\x01\x4f"              # a Sidplayer voice's last command (HLT)
+_IFF_SAMPLE_EXTS = frozenset({".8svx", ".16sv"})
+_MPEG_LOCAL_EXTS = frozenset({".mp1", ".mp2", ".m2a"})
+# Sawteeth songs (Jonas Norberg's software-synth tracker; ``.st`` — also
+# uade's SynTracker suffix, which isn't scanned: a file is a Sawteeth song
+# by its "SWTD" (binary) / "SWTT" (text) start), played by sawteethrender.
+SAWTEETH_FORMAT = "Sawteeth"
+_SAWTEETH_IDENTS = (b"SWTD", b"SWTT")
+SAWTEETH_MAX_S = 1800               # the longest Sawteeth song rendered (then cut)
+SAWTEETH_FADE_MS = 8000
+SUPPORTED_EXTENSIONS |= _XMP_EXTS | PW_EXTS | {".mus", ".st"}    # (.mus: Sidplayer, uade's UFO)
+FORMAT_NAMES.setdefault(".st", SAWTEETH_FORMAT)
+for _e, _name in {**XMP_EXT_NAMES, **PW_EXT_NAMES}.items():
+    FORMAT_NAMES.setdefault(_e, _name)
+del _e, _name
+
+
+def xmp_info(path: "Path | str", binary: "str | None" = None,
+             timeout: float = _ONE_TUNE_INFO_TIMEOUT_S) -> "dict[str, str]":
+    """``xmprender -i`` of the module ``path`` with the options its render
+    uses (``xmp_render_args``): ``seconds`` (the render's length),
+    ``sequences``, ``channels``, ``format`` (libxmp's name) and ``title``;
+    empty when xmprender isn't installed, libxmp can't load the file or it
+    times out."""
+    binary = binary or _find_atari_binary("xmprender_path", "xmprender")
+    if not binary:
+        return {}
+    return _run_info([binary, "-i", *xmp_render_args(), str(path)], timeout,
+                     encoding="latin-1")
+
+
+def is_sawteeth_song(head: bytes) -> bool:
+    """Does ``head`` (a file's first bytes) start a Sawteeth song — "SWTD"
+    (saved by the editor) or "SWTT" (its text form)?  Pure."""
+    return head[:4] in _SAWTEETH_IDENTS
+
+
+def sawteeth_render_args() -> list[str]:
+    """The sawteethrender options a song is measured and rendered with: to
+    its end (one pass of its loop), cut at ``SAWTEETH_MAX_S`` with a
+    ``SAWTEETH_FADE_MS`` fade, 44.1 kHz — the same for ``sawteeth_info`` and
+    ``api.stream._render_sawteeth``, so the measure is the render's length."""
+    return ["-l", "1", "-m", str(SAWTEETH_MAX_S), "-f", str(SAWTEETH_FADE_MS), "-r", "44100"]
+
+
+def sawteeth_info(path: "Path | str", binary: "str | None" = None,
+                  timeout: float = _ONE_TUNE_INFO_TIMEOUT_S) -> "dict[str, str]":
+    """``sawteethrender -i`` of the Sawteeth song ``path`` with the options
+    its render uses: ``seconds`` (the render's length), ``title``, ``author``
+    and ``channels``; empty when sawteethrender isn't installed, can't load
+    the song or times out."""
+    binary = binary or _find_atari_binary("sawteethrender_path", "sawteethrender")
+    if not binary:
+        return {}
+    return _run_info([binary, "-i", *sawteeth_render_args(), str(path)], timeout,
+                     encoding="latin-1")
+
+
+def _extract_sawteeth(path: Path, track_id: str, info: "dict[str, str]") -> dict:
+    """Metadata of a Sawteeth song: its name, author, channel count and the
+    length of its render (``sawteeth_info``, read by ``_extract`` before — the
+    file name and 0, backfilled from a render, inside an archive)."""
+    name = Path(str(path).split("::")[-1]).stem
+
+    def _txt(key: str) -> str:
+        t = _decode_tracker_str((info.get(key) or "").encode("latin-1", "replace"))
+        return "" if not any(c.isalnum() for c in t) or is_placeholder_title(t) else t
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": SAWTEETH_FORMAT,
+        "title": _txt("title") or name,
+        "duration": round(_info_seconds(info), 2),
+        "genre": ["Chiptune"],
+    }
+    if _txt("author"):
+        d["artist"] = _txt("author")
+    try:
+        ch = int(info.get("channels") or 0)
+    except ValueError:
+        ch = 0
+    if ch > 0:
+        d["channels"] = ch
+    return d
+
+
+def xmp_render_args() -> list[str]:
+    """The xmprender options a module is measured and rendered with: one
+    pass of its first sequence, cut at ``XMP_MAX_S`` with a ``XMP_FADE_MS``
+    fade, 44.1 kHz — the same for ``xmp_info`` and ``api.stream._render_xmp``,
+    so the measure is the render's length."""
+    return ["-l", "1", "-m", str(XMP_MAX_S), "-f", str(XMP_FADE_MS), "-r", "44100"]
+
+
+def prowizard_module(path: "Path | str") -> "tuple[str, bytes] | None":
+    """``(format name, ProTracker module)`` for a file one of
+    ``core.prowizard``'s packers made; None for any other file or one it
+    can't convert.  Reads the whole file (packed modules are small; one
+    above 4 MB is no packed module)."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(4 * 1024 * 1024 + 1)
+    except OSError:
+        return None
+    if len(raw) > 4 * 1024 * 1024:
+        return None
+    name = _prowizard.identify(raw)
+    if name is None:
+        return None
+    try:
+        return name, _prowizard.convert(raw)
+    except ValueError:
+        return None
+
+
+def _xmp_meta(path: Path, track_id: str, fmt: str, info: "dict[str, str]") -> dict:
+    name = Path(str(path).split("::")[-1]).stem
+    title = _decode_tracker_str((info.get("title") or "").encode("latin-1", "replace"))
+    if not any(c.isalnum() for c in title) or is_placeholder_title(title):
+        title = ""                      # (a title of dots or blanks is none)
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": fmt,
+        "title": title or name,
+        "duration": round(_info_seconds(info), 2),
+        "genre": ["Tracker", "Module"],
+    }
+    try:
+        ch = int(info.get("channels") or 0)
+    except ValueError:
+        ch = 0
+    if ch > 0:
+        d["channels"] = ch
+    return d
+
+
+def _extract_xmp(path: Path, track_id: str, info: "dict[str, str]") -> dict:
+    """Metadata of a module xmprender plays: its title and channel count as
+    libxmp reads them and the length of its render (``xmp_info``, read by
+    ``_extract`` before — the file name and 0, backfilled from a render,
+    inside an archive)."""
+    return _xmp_meta(path, track_id, XMP_EXT_NAMES.get(path.suffix.lower(), "Module"), info)
+
+
+def _extract_prowizard(path: Path, track_id: str, fmt: str, module: bytes) -> dict:
+    """Metadata of a packed module ``core.prowizard`` converts: the
+    ProTracker module's title, sample names, channel count (libxmp's, else
+    the module's mark: 8 for ``CD81``, 4) and the length xmprender plays it
+    for (``xmp_info`` of the converted module, in a temp file)."""
+    from soniqboom.core import render_tmp
+    info: dict = {}
+    binary = _find_atari_binary("xmprender_path", "xmprender")
+    if binary:
+        fd, tmp = tempfile.mkstemp(suffix=".mod", dir=render_tmp.tmp_dir())
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(module)
+            info = xmp_info(tmp, binary)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    d = _xmp_meta(path, track_id, fmt, info)
+    d.setdefault("channels", 8 if module[1080:1084] == b"CD81" else 4)
+    names = [n for n in (_decode_tracker_str(module[20 + i * 30:42 + i * 30]) for i in range(31))
+             if n and n.isprintable()]
+    if names:
+        d["instruments"] = names
+    title = _decode_tracker_str(module[:20])
+    if title and title.isprintable() and not is_placeholder_title(title):
+        d["title"] = title
+    return d
+
+
+def is_kefrens_module(head: bytes) -> bool:
+    """Does ``head`` start a Kefrens Sound Machine module ("M." then the
+    title, an "a" at 15 — the check libxmp's ProWizard loader starts with)?
+    Its ``.ksm`` is Ken Silverman's AdLib suffix too.  Pure."""
+    return head[:2] == b"M." and head[15:16] == b"a"
+
+
+def is_c64_sidplayer(raw: bytes) -> bool:
+    """Is ``raw`` (the whole file) a C64 Sidplayer song: a load address,
+    three voice lengths (little-endian) whose voices fit in the file, each
+    ending in the HLT command — the check libsidplayfp's MUS loader makes?
+    Pure."""
+    if len(raw) < 8:
+        return False
+    l1, l2, l3 = struct.unpack_from("<HHH", raw, 2)
+    if min(l1, l2, l3) < 2:
+        return False
+    v1, v2, v3 = 8 + l1, 8 + l1 + l2, 8 + l1 + l2 + l3
+    return (v3 <= len(raw) and raw[v1 - 2:v1] == _MUS_HLT and raw[v2 - 2:v2] == _MUS_HLT
+            and raw[v3 - 2:v3] == _MUS_HLT)
+
+
+def c64_sidplayer_credits(raw: bytes) -> "list[str]":
+    """The credit lines after a Sidplayer song's three voices (PETSCII text,
+    lines ended by 0x0D, the block by 0x00), as plain text; empty for none.
+    Pure."""
+    if not is_c64_sidplayer(raw):
+        return []
+    l1, l2, l3 = struct.unpack_from("<HHH", raw, 2)
+    block = raw[8 + l1 + l2 + l3:].split(b"\0", 1)[0][:2048]
+    lines = []
+    for chunk in block.split(b"\r"):
+        out = []
+        for b in chunk:
+            if 0x41 <= b <= 0x5A:
+                out.append(chr(b + 0x20))       # PETSCII unshifted letters: lower case
+            elif 0xC1 <= b <= 0xDA:
+                out.append(chr(b - 0x80))       # shifted letters: upper case
+            elif 0x20 <= b <= 0x3F:
+                out.append(chr(b))
+        text = " ".join("".join(out).split())
+        if text:
+            lines.append(text)
+    return lines[:8]
+
+
+def _extract_c64_sidplayer(path: Path, track_id: str, raw: bytes) -> dict:
+    """C64 Sidplayer song metadata: the file name as title (the song names
+    no title of its own), its credit lines as the comment, length 0 — the
+    song plays to its end, which only a render finds (its first play stores
+    it: ``api.stream._render_sidplayer``) — and two channels for a Stereo
+    Sidplayer song (a ``.str`` of the same name beside a local file; 1
+    otherwise — SID chips, as a SID tune's ``channels``)."""
+    name = Path(str(path).split("::")[-1]).stem
+    credits = c64_sidplayer_credits(raw)
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": C64_SIDPLAYER_FORMAT,
+        "title": name,
+        "duration": 0.0,
+        "genre": ["Chiptune", "C64"],
+    }
+    if credits:
+        d["comment"] = " / ".join(credits)
+    d["channels"] = 1               # (SID chips, as a SID tune's ``channels``)
+    if "::" not in str(path):
+        want = f"{path.stem}.str".lower()
+        with contextlib.suppress(OSError):
+            if any(e.name.lower() == want for e in os.scandir(path.parent)):
+                d["channels"] = 2
+    return d
+
+
+def _extract_iff_sample(path: Path, track_id: str) -> dict:
+    """An Amiga IFF sample (``FORM`` … ``8SVX`` / ``16SV``): its NAME / AUTH
+    / ANNO texts, rate (VHDR), channels (a CHAN chunk of 6: stereo) and
+    length (the BODY's samples — two per byte for a Fibonacci-delta packed
+    8SVX, after its two-byte header per channel)."""
+    raw = _read_head(path, 4 * 1024 * 1024)
+    if raw[:4] != b"FORM" or raw[8:12] not in (b"8SVX", b"16SV"):
+        raise ValueError(f"not an IFF 8SVX / 16SV sample: {path.name}")
+    kind = raw[8:12].decode()
+    rate, comp, channels, body = 0, 0, 1, None
+    texts: dict[str, str] = {}
+    pos = 12
+    while pos + 8 <= len(raw):
+        cid, size = raw[pos:pos + 4], struct.unpack(">I", raw[pos + 4:pos + 8])[0]
+        data = raw[pos + 8:pos + 8 + size]
+        if cid == b"VHDR" and len(data) >= 20:
+            rate, comp = struct.unpack(">H", data[12:14])[0], data[15]
+        elif cid == b"CHAN" and len(data) >= 4:
+            channels = 2 if struct.unpack(">I", data[:4])[0] == 6 else 1
+        elif cid in (b"NAME", b"AUTH", b"ANNO", b"(c) "):
+            texts[cid.decode()] = _decode_tracker_str(data, latin1_native=True)
+        elif cid == b"BODY":
+            body = size                          # (the real size, if the file is cut)
+            break
+        pos += 8 + size + (size & 1)
+    if not rate or body is None:
+        raise ValueError(f"an IFF {kind} sample without a VHDR or BODY: {path.name}")
+    width = 2 if kind == "16SV" else 1
+    if comp == 1 and kind == "8SVX":
+        frames = max(0, body // channels - 2) * 2
+    else:
+        frames = body // (width * channels)
+    # (a NAME is often the sample's file name: its ".iff" / ".8svx" is dropped)
+    name_text = re.sub(r"\.(iff|8svx|16sv|snd|smp)$", "", texts.get("NAME") or "", flags=re.I)
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": FORMAT_NAMES[path.suffix.lower()],
+        # (plain PCM is lossless; a Fibonacci-delta packed 8SVX is not)
+        "is_lossless": not (comp == 1 and kind == "8SVX"),
+        "bit_depth": 8 * width,
+        "title": name_text.strip() or Path(str(path).split("::")[-1]).stem,
+        "duration": round(frames / rate, 3),
+        "channels": channels,
+        "sample_rate": rate,
+        "genre": ["Sample"],
+    }
+    if texts.get("AUTH"):
+        d["artist"] = texts["AUTH"]
+    if texts.get("ANNO") or texts.get("(c) "):
+        d["comment"] = " / ".join(t for t in (texts.get("ANNO"), texts.get("(c) ")) if t)
+    return d
+
+
+def _extract_mpeg_local(path: Path, track_id: str) -> dict:
+    """MPEG audio layer 1 / 2 (``.mp1`` / ``.mp2`` / ``.m2a``): its ID3 tags
+    and stream (mutagen's MPEG reader), else ffprobe's length, rate and
+    channels for a stream mutagen finds no frame sync in; the format named
+    by the first frame's layer."""
+    from mutagen.mp3 import EasyMP3
+    from soniqboom.core.online_aminet import mpeg_audio_layer
+    layer = mpeg_audio_layer(path)
+    fmt = {1: "MP1", 2: "MP2", 3: "MP3"}.get(layer or 0, FORMAT_NAMES[path.suffix.lower()])
+    d = {"id": track_id, "path": str(path), "format": fmt,
+         "title": Path(str(path).split("::")[-1]).stem, "duration": 0.0}
+    audio = None
+    try:
+        audio = EasyMP3(path)
+    except Exception:                                   # noqa: BLE001
+        audio = None
+    if audio is not None and getattr(audio.info, "length", 0):
+        d.update({"duration": audio.info.length, "bitrate": getattr(audio.info, "bitrate", None),
+                  "channels": getattr(audio.info, "channels", None),
+                  "sample_rate": getattr(audio.info, "sample_rate", None)})
+        tags = audio.tags or {}
+        for key, field, sep in (("title", "title", TEXT_SEP), ("artist", "artist", NAME_SEP),
+                                ("album", "album", TEXT_SEP)):
+            v = join_values(tags.get(key), sep)
+            if v:
+                d[field] = v
+        d["year"] = _year((tags.get("date") or [None])[0])
+        return d
+    probe = _ffprobe_audio(path)
+    d.update(probe)
+    return d
+
+
+def _extract_wma(path: Path, track_id: str) -> dict:
+    """Windows Media Audio: its ASF tags and stream (mutagen), the format
+    named by the codec — "WMA Lossless", "WMA Pro", else "WMA"."""
+    from mutagen.asf import ASF
+    audio = ASF(path)
+    codec = f"{getattr(audio.info, 'codec_name', '')} {getattr(audio.info, 'codec_type', '')}"
+    fmt = ("WMA Lossless" if "lossless" in codec.lower()
+           else "WMA Pro" if "professional" in codec.lower() else "WMA")
+    tags = audio.tags or {}
+    by_lower = {str(k).lower(): k for k in (tags.keys() if hasattr(tags, "keys") else [])}
+
+    def tag(*keys: str) -> str:
+        for k in keys:
+            real = by_lower.get(k.lower(), k)            # (any case of the name)
+            vals = [str(v).strip() for v in tags.get(real) or [] if str(v).strip()]
+            if vals:
+                return vals[0]
+        return ""
+
+    trck = tag("WM/TrackNumber", "WM/Track")
+    disc = tag("WM/PartOfSet")
+    length = getattr(audio.info, "length", 0.0) or 0.0
+    bitrate = getattr(audio.info, "bitrate", None)
+    if fmt == "WMA Lossless" and length > 0:
+        # (the header states a nominal rate: a lossless file's real one)
+        try:
+            bitrate = int(path.stat().st_size * 8 / length)
+        except OSError:
+            pass
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": fmt,
+        "duration": length,
+        "bitrate": bitrate,
+        "channels": getattr(audio.info, "channels", None),
+        "sample_rate": getattr(audio.info, "sample_rate", None),
+        "title": tag("Title") or Path(str(path).split("::")[-1]).stem,
+        "artist": tag("Author", "WM/AlbumArtist"),
+        "album_artist": tag("WM/AlbumArtist"),
+        "album": tag("WM/AlbumTitle"),
+        "composer": tag("WM/Composer"),
+        "comment": tag("Description", "WM/Description"),
+        "label": tag("WM/Publisher"),
+        "isrc": tag("WM/ISRC"),
+        "genre": split_genres([tag("WM/Genre")] if tag("WM/Genre") else []),
+        "year": _year(tag("WM/Year") or None),
+        "track_number": _int(trck or None),
+        "total_tracks": _total(trck),
+        "disc_number": _int(disc or None),
+        "total_discs": _total(disc),
+    }
+    d.update(_replaygain_from_vorbis({k.lower(): [tag(k)] for k in (
+        "REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_ALBUM_GAIN",
+        "REPLAYGAIN_TRACK_PEAK", "REPLAYGAIN_ALBUM_PEAK") if tag(k)}))
+    try:
+        for pic in tags.get("WM/Picture") or []:
+            raw = bytes(pic.value)
+            # (WM/Picture: picture type, data length, MIME, description —
+            # UTF-16 strings ending in two NULs —, then the image)
+            if len(raw) < 6:
+                continue
+            pos = 5
+            mime_end = raw.find(b"\0\0", pos)
+            while mime_end != -1 and (mime_end - pos) % 2:
+                mime_end = raw.find(b"\0\0", mime_end + 1)
+            desc_end = raw.find(b"\0\0", mime_end + 2) if mime_end != -1 else -1
+            while desc_end != -1 and (desc_end - mime_end - 2) % 2:
+                desc_end = raw.find(b"\0\0", desc_end + 1)
+            if desc_end == -1:
+                continue
+            img = raw[desc_end + 2:]
+            if img[:3] == b"\xff\xd8\xff" or img[:4] == b"\x89PNG":
+                d["cover_art"] = _cover_b64(img, "image/png" if img[:4] == b"\x89PNG"
+                                            else "image/jpeg")
+                break
+    except Exception:                                   # noqa: BLE001
+        pass
+    return d
+
+
+def _ffprobe_audio(path: Path) -> dict:
+    """``duration`` / ``channels`` / ``sample_rate`` of the first audio
+    stream ffprobe reads in ``path``; empty when ffprobe isn't installed or
+    reads none."""
+    import shutil as _sh
+    probe = _sh.which("ffprobe")
+    if not probe:
+        return {}
+    try:
+        r = forksafe.run([probe, "-v", "error", "-select_streams", "a:0", "-show_entries",
+                          "stream=channels,sample_rate:format=duration", "-of", "json",
+                          str(path)], capture_output=True, timeout=20)
+        j = json.loads(r.stdout or b"{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    out: dict = {}
+    st = (j.get("streams") or [{}])[0]
+    try:
+        out["duration"] = float((j.get("format") or {}).get("duration") or 0)
+    except ValueError:
+        pass
+    if st.get("channels"):
+        out["channels"] = int(st["channels"])
+    if st.get("sample_rate"):
+        out["sample_rate"] = int(st["sample_rate"])
+    return out
+
+
 _SCENE_MD5_MAX = 8 * 1024 * 1024    # no bigger file is hashed for the scene joins
 # Set in scan worker processes (``scanner._worker_init``): tracker durations
 # come from libopenmpt in-process there — never in the server itself.
@@ -3126,7 +5279,9 @@ def _wants_scene_md5(ext: str, name: str, d: dict) -> bool:
         return "sid_md5" not in d
     if (ext in _TRACKER_EXTS or ext in _UADE_SUFFIX_EXTS
             or ext in _ATARI_EXTS or ext in _GME_EXTS
-            or ext in _ADLIB_EXTS or ext in _PSF_EXTS):
+            or ext in _ADLIB_EXTS or ext in _PSF_EXTS or ext in _ZXTUNE_EXTS
+            or ext in _MDX_EXTS or ext in _SUNVOX_EXTS or ext in _MGS_EXTS
+            or ext in (".ftm", ".sng", ".dmf", ".st")):
         return True
     return _uade.classify(name) is not None
 
@@ -3162,7 +5317,7 @@ def extract_lyrics(path: Path) -> str | None:
                     return text or None
             return None
         elif ext in (".ogg",):
-            audio = OggVorbis(path)
+            audio = OggOpus(path) if _ogg_is_opus(path) else OggVorbis(path)
             for key in ("lyrics", "unsyncedlyrics"):
                 vals = audio.get(key, [])
                 if vals:
@@ -3242,7 +5397,7 @@ def write_lyrics(path: Path, lyrics: str) -> bool:
             audio.save()
             return True
         if ext == ".ogg":
-            audio = OggVorbis(path)
+            audio = OggOpus(path) if _ogg_is_opus(path) else OggVorbis(path)
             audio["lyrics"] = text
             audio.save()
             return True
@@ -3265,12 +5420,39 @@ def _extract_adlib(path: Path, track_id: str) -> dict:
     rendered WAV carries the real length once the track is played.
     """
     ext = path.suffix.lower()
+    head = adlib_header(path) if "::" not in str(path) else {}
     return {
         "id": track_id, "path": str(path),
         "format": FORMAT_NAMES.get(ext, "AdLib"),
-        "title": path.stem, "artist": "", "album": "", "album_artist": "",
+        "title": head.get("title") or path.stem, "artist": head.get("author") or "",
+        "album": "", "album_artist": "",
         "duration": float(_ADLIB_DEFAULT_DURATION),
     }
+
+
+def adlib_header(path: Path) -> dict:
+    """``{"title", "author"}`` AdPlug reads in the AdLib tune ``path`` (the
+    "Title :" / "Author:" lines adplay prints — it reads them from the
+    formats that hold them: A2M, RAD, D00, …); empty without adplay or when it
+    names none.  adplay with its null output (no rendering — about 10 ms);
+    blocking."""
+    binary = _find_atari_binary("adplay_path", "adplay")
+    if not binary:
+        return {}
+    try:
+        r = forksafe.run([binary, "-O", "null", "-o", "-q", str(path)],
+                         capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: dict = {}
+    # (adplay prints them to stderr)
+    for line in ((r.stderr or b"") + b"\n" + (r.stdout or b"")).decode(
+            "latin-1", "replace").splitlines():
+        key, sep, val = line.partition(":")
+        key, val = key.strip().lower(), " ".join(val.split())
+        if sep and key in ("title", "author") and _game_name(val) and key not in out:
+            out[key] = val
+    return out
 
 
 def _extract_imf(path: Path, track_id: str) -> dict:
@@ -3382,22 +5564,132 @@ def _extract(
                 f"tune: {path.name}"
             )
 
-    # FamiTracker (NES) saves ``.ftm`` too: only a Face The Music module
-    # ("FTMN") saved with its samples (flag bit 0 at offset 13 — libopenmpt
-    # loads no other kind) is one SoniqBoom plays; anything else under that
-    # name is not indexed.
+    # ``.ftm`` is two formats, told apart by content: a FamiTracker module
+    # ("FamiTracker Module" — Furnace plays it) or a Face The Music module
+    # ("FTMN"), which plays only when saved with its samples (flag bit 0 at
+    # offset 13 — libopenmpt loads no other kind) and libopenmpt here reads
+    # the format (0.8 on); anything else under that name is not indexed —
+    # without such a libopenmpt, skipped like an unsupported suffix
+    # (``NotPlayableHere``).
+    _fami = False
     if ext == ".ftm":
         try:
             with open(path, "rb") as _fh:
-                _ftm_head = _fh.read(14)
+                _ftm_head = _fh.read(len(_FAMI_MAGIC))
         except OSError:
             _ftm_head = b""
-        if _ftm_head[:4] != b"FTMN":
-            raise ValueError(f"not a Face The Music module (FamiTracker's .ftm is "
-                             f"another format): {path.name}")
-        if len(_ftm_head) < 14 or not _ftm_head[13] & 1:
-            raise ValueError(f"a Face The Music module saved without its samples "
-                             f"(libopenmpt doesn't load one): {path.name}")
+        _fami = is_famitracker_module(_ftm_head)
+        if not _fami and ext not in OPENMPT_EXTRA_EXTS:
+            raise NotPlayableHere(f"not a FamiTracker module, and the libopenmpt here "
+                                  f"doesn't read Face The Music (0.8 does): {path.name}")
+        if not _fami:
+            if _ftm_head[:4] != b"FTMN":
+                raise ValueError(f"neither a FamiTracker nor a Face The Music module: "
+                                 f"{path.name}")
+            if len(_ftm_head) < 14 or not _ftm_head[13] & 1:
+                raise ValueError(f"a Face The Music module saved without its samples "
+                                 f"(libopenmpt doesn't load one): {path.name}")
+    # ``.sng``: a GoatTracker 2 song by its "GTS" header (gt2reloc), else
+    # uade's (Amiga ZoundMonitor / Richard Joseph) — where uade is installed.
+    _goat = False
+    if ext == ".sng":
+        try:
+            with open(path, "rb") as _fh:
+                _goat = is_goattracker_song(_fh.read(4))
+        except OSError:
+            _goat = False
+        if not _goat and ext not in _UADE_SUFFIX_EXTS and _uade.classify(path.name) is None:
+            raise NotPlayableHere(f"not a GoatTracker song (and no Amiga player here reads "
+                                  f".sng files): {path.name}")
+    elif path.name.lower().startswith("sng."):
+        # A GoatTracker song saved under an Amiga prefix name (``sng.NAME``)
+        # is no uade module (a ZoundMonitor / Richard Joseph name): say so
+        # rather than uade's "unknown module".
+        try:
+            with open(path, "rb") as _fh:
+                _gts_head = _fh.read(4)
+        except OSError:
+            _gts_head = b""
+        if is_goattracker_song(_gts_head):
+            raise ValueError(f"a GoatTracker song with an Amiga name — rename it "
+                             f"{path.name[4:]}.sng to play it: {path.name}")
+    # A SunVox project / an MGSDRV song is one by its header, else not indexed
+    # (before the permissive try below, which would list junk as a stub).
+    if ext in _SUNVOX_EXTS or ext in _MGS_EXTS:
+        try:
+            with open(path, "rb") as _fh:
+                _h4 = _fh.read(4)
+        except OSError:
+            _h4 = b""
+        if ext in _SUNVOX_EXTS and _h4 != b"SVOX":
+            raise ValueError(f"not a SunVox project: {path.name}")
+        if ext in _MGS_EXTS and _h4[:3] != b"MGS":
+            raise ValueError(f"not an MGSDRV song: {path.name}")
+    # Read by content, before the permissive try below (which would list a
+    # file under these names that isn't one as a stub) — a miss is skipped
+    # like a suffix the install doesn't play (``NotPlayableHere``):
+    #   * a module xmprender plays (libxmp loads it; inside an archive it
+    #     is measured at its render);
+    #   * a packed module ``core.prowizard`` converts;
+    #   * a libopenmpt format whose suffix another format shares
+    #     (``_OPENMPT_OPENS_ONLY``: libopenmpt must open the file).
+    # A C64 Sidplayer ``.mus`` (uade's UFO suffix too) and a Kefrens Sound
+    # Machine ``.ksm`` (Ken Silverman's AdLib suffix) are told by content.
+    _xmp_inf: "dict | None" = None
+    _pw: "tuple[str, bytes] | None" = None
+    # ``.dmf``: a DefleMask module by content (Furnace), else one of
+    # libopenmpt's (``_OPENMPT_OPENS_ONLY``) where it reads the suffix.
+    _defle = ext == ".dmf" and is_deflemask_module(_read_head(path, 4096))
+    if ext == ".dmf" and not _defle and ext not in OPENMPT_EXTRA_EXTS:
+        raise NotPlayableHere(f"not a DefleMask module, and the libopenmpt here doesn't "
+                              f"read X-Tracker modules: {path.name}")
+    if _defle:
+        pass                            # (Furnace plays it: ``_extract_deflemask``)
+    elif ext in _XMP_EXTS:
+        _xmp_inf = xmp_info(path) if "::" not in str(path) else {"seconds": "0"}
+        if not _xmp_inf:
+            raise NotPlayableHere(f"not a {XMP_EXT_NAMES[ext]} module xmprender (libxmp) "
+                                  f"plays here: {path.name}")
+    elif ext in PW_EXTS:
+        if not _find_atari_binary("xmprender_path", "xmprender"):
+            raise NotPlayableHere(f"a packed module xmprender plays (it isn't installed "
+                                  f"here): {path.name}")
+        _pw = prowizard_module(path)
+        if _pw is None:
+            raise NotPlayableHere(f"not a packed module this server converts: {path.name}")
+    elif ext in _OPENMPT_OPENS_ONLY and ext in OPENMPT_EXTRA_EXTS and not _openmpt_opens(path):
+        raise NotPlayableHere(f"not a {FORMAT_NAMES.get(ext, 'tracker')} module libopenmpt "
+                              f"reads: {path.name}")
+    if ext in _IFF_SAMPLE_EXTS:
+        _iff = _read_head(path, 12)
+        if _iff[:4] != b"FORM" or _iff[8:12] not in (b"8SVX", b"16SV"):
+            raise ValueError(f"not an IFF 8SVX / 16SV sample: {path.name}")
+    # ``.st``: a Sawteeth song by content; an Amiga module under a uade prefix
+    # name (``jam.title.st``) is probed with uade (``st`` is an owned suffix a
+    # verified Amiga module may override — ``uade_formats.
+    # _NAME_OVERRIDABLE_SUFFIXES``); anything else isn't listed.
+    _saw_inf: "dict | None" = None
+    if ext == ".st":
+        if is_sawteeth_song(_read_head(path, 4)):
+            _saw_inf = sawteeth_info(path) if "::" not in str(path) else {"seconds": "0"}
+            if not _saw_inf:
+                raise NotPlayableHere(f"a Sawteeth song sawteethrender doesn't play here "
+                                      f"(or isn't installed): {path.name}")
+        elif _uade.classify(path.name) is None:
+            raise NotPlayableHere(f"not a Sawteeth song (and no Amiga player here reads "
+                                  f".st files): {path.name}")
+    _c64mus_raw = None
+    if ext == ".mus":
+        _mus = _read_head(path, 64 * 1024 + 8)
+        if is_c64_sidplayer(_mus):
+            _c64mus_raw = _mus
+        elif ext not in _UADE_SUFFIX_EXTS:
+            raise NotPlayableHere(f"not a C64 Sidplayer song (and no Amiga player here reads "
+                                  f".mus files): {path.name}")
+    _kefrens = ext == ".ksm" and is_kefrens_module(_read_head(path, 16))
+    if _kefrens and not _uade.player_map():
+        raise NotPlayableHere(f"a Kefrens Sound Machine module (uade plays it; it isn't "
+                              f"installed here): {path.name}")
 
     # ── UADE candidates: authoritative content probe BEFORE the permissive
     # try below (mirrors the HUNK guard — the catch-all would otherwise index
@@ -3432,7 +5724,16 @@ def _extract(
             _owned_prefix = True
         else:
             _uade_cls = None
-    _is_uade = ext in _UADE_SUFFIX_EXTS or _uade_cls is not None
+    _is_uade = ext in _UADE_SUFFIX_EXTS or _uade_cls is not None or _kefrens
+    if (_goat or _fami or _defle or _c64mus_raw is not None or _xmp_inf is not None
+            or _pw is not None or _saw_inf is not None):
+        _is_uade = False                # (its own engine — never probed with uade)
+        _uade_cls = None
+    if _is_uade and _read_head(path, len(FRED_EDITOR_MAGIC)) == FRED_EDITOR_MAGIC:
+        # A song saved in the Fred Editor's own format (uade's Fred player
+        # plays the compiled replay modules only): no player here reads it.
+        raise NotPlayableHere(f"a song in the Fred Editor's own format (no player here "
+                              f"reads it): {path.name}")
     if ext in _SID_EXTS:
         # ``.sid`` is decided by content, whatever the name: a PSID/RSID header
         # is a C64 tune (no uade boot); anything else must pass uade's strict
@@ -3477,6 +5778,9 @@ def _extract(
                 f"not an Amiga module (text or empty content): {path.name}")
         _uade_probe = uade_get_info(path) if not (_texty or not _head) else {"_ok": False}
         if not _uade_probe.get("_ok") and _owned_prefix:
+            if ext == ".st":            # (no Sawteeth song either: not listed)
+                raise NotPlayableHere(f"neither a Sawteeth song nor an Amiga module uade "
+                                      f"plays: {path.name}")
             _uade_probe = None          # not Amiga after all: its own extension decides
         elif not _uade_probe.get("_ok"):
             # QA C1: remote loose modules are scanned from a LONE temp copy —
@@ -3529,7 +5833,21 @@ def _extract(
             _uade_probe = {"_ok": False}   # classify-only metadata below
 
     try:
-        if _uade_probe is not None:
+        if _goat:
+            d = _extract_goattracker(path, track_id)
+        elif _fami:
+            d = _extract_famitracker(path, track_id)
+        elif _defle:
+            d = _extract_deflemask(path, track_id)
+        elif _saw_inf is not None:
+            d = _extract_sawteeth(path, track_id, _saw_inf)
+        elif _pw is not None:
+            d = _extract_prowizard(path, track_id, *_pw)
+        elif _xmp_inf is not None:
+            d = _extract_xmp(path, track_id, _xmp_inf)
+        elif _c64mus_raw is not None:
+            d = _extract_c64_sidplayer(path, track_id, _c64mus_raw)
+        elif _uade_probe is not None:
             d = _extract_uade(path, track_id, _uade_probe)
         elif ext in _SID_EXTS:
             d = _extract_sid(path, track_id)
@@ -3545,6 +5863,14 @@ def _extract(
             d = _extract_gme(path, track_id)
         elif ext in _PSF_EXTS:
             d = _extract_psf(path, track_id)
+        elif ext in _ZXTUNE_EXTS:
+            d = _extract_zxtune(path, track_id)
+        elif ext in _MDX_EXTS:
+            d = _extract_mdx(path, track_id)
+        elif ext in _SUNVOX_EXTS:
+            d = _extract_sunvox(path, track_id)
+        elif ext in _MGS_EXTS:
+            d = _extract_mgs(path, track_id)
         elif ext in _DSD_EXTS:
             # ``.dsf`` collision: Sony DSD Stream File ('DSD ') vs Sega
             # Dreamcast Sound Format ('PSF' + version 0x12) share the
@@ -3572,14 +5898,33 @@ def _extract(
             d = _mp3(path, track_id)
         elif ext == ".flac":
             d = _flac(path, track_id)
+        elif ext == ".aac" and _read_head(path, 8)[4:8] != b"ftyp":
+            d = _adts(path, track_id)                  # (raw ADTS, not an MP4)
         elif ext in (".m4a", ".aac", ".mp4"):
             d = _mp4(path, track_id)
-        elif ext == ".ogg":
-            d = _vorbis(path, track_id, OggVorbis(path), "Ogg Vorbis")
+        elif ext in _SURROUND_STREAM_EXTS:
+            d = _extract_surround_stream(path, track_id)
+        elif ext in _IFF_SAMPLE_EXTS:
+            d = _extract_iff_sample(path, track_id)
+        elif ext in _MPEG_LOCAL_EXTS:
+            d = _extract_mpeg_local(path, track_id)
+        elif ext == ".wma":
+            d = _extract_wma(path, track_id)
+        elif ext in (".ogg", ".oga"):
+            # An Ogg file holds Vorbis or Opus: read it as the one it is.
+            if _ogg_is_opus(path):
+                d = _vorbis(path, track_id, OggOpus(path), "Opus")
+            else:
+                d = _vorbis(path, track_id, OggVorbis(path), "Ogg Vorbis")
         elif ext == ".opus":
             d = _vorbis(path, track_id, OggOpus(path), "Opus")
         elif ext in (".aiff", ".aif"):
             d = _aiff(path, track_id)
+        elif (ext == ".wav" and _read_head(path, 4) in (b"RIFF", b"RF64", b"BW64")
+              and (d := _wav_or_none(path, track_id))):
+            pass
+        elif ext in (".wv", ".mpc", ".ape", ".tta") and (d := _apev2_audio(path, track_id, ext)):
+            pass
         else:
             # Generic fallback via mutagen auto-detect (easy=True gives Vorbis-like keys)
             audio = MutagenFile(path, easy=True)
@@ -3605,7 +5950,7 @@ def _extract(
                 "total_tracks": _total(trck),
             }
     except Exception as exc:
-        if strict_io and _is_io_error(exc):
+        if isinstance(exc, NotPlayableHere) or (strict_io and _is_io_error(exc)):
             raise
         d = {"id": track_id, "path": str(path), "title": title_from_filename(path.name),
              "format": FORMAT_NAMES.get(ext, ""), "duration": 0.0}

@@ -71,6 +71,13 @@ def _ext_for(track_path: str, track=None) -> str:
     ext = Path(track_path.split("::")[-1] if "::" in track_path else track_path).suffix.lower()
     if ext == ".mpg" and track is not None and getattr(track, "format", None) == "MP3":
         return ".mp3"                    # Aminet MPEG audio read as MP3 (stream._render_ident)
+    if ext in (".sng", ".ftm", ".dmf", ".mus", ".st") and track is not None:
+        # a GoatTracker song / FamiTracker or DefleMask module / C64 Sidplayer
+        # or Sawteeth song: its routing name (".goattracker" / ".famitracker" /
+        # ".deflemask" / ".sidplayer" / ".sawteeth" —
+        # cast_render.one_tune_route)
+        from soniqboom.core.cast_render import one_tune_route
+        return one_tune_route(getattr(track, "id", "") or "", track_path, track) or ext
     return ext
 
 

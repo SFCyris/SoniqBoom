@@ -283,6 +283,26 @@ export const TRACKER_FORMAT_NAMES = new Set([
   'AHX', 'HivelyTracker', 'UltraTracker', 'ScreamTracker 2',
   'Farandole', 'ASYLUM/DMP', 'General DigiMusic', 'Imago Orpheus',
   'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK', 'Face The Music',
+  // (libopenmpt, also under other names)
+  'Astroidea XMF', 'Digital Symphony', 'Digital Tracker', 'X-Tracker', 'DSMI Compact', 'Software Visions',
+  'Digitrakker', 'Unreal Music', 'Epic MegaGames MASI', 'Galaxy Music System', 'MO3', 'OggMod',
+  'OpenMPT MPTM', 'Real Tracker', 'STMIK', 'Poly Tracker', 'ProTracker IFF', 'ChipTracker',
+]);
+
+/**
+ * The modules xmprender (libxmp) plays — the formats only libxmp reads and
+ * the packed Amiga modules the server converts to ProTracker for it.  They
+ * render on the one-tune route (PSF_FORMAT_NAMES); the packed modules have
+ * per-channel VU data (the converted module's, libopenmpt), the others none.
+ * Names mirror metadata.py XMP_EXT_NAMES / PW_EXT_NAMES.
+ */
+export const XMP_FORMAT_NAMES = new Set([
+  'Archimedes Tracker', 'Coconizer', 'FlexTrax', 'Funktracker', 'Liquid Tracker',
+  'Megatracker', 'Titanics Player', 'STIM', 'The Dark Demon', 'Eureka Packer',
+  'Ben Replay', 'Binary Packer', 'Devils Replay', 'GnoiPacker', 'Gnu Protected Module',
+  'GnuPlayer', 'HCD Protector', 'Newtron Packer 1.0', 'Newtron Packer 2.0',
+  'Perfect Song 1', 'Perfect Song 2', 'Module-Patterncompressor', 'NoiseTracker Compressed',
+  'The Player 2.2A', 'The Player 3.0A',
 ]);
 
 /**
@@ -325,10 +345,20 @@ export const UADE_FORMAT_NAMES = new Set(['AHX', 'HivelyTracker']);
  * Atari ST + PSF console-rip families (server-rendered; scan stores 0 for
  * SC68 and for untagged PSF rips, so they join the duration probe).  YM and
  * tagged PSF carry REAL scan durations; SNDH defaults to the server cap.
+ * The PSF set also holds the other one-tune files the same route renders —
+ * S98 register dumps and Farbrausch V2 songs (zxtune123), X68000 MDX songs
+ * (mdxrender), SunVox projects (sunvoxrender), MSX MGSDRV songs (kssrender),
+ * GoatTracker 2 songs (gt2reloc + sidplayfp), FamiTracker and DefleMask
+ * modules (Furnace), C64 Sidplayer songs (sidplayfp), Sawteeth songs
+ * (sawteethrender) and the modules xmprender plays
+ * (XMP_FORMAT_NAMES); their scan reads the length (a FamiTracker / DefleMask module's is
+ * learned from its first render; a Sidplayer song plays for the SID length).
  */
 export const ATARI_FORMAT_NAMES = new Set(['SNDH', 'YM', 'SC68']);
 export const PSF_FORMAT_NAMES = new Set([
-  'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (Dreamcast)', 'NCSF',
+  'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (Dreamcast)', 'NCSF', 'S98', 'V2M', 'MDX',
+  'SunVox', 'MGSDRV', 'GoatTracker', 'FamiTracker', 'DefleMask', 'C64 Sidplayer', 'Sawteeth',
+  ...XMP_FORMAT_NAMES,
 ]);
 
 /**
@@ -409,6 +439,10 @@ export const MODULE_FORMAT_NAMES = new Set([
   'DigiBooster Pro', 'AHX', 'HivelyTracker', 'UltraTracker',
   'ScreamTracker 2', 'Farandole', 'ASYLUM/DMP', 'General DigiMusic',
   'Imago Orpheus', 'Oktalyzer', 'SoundFX', 'Grave Composer', 'DSIK', 'Face The Music',
+  'Astroidea XMF', 'Digital Symphony', 'Digital Tracker', 'X-Tracker', 'DSMI Compact', 'Software Visions',
+  'Digitrakker', 'Unreal Music', 'Epic MegaGames MASI', 'Galaxy Music System', 'MO3', 'OggMod',
+  'OpenMPT MPTM', 'Real Tracker', 'STMIK', 'Poly Tracker', 'ProTracker IFF', 'ChipTracker',
+  'C64 Sidplayer', ...XMP_FORMAT_NAMES,
 ]);
 
 /** Module-family test: static tracker/SID/MIDI names plus the dynamic-name
@@ -606,6 +640,8 @@ function _computeArtPlaceholderEmoji(track) {
 
   // Atari ST + PSF console rips
   if (ATARI_FORMAT_NAMES.has(fmt)) return '\u{1F579}\uFE0F';          // 🕹️
+  if (fmt === 'V2M') return '\u{1F3B9}';                              // 🎹 (a software synth)
+  if (fmt === 'SunVox') return '\u{1F39B}\uFE0F';                    // 🎛️ (a modular synth)
   if (PSF_FORMAT_NAMES.has(fmt)) return '\u{1F3AE}';                  // 🎮
 
   // Tracker — fallback: check file extension

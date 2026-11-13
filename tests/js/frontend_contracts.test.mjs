@@ -112,7 +112,7 @@ test('the spectrum label says why no per-voice meters come, in the server\'s wor
   assert.match(app, /function _vuFallbackText\(format, reason\) \{\n  return vuFallbackText\(format, reason, Auth\.isAdmin\);\n\}/);
   const make = (isAdmin) => (f, r) => vuFallbackText(f, r, isAdmin);
   const admin = make(true), user = make(false);
-  assert.equal(admin('TFMX Pro', 'off'), 'Spectrum — per-voice meters are turned off (Settings → Renderers)');
+  assert.equal(admin('TFMX Pro', 'off'), 'Spectrum — per-voice meters are turned off (gear → Renderers → Playback preparation)');
   assert.equal(user('TFMX Pro', 'off'), 'Spectrum — per-voice meters are turned off on this server',
     'only an admin can reach Settings → Renderers');
   assert.equal(user('TFMX Pro', 'skipped'), 'Spectrum — per-voice meters not available for this tune');
@@ -405,4 +405,23 @@ test('the phone\'s keys, rows and switches are finger-sized (≥ 44 px)', () => 
   assert.ok(px('.m-radio-fav', 'height') >= 44 && px('.m-radio-fav', 'width') >= 44, 'the station star is under 44 px');
   assert.ok(px('.m-settings-select', 'min-height') >= 44, 'the selector is under 44 px');
   assert.ok(px('.m-search-input, .m-radio-search input', 'height') >= 44, 'the search field is under 44 px');
+});
+
+test('every scripted change of the search text tells its listeners (Save search)', () => {
+  // A scripted ``input.value = …`` fires no 'input' event: app.js shows and
+  // hides Save search on 'input' and on 'sb:search-set' only.
+  const src = read('soniqboom/frontend/js/search.js');
+  const lines = src.split('\n');
+  const writes = lines.map((l, i) => (/^\s*input\.value\s*=[^=]/.test(l) ? i : -1)).filter((i) => i >= 0);
+  assert.ok(writes.length >= 3, 'the search box writers were not found');
+  for (const i of writes) {
+    // (the announcement is in the same function: before its closing brace)
+    const end = lines.findIndex((l, j) => j > i && /^\}\)?;?\s*$/.test(l));
+    const body = lines.slice(i, end).join('\n');
+    assert.match(body, /input\.dispatchEvent\(new Event\('sb:search-set'\)\)/,
+      `search.js:${i + 1} sets the search text without 'sb:search-set'`);
+  }
+  const app = read('soniqboom/frontend/js/app.js');
+  assert.match(app, /_searchInputEl\.addEventListener\('input', _syncSaveSmart\);/);
+  assert.match(app, /_searchInputEl\.addEventListener\('sb:search-set', _syncSaveSmart\);/);
 });

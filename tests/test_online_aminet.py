@@ -29,7 +29,9 @@ from soniqboom.core.store import TrackStore
 
 
 def _mod(title: bytes) -> bytes:
-    return title.ljust(20, b"\0") + b"\0" * 1064 + b"M.K." + b"\0" * 1024
+    # (one order: libopenmpt refuses a song length of 0)
+    return (title.ljust(20, b"\0") + b"\0" * 930 + bytes([1, 127]) + b"\0" * 128 + b"M.K."
+            + b"\0" * 1024)
 
 
 def _zip(members: dict) -> bytes:

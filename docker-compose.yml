@@ -3,7 +3,7 @@
 #   1. Put (or symlink) your music under ./music — or edit the bind below.
 #   2. docker compose up -d
 #   3. Open http://<host>:8080, create the first admin (see DEPLOY.md),
-#      then in Settings → Music Folders add  /music  as a library folder.
+#      then under gear → Library → Music Folders add  /music  as a library folder.
 #
 # For automatic HTTPS over the internet, see deploy/docker-compose.https.yml.
 

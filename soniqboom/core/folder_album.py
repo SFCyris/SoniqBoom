@@ -585,7 +585,7 @@ def _generic(clean: str) -> bool:
         return True                                     # "A-F", "0-9", "#"
     if not any(c.isalpha() for c in clean):
         return True                                     # "00", "1991", "01-50"
-    if low.startswith(("coop-", "coop ", "not by ", "- unknown")):
+    if low.startswith(("coop-", "coop ", "not by ", "- unknown", "_unknown")):
         return True
     words = _WORD_RE.findall(low)
     last = len(words)
@@ -841,9 +841,16 @@ def _format_keys_static() -> frozenset[str]:
     uade labels) — the stoplist core that works without a Modland index."""
     names: set[str] = set()
     try:
-        from soniqboom.core.metadata import FORMAT_NAMES
+        from soniqboom.core.metadata import (FORMAT_NAMES, PW_EXT_NAMES, XMP_EXT_NAMES,
+                                             _TRACKER_ALT_EXTS)
+        from soniqboom.core.uade_formats import _SUFFIX_ALIASES
+        # (not the suffixes of the formats known only by other names, the
+        # packers and libxmp's modules — "chip", "dev", "ben", "coco", "tip",
+        # "mp" are folder names as often; their format names stand)
+        not_words = ({*PW_EXT_NAMES, *XMP_EXT_NAMES, *_TRACKER_ALT_EXTS}
+                     | {f".{a}" for a in _SUFFIX_ALIASES})
         names |= set(FORMAT_NAMES.values())
-        names |= {k.lstrip(".") for k in FORMAT_NAMES}
+        names |= {k.lstrip(".") for k in FORMAT_NAMES if k not in not_words}
     except Exception:                                   # noqa: BLE001
         pass
     try:
