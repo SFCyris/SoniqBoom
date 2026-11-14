@@ -118,21 +118,27 @@ def _write_cache(name: str, rec: dict) -> None:
         log.debug("artistinfo cache write failed for %s: %s", name, exc)
 
 
+async def mb_pace() -> None:
+    """Wait for this process's next MusicBrainz slot (one request per 1.1 s,
+    shared by every module that asks MusicBrainz)."""
+    global _mb_last
+    async with _mb_gate:
+        wait = 1.1 - (time.monotonic() - _mb_last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _mb_last = time.monotonic()
+
+
 async def _get_json(url: str, *, mb: bool = False) -> dict | None:
     """GET → JSON. ``mb=True`` routes through the MusicBrainz rate gate.
     Returns None on HTTP error status; raises _Unreachable on network failure."""
     import httpx
-    global _mb_last
     from soniqboom.core import netpolicy
     if netpolicy.blocked(url):
         raise _Unreachable(f"offline mode: not contacting {url}")
     try:
         if mb:
-            async with _mb_gate:
-                wait = 1.1 - (time.monotonic() - _mb_last)
-                if wait > 0:
-                    await asyncio.sleep(wait)
-                _mb_last = time.monotonic()
+            await mb_pace()
         async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": _UA}) as cx:
             r = await cx.get(url, follow_redirects=True)
         if r.status_code != 200:

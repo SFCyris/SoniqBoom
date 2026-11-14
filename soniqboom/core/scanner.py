@@ -5310,6 +5310,9 @@ _BACKFILL_WAIT_S = 10.0
 # ``scan_root_hash`` of the remote roots whose one-time header-game backfill
 # (``repair.run_remote_album_backfill``) waits for the runner.
 _remote_backfill_pending: set[str] = set()
+# Catalogue roots whose open pages re-read once the runner's applies have
+# taken their rows in (``announce_after_enrichment``).
+_enrichment_announce: set[str] = set()
 
 
 def _scene_enrichment_wanted() -> bool:
@@ -5583,6 +5586,7 @@ async def stop_background_writers(extra=(), timeout: float = 3.0) -> int:
     global _scene_autoapply_pending
     _scan_queue.clear()
     _scene_autoapply_pending = False
+    _enrichment_announce.clear()
     tasks: set = set(extra)
     tasks.add(_scan_task)
     tasks.add(_dup_runner_task)
@@ -5779,6 +5783,43 @@ def schedule_startup_enrichment() -> None:
         _ensure_scene_autoapply_runner()
 
 
+def announce_after_enrichment(root: str) -> None:
+    """Rows of the catalogue root ``root`` were written outside a scan (the
+    unplayed tunes' index fill, ``modland_catalog.refill_unplayed``): tell
+    every open page (``catalogue_changed`` — its open view, the folder tree
+    and the counts re-read in place) once the enrichment runner has taken
+    them in, so a page re-reads one time and shows the joined fields too.
+    With a runner going or due (call this after ``_spawn_scene_autoapply``)
+    the event follows its applies; without one it is sent now."""
+    if not root:
+        return
+    _enrichment_announce.add(root)
+    if _scene_autoapply_running:
+        return                                  # the runner sends it (``_announce_enriched``)
+    try:
+        t = asyncio.get_running_loop().create_task(_announce_enriched(),
+                                                   name="enrichment-announce")
+        _scene_autoapply_tasks.add(t)
+        t.add_done_callback(_scene_autoapply_tasks.discard)
+    except RuntimeError:
+        _enrichment_announce.discard(root)      # not on the loop: no page to tell
+
+
+async def _announce_enriched() -> None:
+    """Send the ``catalogue_changed`` events ``announce_after_enrichment``
+    collected — one per root, however many fills asked."""
+    roots = sorted(_enrichment_announce)
+    _enrichment_announce.clear()
+    if not roots:
+        return
+    try:
+        from soniqboom.api import library
+        for root in roots:
+            await library.broadcast_catalogue_changed(root)
+    except Exception:                                   # noqa: BLE001
+        log.debug("catalogue-changed broadcast after enrichment failed", exc_info=True)
+
+
 def _ensure_scene_autoapply_runner() -> None:
     global _scene_autoapply_running
     if _scene_autoapply_running:
@@ -5790,76 +5831,87 @@ def _ensure_scene_autoapply_runner() -> None:
         global _scene_autoapply_pending, _scene_autoapply_running
         lock_retries = 0
         try:
-            while _scene_autoapply_pending:
-                _scene_autoapply_pending = False
-                # Never join a half-written library: wait out a running scan
-                # (its own drain re-triggers this runner anyway).
-                while is_scanning():
-                    await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S or 0.05)
-                retry = False
-                if scene_metadata.has_index():
+            while True:
+                while _scene_autoapply_pending:
+                    _scene_autoapply_pending = False
+                    # Never join a half-written library: wait out a running scan
+                    # (its own drain re-triggers this runner anyway).
+                    while is_scanning():
+                        await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S or 0.05)
+                    retry = False
+                    if scene_metadata.has_index():
+                        try:
+                            res = await scene_metadata.apply_to_library(auto=True)
+                            if res.get("error") == "apply already running":
+                                retry = True
+                            elif not res.get("skipped"):
+                                la = res.get("last_apply") or {}
+                                if la.get("updated"):
+                                    log.info("Post-scan Modland apply: %d track(s) "
+                                             "updated (%d album changes)",
+                                             la["updated"], la.get("albums", 0))
+                        except Exception:           # noqa: BLE001 — best-effort
+                            log.debug("Post-scan Modland apply failed", exc_info=True)
+                    if songdb.has_index() and songdb.auto_apply_enabled():
+                        try:
+                            res = await songdb.apply_to_library()
+                            if res.get("error") == "apply already running":
+                                retry = True
+                            elif not res.get("skipped"):
+                                la = res.get("last_apply") or {}
+                                if la.get("updated"):
+                                    log.info("Post-scan song-database apply: %d track(s) "
+                                             "updated", la["updated"])
+                        except Exception:           # noqa: BLE001 — best-effort
+                            log.debug("Post-scan song-database apply failed", exc_info=True)
+                    # Toggled OFF (e.g. a Reset) — must NOT re-enrich a just-reset
+                    # library, not even mid-coalesce.
+                    if demozoo.has_index() and demozoo.auto_apply_enabled():
+                        try:
+                            res = await demozoo.apply_to_library()
+                            if res.get("error") == "apply already running":
+                                retry = True
+                            else:
+                                updated = res.get("updated") or 0
+                                if updated:
+                                    log.info("Post-scan Demozoo auto-apply: %d track(s) "
+                                             "enriched", updated)
+                        except Exception:           # noqa: BLE001 — best-effort
+                            log.debug("Post-scan Demozoo auto-apply failed", exc_info=True)
+                    if retry:
+                        # A manual Admin apply holds the lock — retry our delta
+                        # once it clears (bounded, so a WEDGED manual apply can't
+                        # spin this forever; a later scan re-triggers regardless).
+                        lock_retries += 1
+                        if lock_retries <= 5:
+                            _scene_autoapply_pending = True
+                    else:
+                        lock_retries = 0
+                    if _enrichment_announce and not _scene_autoapply_pending:
+                        # (with another pass due — a fill that asked while this
+                        # one ran, a busy apply lock — the event follows that one)
+                        await _announce_enriched()
                     try:
-                        res = await scene_metadata.apply_to_library(auto=True)
-                        if res.get("error") == "apply already running":
-                            retry = True
-                        elif not res.get("skipped"):
-                            la = res.get("last_apply") or {}
-                            if la.get("updated"):
-                                log.info("Post-scan Modland apply: %d track(s) "
-                                         "updated (%d album changes)",
-                                         la["updated"], la.get("albums", 0))
-                    except Exception:           # noqa: BLE001 — best-effort
-                        log.debug("Post-scan Modland apply failed", exc_info=True)
-                if songdb.has_index() and songdb.auto_apply_enabled():
-                    try:
-                        res = await songdb.apply_to_library()
-                        if res.get("error") == "apply already running":
-                            retry = True
-                        elif not res.get("skipped"):
-                            la = res.get("last_apply") or {}
-                            if la.get("updated"):
-                                log.info("Post-scan song-database apply: %d track(s) "
-                                         "updated", la["updated"])
-                    except Exception:           # noqa: BLE001 — best-effort
-                        log.debug("Post-scan song-database apply failed", exc_info=True)
-                # Toggled OFF (e.g. a Reset) — must NOT re-enrich a just-reset
-                # library, not even mid-coalesce.
-                if demozoo.has_index() and demozoo.auto_apply_enabled():
-                    try:
-                        res = await demozoo.apply_to_library()
-                        if res.get("error") == "apply already running":
-                            retry = True
-                        else:
-                            updated = res.get("updated") or 0
-                            if updated:
-                                log.info("Post-scan Demozoo auto-apply: %d track(s) "
-                                         "enriched", updated)
-                    except Exception:           # noqa: BLE001 — best-effort
-                        log.debug("Post-scan Demozoo auto-apply failed", exc_info=True)
-                if retry:
-                    # A manual Admin apply holds the lock — retry our delta
-                    # once it clears (bounded, so a WEDGED manual apply can't
-                    # spin this forever; a later scan re-triggers regardless).
-                    lock_retries += 1
-                    if lock_retries <= 5:
-                        _scene_autoapply_pending = True
-                else:
-                    lock_retries = 0
-                try:
-                    if await repair.run_album_backfill_once():
-                        # Let it finish (and settle) first, briefly: the
-                        # shares' own backfills below would find the task busy
-                        # and wait for their next scan.  Bounded — a read
-                        # stuck on a hung mount must not hold every later
-                        # pass (enrichment, folder pass, the shares).
-                        await repair.wait_idle(_BACKFILL_WAIT_S)
-                except Exception:               # noqa: BLE001 — best-effort
-                    log.debug("Header-game album backfill failed to start", exc_info=True)
-                await _run_remote_album_backfills()
-                _schedule_folder_album_pass()
-                if _scene_autoapply_pending:
-                    # Coalesce a burst of drains (folder-watch) into fewer applies.
-                    await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S)
+                        if await repair.run_album_backfill_once():
+                            # Let it finish (and settle) first, briefly: the
+                            # shares' own backfills below would find the task busy
+                            # and wait for their next scan.  Bounded — a read
+                            # stuck on a hung mount must not hold every later
+                            # pass (enrichment, folder pass, the shares).
+                            await repair.wait_idle(_BACKFILL_WAIT_S)
+                    except Exception:               # noqa: BLE001 — best-effort
+                        log.debug("Header-game album backfill failed to start", exc_info=True)
+                    await _run_remote_album_backfills()
+                    _schedule_folder_album_pass()
+                    if _scene_autoapply_pending:
+                        # Coalesce a burst of drains (folder-watch) into fewer applies.
+                        await asyncio.sleep(_SCENE_AUTOAPPLY_SETTLE_S)
+                if not _enrichment_announce:
+                    break
+                # (asked for during the last pass's tail, after its applies;
+                # a pass requested while the event goes out runs next —
+                # nothing awaits between the last check and the flag below)
+                await _announce_enriched()
         finally:
             _scene_autoapply_running = False
 

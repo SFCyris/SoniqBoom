@@ -4112,6 +4112,8 @@ async function loadSettings() {
     }
     const folderArtEl = document.getElementById('setting-use-folder-art');
     if (folderArtEl) folderArtEl.checked = s.use_folder_art !== false;
+    const onlineCoverEl = document.getElementById('setting-online-cover-lookup');
+    if (onlineCoverEl) onlineCoverEl.checked = s.online_cover_lookup !== false;
     const lyricsWbEl = document.getElementById('setting-lyrics-writeback');
     if (lyricsWbEl) lyricsWbEl.checked = !!s.lyrics_writeback;
     const lyricsCountEl = document.getElementById('lyrics-cache-count');
@@ -4225,6 +4227,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     const unplayableTracks = document.getElementById('setting-unplayable-tracks')?.value || 'mark';
     const skipShort = Number(document.getElementById('setting-skip-short-tunes')?.value || 0);
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
+    const onlineCovers = document.getElementById('setting-online-cover-lookup')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
     // dedupes server-side (api/art.py:_parse_folder_art_names).  We send
     // the raw textbox value so the user's capitalisation round-trips for
@@ -4247,6 +4250,7 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         unplayable_tracks: unplayableTracks,
         skip_short_tunes: skipShort,
         use_folder_art: useFolderArt,
+        online_cover_lookup: onlineCovers,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,
         log_level: logLevel,

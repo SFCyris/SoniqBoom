@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -121,22 +122,74 @@ def status() -> dict:
     return out
 
 
-def refresh_index() -> dict:
-    """Download the nightly index and (re)build the sqlite DB.  Blocking —
-    callers run it in an executor.  Returns the updated status dict."""
+_refresh_guard = threading.Lock()
+
+
+def index_validator() -> str:
+    """What Modland's server said of the list the installed index was built
+    from (its ``ETag``, else its ``Last-Modified``); "" when unknown (no
+    index, one built before this was recorded)."""
+    if not has_index():
+        return ""
+    try:
+        con = _connect_ro(_db_path())
+        try:
+            row = con.execute("SELECT v FROM meta WHERE k = 'validator'").fetchone()
+        finally:
+            con.close()
+        return str(row[0] or "") if row else ""
+    except sqlite3.Error:
+        return ""
+
+
+def _validator_of(headers) -> str:
+    return str(headers.get("etag") or headers.get("last-modified") or "").strip()
+
+
+def _upstream_validator() -> str:
+    """The validator of the list on Modland's server now (a HEAD request);
+    "" when the server names none."""
     import httpx
-    if _status["refreshing"]:
-        # Re-entrancy guard (QA): two concurrent refreshes clobber the same
-        # .building/.zip/sqlite paths — reject the second.
-        return {**status(), "error": "refresh already running"}
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        resp = client.head(MODLAND_MD5_URL)
+        resp.raise_for_status()
+        return _validator_of(resp.headers)
+
+
+def refresh_index(*, if_changed: bool = False) -> dict:
+    """Download the nightly index and (re)build the sqlite DB.  Blocking —
+    callers run it in an executor.  Returns the updated status dict.
+
+    ``if_changed``: nothing is downloaded when the list on the server is the
+    one the installed index was built from (``index_validator``) — the
+    returned status then has ``"unchanged": True``.  A server that can't be
+    asked, or names no validator, is downloaded from."""
+    import httpx
     from soniqboom.core import netpolicy
-    if netpolicy.blocked(MODLAND_MD5_URL):
-        return {**status(), "error": "Offline mode is on — the Modland index can't be downloaded"}
-    _status.update(refreshing=True, error=None)
+    with _refresh_guard:
+        if _status["refreshing"]:
+            # Re-entrancy guard (QA): two concurrent refreshes clobber the same
+            # .building/.zip/sqlite paths — reject the second.
+            return {**status(), "error": "refresh already running"}
+        if netpolicy.blocked(MODLAND_MD5_URL):
+            return {**status(),
+                    "error": "Offline mode is on — the Modland index can't be downloaded"}
+        _status.update(refreshing=True, error=None)
+    if if_changed:
+        try:
+            have = index_validator()
+            same = bool(have) and have == _upstream_validator()
+        except Exception as exc:                        # noqa: BLE001
+            log.debug("Modland index: the server's list could not be compared (%s)", exc)
+            same = False
+        if same:
+            _status["refreshing"] = False
+            return {**status(), "unchanged": True}
     tmp = _db_path().with_suffix(".building")
     try:
         log.info("Modland index: downloading %s", MODLAND_MD5_URL)
         blob = None
+        validator = ""
         last_exc: Exception | None = None
         for _attempt in range(3):          # ftp.modland.com can be flaky
             try:
@@ -145,6 +198,7 @@ def refresh_index() -> dict:
                     resp = client.get(MODLAND_MD5_URL)
                     resp.raise_for_status()
                     blob = resp.content
+                    validator = _validator_of(resp.headers)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -175,6 +229,9 @@ def refresh_index() -> dict:
                 if batch:
                     con.executemany(
                         "INSERT OR REPLACE INTO mods VALUES (?,?)", batch)
+        # (What the server said of this list: ``index_validator``.)
+        con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+        con.execute("INSERT INTO meta VALUES ('validator', ?)", (validator,))
         con.commit()
         con.close()
         zpath.unlink(missing_ok=True)
@@ -773,8 +830,14 @@ def collect_updates(*, use_filename: bool | None = None,
         tracks = get_store().all_tracks()      # list[dict] (shallow refs)
     # The file-name gate's sibling evidence (cached per index file).
     siblings = modland_filename_siblings() if use_filename else None
-    wanted = list({m.lower() for m in (t.get("file_md5") for t in tracks)
-                   if isinstance(m, str) and m})
+    from soniqboom.core.catalogue import is_catalogue_path
+
+    def _own_path(t: dict) -> bool:
+        # A Modland CATALOGUE track carries its Modland data from its own
+        # path (core/modland_catalog.py) — never joined, never withdrawn.
+        return is_catalogue_path(t.get("path")) and _is_modland_catalogue(t.get("path"))
+    wanted = list({m.lower() for m, t in ((t.get("file_md5"), t) for t in tracks)
+                   if isinstance(m, str) and m and not _own_path(t)})
     rows: dict[str, str] = {}
     con = _connect_ro(db)
     try:
@@ -790,14 +853,11 @@ def collect_updates(*, use_filename: bool | None = None,
     matched = 0
     batch: list[tuple[str, dict]] = []
     expect: dict[str, dict] = {}
-    from soniqboom.core.catalogue import is_catalogue_path
     for t in tracks:
         md5 = t.get("file_md5")
         if not isinstance(md5, str) or not md5:
             continue
-        if is_catalogue_path(t.get("path")) and _is_modland_catalogue(t.get("path")):
-            # A Modland CATALOGUE track carries its Modland data from its own
-            # path (core/modland_catalog.py) — never joined, never withdrawn.
+        if _own_path(t):
             # (Another online collection's tune is joined like a local file.)
             continue
         path = rows.get(md5.lower())

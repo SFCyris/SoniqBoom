@@ -40,7 +40,8 @@ window.Toast = Toast;
   } catch (_) { /* server falls back to UA detection */ }
 })();
 
-import { MobileRadio }     from './radio-player.js';
+import { MobileRadio, paintStationArt, forgetStationArt } from './radio-player.js';
+import { freshArt, reaskArt, noteArtChanged, noteArtMissed } from './views/_common.js';
 import { mountLibrary }    from './views/library.js';
 import { mountSearch }     from './views/search.js';
 import { mountRadio }      from './views/radio.js';
@@ -144,6 +145,7 @@ function renderMini(track) {
   _miniCuedKey = cued ? `${cued.id}~${cued.subsong ?? ''}` : null;
   if (!resumable && !cued) {
     mini.classList.add('hidden');
+    miniArt.__artSrc = null;
     return;
   }
   if (cued) {
@@ -155,6 +157,7 @@ function renderMini(track) {
   }
   mini.classList.remove('hidden');
   delete mini.dataset.src;
+  forgetStationArt(miniArt);
   miniTitle.textContent  = track.title  || '—';
   miniArtist.textContent = track.artist || track.album_artist || '';
 
@@ -166,7 +169,8 @@ function renderMini(track) {
   span.className = 'm-mp-art-ph';
   span.textContent = artPlaceholderEmoji(track);
   miniArt.appendChild(span);
-  const artSrc = staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : null);
+  const artSrc = freshArt(staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : null));
+  miniArt.__artSrc = artSrc;   // (asked again when the cover changes — _common.js)
   if (artSrc) {
     const img = new Image();
     img.alt = '';
@@ -178,28 +182,27 @@ function renderMini(track) {
   }
 }
 
+// A station: its name and logo — and, while it says what it plays
+// (MobileRadio.now), the song with the artist and the station under it, and
+// the song's cover over the logo once one was found.
 function renderMiniStation(st) {
+  const now = MobileRadio.now;
+  const lines = MobileRadio.lines;
   mini.classList.remove('hidden');
   mini.dataset.src = 'radio';
-  miniTitle.textContent  = (st && st.name) || 'Radio';
-  miniArtist.textContent = 'Internet radio';
-  miniArt.innerHTML = '';
-  const span = document.createElement('span');
-  span.className = 'm-mp-art-ph';
-  span.textContent = '📻';
-  miniArt.appendChild(span);
-  if (st && st.favicon) {
-    const img = new Image();
-    img.alt = ''; img.decoding = 'async';
-    img.onload  = () => img.classList.add('loaded');
-    img.onerror = () => img.remove();
-    miniArt.appendChild(img);
-    img.src = st.favicon;
-  }
+  miniArt.__artSrc = null;
+  miniTitle.textContent  = lines.title;
+  miniArtist.textContent = lines.sub;
   miniProg.style.width = '0%';   // live stream — no meaningful progress
+  paintStationArt(miniArt, { logo: (st && st.favicon) || '', cover: (now && now.cover) || '',
+                             phClass: 'm-mp-art-ph' });
 }
 
 Player.on('trackchange', renderMini);
+// The shown track's cover changed (art_ready / art_refresh — _common.js).
+document.addEventListener('soniqboom:art-changed', (e) => {
+  if (!MobileRadio.active) reaskArt(miniArt, miniArt, e.detail && e.detail.id, e.detail && e.detail.missing);
+});
 
 // A tune of an online collection not read yet — a package (Aminet, scene.org)
 // that opens into its first tune on this play, a catalogue file read on its
@@ -255,15 +258,24 @@ Player.on('trackchange', (t) => {
 // read: rows of an online collection that left the library
 // (``catalogue_tracks_left`` → ``left``, see _tracksLeft), and which tracks
 // can play changed (``availability_changed`` → ``avail``: offline.js re-reads
-// the state, and the open view and the settings follow).  The socket comes
-// back after a pause that grows to 30 s (1 s after the server's own restart
-// close, 1012) and rests while the page is hidden.
+// the state, and the open view and the settings follow), tracks that took
+// fields without a scan (``catalogue_changed`` → ``changed``, see
+// _catalogueChanged), and what a relayed station plays (``radio_meta`` /
+// ``radio_art`` → ``radio``; ``opened`` at every connect: a title said while
+// the socket was away is asked for).  The socket comes back after a pause
+// that grows to 30 s (1 s after the server's own restart close, 1012) and
+// rests while the page is hidden.
 function _listenForRestart({ WS = globalThis.WebSocket, doc = globalThis.document,
                              loc = globalThis.location, wait = (fn, ms) => setTimeout(fn, ms),
                              note = () => Player.noteServerRestart(),
                              left = (m) => _tracksLeft(m),
-                             avail = () => Offline.refresh() } = {}) {
+                             avail = () => Offline.refresh(),
+                             changed = (m) => _catalogueChanged(m),
+                             radio = (m) => _radioSaid(m),
+                             art = (id) => noteArtChanged(id),
+                             opened = (again) => _socketOpened(again) } = {}) {
   let backoff = 2000;
+  let again = false;          // the socket was open before (this is a reconnect)
   const connect = () => {
     if (doc.visibilityState === 'hidden') { doc.addEventListener('visibilitychange', connect, { once: true }); return; }
     let ws;
@@ -274,8 +286,19 @@ function _listenForRestart({ WS = globalThis.WebSocket, doc = globalThis.documen
       if (m && m.event === 'server_restarting') { try { note(); } catch (_) { /* older player */ } }
       else if (m && m.event === 'catalogue_tracks_left') { try { left(m); } catch (_) { /* isolation */ } }
       else if (m && m.event === 'availability_changed') { try { avail(m); } catch (_) { /* isolation */ } }
+      else if (m && m.event === 'catalogue_changed') { try { changed(m); } catch (_) { /* isolation */ } }
+      else if (m && (m.event === 'radio_meta' || m.event === 'radio_art')) { try { radio(m); } catch (_) { /* isolation */ } }
+      // A track's cover arrived after its row was painted (a network share's,
+      // one looked up online) / a cover setting changed: the slots ask again.
+      else if (m && m.event === 'art_ready' && m.track_id) { try { art(String(m.track_id)); } catch (_) { /* isolation */ } }
+      else if (m && m.event === 'art_refresh') { try { art(null); } catch (_) { /* isolation */ } }
     };
-    ws.onopen = () => { backoff = 2000; };
+    ws.onopen = () => {
+      backoff = 2000;
+      const was = again;
+      again = true;
+      try { opened(was); } catch (_) { /* isolation */ }
+    };
     ws.onclose = (ev) => {
       const ms = ev && ev.code === 1012 ? 1000 : backoff;
       backoff = Math.min(30000, backoff * 2);
@@ -299,6 +322,26 @@ function _tracksLeft(m) {
       { detail: { ids: [id], fields: { defect: 'empty', defect_detail: String(reasons[id] || '') } } }));
   }
   document.dispatchEvent(new CustomEvent('soniqboom:tracks-left', { detail: { ids } }));
+}
+
+// Tracks took fields without a scan (an online collection's unplayed tunes
+// filled from the song database, an enrichment pass that ended): the open
+// list reads its rows again in place (views/library.js).
+function _catalogueChanged() {
+  document.dispatchEvent(new CustomEvent('soniqboom:catalogue-changed'));
+}
+
+// What a relayed station plays, and the cover found for that song: the radio
+// player keeps it when it is of the station playing here.
+function _radioSaid(m) {
+  if (m.event === 'radio_meta') MobileRadio.noteMeta(m); else MobileRadio.noteArt(m);
+}
+// The socket (re)opened.  What it tells only once may have passed while it
+// was away: the station's song is asked, and — on a reconnect — the covers
+// that are not showing (an ``art_ready`` may have been missed).
+function _socketOpened(again) {
+  MobileRadio.refreshNow();
+  if (again) noteArtMissed();
 }
 
 // A queue cued for ▶ (see renderMini): repaint when the cued entry changes —
@@ -336,6 +379,7 @@ Player.on('timeupdate', ({ pct }) => {
 
 // Radio drives the mini-player when a station is the active source.
 MobileRadio.on('change', () => renderMini(Player.currentTrack));
+MobileRadio.on('meta',   () => { if (MobileRadio.active) renderMiniStation(MobileRadio.station); });
 MobileRadio.on('state',  () => {
   if (MobileRadio.active) {
     miniPlay.textContent = MobileRadio.playing ? PAUSE_GLYPH : PLAY_GLYPH;

@@ -6,11 +6,11 @@
  * the tune list of a multi-tune file (SID, Amiga modules, console rips …).
  */
 import { Player } from '../../player.js';
-import { MobileRadio } from '../radio-player.js';
+import { MobileRadio, paintStationArt, forgetStationArt } from '../radio-player.js';
 import { artPlaceholderEmoji, subsongStart, subsongStartOf, subsongWireToTune,
          subsongTuneToWire, staticArtUrl } from '../../utils.js';
 import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
-import { fmtDur } from './_common.js';
+import { fmtDur, freshArt, reaskArt } from './_common.js';
 import { healthBadge } from '../../health.js';
 import { mountNpVisuals } from './np_visuals.js';
 
@@ -157,18 +157,18 @@ export function mountNowPlaying(root, ctx) {
     if (radio) np.dataset.src = 'radio'; else delete np.dataset.src;
   }
 
+  // A station: its name and its logo on the cassette label — and, while it
+  // says what it plays (MobileRadio.now: a station played through the relay),
+  // the song with the artist and the station under it, and the song's cover
+  // on the label once one was found (the logo stays under it, and is back for
+  // a song without a cover).
   function renderStation(st) {
-    titleEl.textContent  = (st && st.name) || 'Radio';
-    artistEl.textContent = 'Internet radio';
-    art.innerHTML = '<span>\u{1F4FB}</span>';   // 📻
-    if (st && st.favicon) {
-      const img = new Image();
-      img.alt = ''; img.decoding = 'async';
-      img.onload  = () => img.classList.add('loaded');
-      img.onerror = () => img.remove();
-      art.appendChild(img);
-      img.src = st.favicon;
-    }
+    const now = MobileRadio.now;
+    const lines = MobileRadio.lines;
+    titleEl.textContent  = lines.title;
+    artistEl.textContent = lines.sub;
+    art.__artSrc = null;
+    paintStationArt(art, { logo: (st && st.favicon) || '', cover: (now && now.cover) || '' });
     // Live stream — no seekable position.
     setScrub(0); scrub.disabled = true;
     curEl.textContent = '● LIVE'; durEl.textContent = '';
@@ -206,6 +206,8 @@ export function mountNowPlaying(root, ctx) {
       artistEl.textContent = '';
       // Layered placeholder with the default 🔊 glyph (no track to ask
       // ``artPlaceholderEmoji`` about format).
+      forgetStationArt(art);
+      art.__artSrc = null;
       art.innerHTML = '<span>\u{1F50A}</span>';
       setScrub(0); curEl.textContent = '0:00'; durEl.textContent = '0:00';
       return;
@@ -223,11 +225,13 @@ export function mountNowPlaying(root, ctx) {
     // and the desktop row covers).  The img fades in via the ``.loaded``
     // class on successful decode; onerror removes it so the format
     // glyph stays put — no broken-image glyph ever paints.
+    forgetStationArt(art);
     art.innerHTML = '';
     const span = document.createElement('span');
     span.textContent = artPlaceholderEmoji(t);
     art.appendChild(span);
-    const artSrc = t.id ? `/api/art/${t.id}/lg.jpg?fallback=none` : staticArtUrl(t.cover_art);
+    const artSrc = freshArt(t.id ? `/api/art/${t.id}/lg.jpg?fallback=none` : staticArtUrl(t.cover_art));
+    art.__artSrc = artSrc;     // (asked again when the cover changes — _common.js)
     if (artSrc) {
       const img = new Image();
       img.alt = '';
@@ -356,6 +360,10 @@ export function mountNowPlaying(root, ctx) {
   });
 
   Player.on('trackchange', renderTrack);
+  // The shown track's cover changed (art_ready / art_refresh — _common.js).
+  document.addEventListener('soniqboom:art-changed', (e) => {
+    if (!MobileRadio.active) reaskArt(art, art, e.detail && e.detail.id, e.detail && e.detail.missing);
+  });
   Player.on('trackchange', (t) => { renderTunes(t); });
   // The playing track's row was re-read (an online collection's package
   // opened into its first tune, a catalogue tune's first-play read).
@@ -400,6 +408,8 @@ export function mountNowPlaying(root, ctx) {
   MobileRadio.on('state',  () => {
     if (MobileRadio.active) paintState();
   });
+  // The station said another song, or the song's cover was found.
+  MobileRadio.on('meta', () => { if (MobileRadio.active) renderStation(MobileRadio.station); });
 
   // Scrubber: pointerdown locks, input previews, change commits
   scrub.addEventListener('pointerdown', () => { _scrubbing = true; });

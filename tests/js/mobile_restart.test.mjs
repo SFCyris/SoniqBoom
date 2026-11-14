@@ -75,3 +75,87 @@ test('an availability change re-reads the state (Hide leaves rows out on the pho
   assert.match(SRC, /avail = \(\) => Offline\.refresh\(\)/);
   assert.match(SRC, /^import \{ Offline \} from '\.\.\/offline\.js';$/m);
 });
+
+test('a catalogue change, a station\'s song and its cover reach their hooks', () => {
+  const e = env();
+  const changed = [], radio = [];
+  _listenForRestart({ ...e.opts, changed: (m) => changed.push(m), radio: (m) => radio.push(m.event) });
+  const say = (m) => e.sockets[0].onmessage({ data: JSON.stringify(m) });
+  say({ event: 'catalogue_changed', root: 'modland://', lib_gen: 7 });
+  say({ event: 'radio_meta', sid: 'rb:1', title: 'A - B' });
+  say({ event: 'radio_art', sid: 'rb:1', title: 'A - B', cover_url: '/api/art/x/lg.jpg' });
+  say({ event: 'radio_status', sid: 'rb:1' });                   // (not one of them)
+  assert.equal(changed.length, 1);
+  assert.equal(changed[0].lib_gen, 7);
+  assert.deepEqual(radio, ['radio_meta', 'radio_art']);
+  assert.equal(e.notes.length, 0);
+});
+
+test('every connect asks once; a hook that throws breaks nothing', () => {
+  const e = env();
+  let opened = 0;
+  _listenForRestart({ ...e.opts, opened: () => { opened++; throw new Error('x'); },
+                      changed: () => { throw new Error('x'); }, radio: () => { throw new Error('x'); } });
+  e.sockets[0].onopen();
+  assert.equal(opened, 1);
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'catalogue_changed' }) });
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'radio_meta' }) });
+  e.sockets[0].onclose({ code: 1006 });
+  e.waits.at(-1)[0]();
+  e.sockets[1].onopen();
+  assert.equal(opened, 2);
+  e.sockets[1].onmessage({ data: JSON.stringify({ event: 'server_restarting' }) });
+  assert.equal(e.notes.length, 1);                               // still listening
+});
+
+test('the page wires the new events to the open list and the radio player', () => {
+  assert.match(SRC, /changed = \(m\) => _catalogueChanged\(m\)/);
+  assert.match(SRC, /radio = \(m\) => _radioSaid\(m\)/);
+  assert.match(SRC, /opened = \(again\) => _socketOpened\(again\)/);
+  assert.match(SRC, /art = \(id\) => noteArtChanged\(id\)/);
+  assert.match(SRC, /function _catalogueChanged\(\) \{\s*document\.dispatchEvent\(new CustomEvent\('soniqboom:catalogue-changed'\)\);/);
+  assert.match(SRC, /function _radioSaid\(m\) \{\s*if \(m\.event === 'radio_meta'\) MobileRadio\.noteMeta\(m\); else MobileRadio\.noteArt\(m\);/);
+  assert.match(SRC, /function _socketOpened\(again\) \{\s*MobileRadio\.refreshNow\(\);\s*if \(again\) noteArtMissed\(\);\s*\}/);
+  const lib = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)),
+    '../../soniqboom/frontend/js/mobile/views/library.js'), 'utf8');
+  assert.match(lib, /addEventListener\('soniqboom:catalogue-changed'/);
+});
+
+test('a cover that arrived, and a changed cover setting, reach the art slots', () => {
+  const e = env();
+  const art = [];
+  _listenForRestart({ ...e.opts, art: (id) => art.push(id) });
+  const say = (m) => e.sockets[0].onmessage({ data: JSON.stringify(m) });
+  say({ event: 'art_ready', track_id: 'abc123' });
+  say({ event: 'art_ready' });                                   // (names no track: nothing to ask)
+  say({ event: 'art_ready', track_id: '' });
+  say({ event: 'art_refresh' });
+  say({ event: 'art_ready', track_id: 77 });
+  assert.deepEqual(art, ['abc123', null, '77']);
+  assert.equal(e.notes.length, 0);
+});
+
+test('a cover hook that throws breaks nothing', () => {
+  const e = env();
+  _listenForRestart({ ...e.opts, art: () => { throw new Error('x'); } });
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'art_ready', track_id: 'a' }) });
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'art_refresh' }) });
+  e.sockets[0].onmessage({ data: JSON.stringify({ event: 'server_restarting' }) });
+  assert.equal(e.notes.length, 1);
+});
+
+test('the open hook hears whether this is a reconnect', () => {
+  const e = env();
+  const seen = [];
+  _listenForRestart({ ...e.opts, opened: (again) => seen.push(again) });
+  e.sockets[0].onopen();
+  e.sockets[0].onclose({ code: 1006 });
+  e.waits.at(-1)[0]();
+  e.sockets[1].onclose({ code: 1006 });                          // (never opened: still no reconnect seen)
+  e.waits.at(-1)[0]();
+  e.sockets[2].onopen();
+  e.sockets[2].onclose({ code: 1012 });
+  e.waits.at(-1)[0]();
+  e.sockets[3].onopen();
+  assert.deepEqual(seen, [false, true, true]);
+});

@@ -103,6 +103,123 @@ async def test_a_busy_modland_apply_is_retried(runner):
     assert [o for o in runner["order"] if isinstance(o, tuple)] == [("modland", True)] * 2
 
 
+@pytest.fixture
+def told(monkeypatch):
+    """The ``catalogue_changed`` events sent, with what the runner had done
+    by then."""
+    from soniqboom.api import library
+    sent = []
+    scanner._enrichment_announce.clear()
+    return sent, library
+
+
+async def test_a_fill_is_announced_once_after_the_passes_that_take_it_in(runner, told, monkeypatch):
+    sent, library = told
+
+    async def cast(root):
+        sent.append((root, list(runner["order"])))
+    monkeypatch.setattr(library, "broadcast_catalogue_changed", cast)
+    scanner._spawn_scene_autoapply()
+    scanner.announce_after_enrichment("ftp://example/root")
+    scanner.announce_after_enrichment("ftp://example/root")     # a second fill meanwhile
+    assert sent == []                                           # not before the applies
+    await _drain()
+    assert [r for r, _ in sent] == ["ftp://example/root"]
+    # after Modland and Demozoo, before the slower tail of the pass
+    assert sent[0][1] == [("modland", True), "demozoo"]
+    assert not scanner._enrichment_announce
+
+
+async def test_a_fill_that_asks_during_a_pass_is_announced_after_the_next(runner, told, monkeypatch):
+    sent, library = told
+
+    async def cast(root):
+        sent.append(sum(1 for o in runner["order"] if isinstance(o, tuple)))
+    monkeypatch.setattr(library, "broadcast_catalogue_changed", cast)
+    real = scene_metadata.apply_to_library
+    asked = []
+
+    async def modland(*, auto=False):
+        res = await real(auto=auto)
+        if not asked:                           # a fill lands while pass 1 applies
+            asked.append(1)
+            scanner._spawn_scene_autoapply()
+            scanner.announce_after_enrichment("ftp://example/root")
+        return res
+    monkeypatch.setattr(scene_metadata, "apply_to_library", modland)
+    scanner._spawn_scene_autoapply()
+    await _drain()
+    assert sent == [2]                          # once, after the pass that took it in
+
+
+async def test_a_busy_apply_holds_the_announcement_for_the_retry(runner, told, monkeypatch):
+    sent, library = told
+
+    async def cast(root):
+        sent.append(sum(1 for o in runner["order"] if isinstance(o, tuple)))
+    monkeypatch.setattr(library, "broadcast_catalogue_changed", cast)
+    runner["modland_results"] = [{"error": "apply already running"}]
+    scanner._spawn_scene_autoapply()
+    scanner.announce_after_enrichment("ftp://example/root")
+    await _drain()
+    assert sent == [2]
+
+
+async def test_without_a_pass_a_fill_is_announced_at_once(runner, told, monkeypatch):
+    sent, library = told
+
+    async def cast(root):
+        sent.append(root)
+    monkeypatch.setattr(library, "broadcast_catalogue_changed", cast)
+    scanner.announce_after_enrichment("ftp://example/root")     # no runner going
+    scanner.announce_after_enrichment("")                       # (no root: nothing)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+    assert sent == ["ftp://example/root"] and runner["order"] == []
+
+
+async def test_an_announcement_in_a_passs_tail_is_still_sent(runner, told, monkeypatch):
+    sent, library = told
+
+    async def cast(root):
+        sent.append(root)
+    monkeypatch.setattr(library, "broadcast_catalogue_changed", cast)
+
+    async def backfill():
+        scanner.announce_after_enrichment("ftp://example/tail")  # after the applies
+        return False
+    monkeypatch.setattr(repair, "run_album_backfill_once", backfill)
+    scanner._spawn_scene_autoapply()
+    await _drain()
+    assert sent == ["ftp://example/tail"]
+
+
+async def test_a_pass_asked_for_during_the_last_announcement_still_runs(runner, told, monkeypatch):
+    sent, library = told
+    asked = []
+
+    async def cast(root):
+        sent.append(root)
+        if not asked:                           # a scan drains while the event goes out
+            asked.append(1)
+            scanner._spawn_scene_autoapply()
+        await asyncio.sleep(0.02)
+    monkeypatch.setattr(library, "broadcast_catalogue_changed", cast)
+    calls = []
+
+    async def backfill():
+        calls.append(1)
+        if len(calls) == 1:
+            scanner.announce_after_enrichment("ftp://example/tail")  # after the applies
+        return False
+    monkeypatch.setattr(repair, "run_album_backfill_once", backfill)
+    scanner._spawn_scene_autoapply()
+    await _drain()
+    assert sent == ["ftp://example/tail"]
+    assert len([o for o in runner["order"] if isinstance(o, tuple)]) == 2
+    assert not scanner._scene_autoapply_pending and not scanner._scene_autoapply_running
+
+
 async def test_the_runner_waits_out_a_running_scan(runner, monkeypatch):
     scanning = {"v": True}
     monkeypatch.setattr(scanner, "is_scanning", lambda path=None: scanning["v"])

@@ -16,7 +16,9 @@
  * reported as a temporary outage (no blacklisting — it stays listed so
  * the listener can retry).  Now-playing titles arrive over the library
  * WebSocket as ``radio_meta`` events (re-dispatched by app.js as
- * ``sb:radio-meta``).
+ * ``sb:radio-meta``); a station tells only at a change of song, so the page
+ * asks what it last said once it plays and when the socket connects
+ * (``_askNow`` → GET /api/stations/now/{sid}).
  *
  * Layout (top to bottom): the location (breadcrumbs), in the shared UI style
  * (js/ui_style.js: Modern / Retro hi-fi); the now-playing card (station art + LIVE badge, the
@@ -49,8 +51,72 @@ const view = () => $('stations-view');
 
 // ── Playback state ────────────────────────────────────────────────────────────
 let _current = null;     // { station, cands, i } while a station is selected
+// [radio-now:begin] — tests/js/desktop_radio_now.test.mjs runs this region as is
 let _nowTitle = '';      // last ICY StreamTitle for the current station
+let _nowSong = '';       // … and its two halves, when the server split it
+let _nowArtist = '';
 let _artMeta = null;     // last radio_art result (cover + album/year/source) for _nowTitle
+let _nowSeq = 0;         // every title / cover taken or dropped: an older answer is not taken
+
+/** A title the station said.  The same title said again (another stream of
+ *  the station started, a relay reconnected) changes nothing — its cover
+ *  stays; another title is another song: the cover goes until one is found. */
+function _takeTitle(d) {
+  const title = d && typeof d.title === 'string' ? d.title : '';
+  if (!title || title === _nowTitle) return false;
+  _nowTitle = title;
+  _nowSong = typeof d.song === 'string' ? d.song : '';
+  _nowArtist = typeof d.artist === 'string' ? d.artist : '';
+  _artMeta = null;
+  _nowSeq++;
+  return true;
+}
+
+/** What was found for a title (cover, album, year, source) — only for the
+ *  title that still plays, and not what is held already. */
+function _takeArt(d) {
+  if (!d || !_nowTitle || d.title !== _nowTitle) return false;
+  const a = _artMeta;
+  if (a && ['cover_url', 'album', 'year', 'label', 'source']
+    .every(k => (a[k] == null ? '' : a[k]) === (d[k] == null ? '' : d[k]))) return false;
+  _artMeta = d;
+  _nowSeq++;
+  return true;
+}
+
+function _forgetNow() { _nowTitle = ''; _nowSong = ''; _nowArtist = ''; _artMeta = null; _nowSeq++; }
+
+// A cover comes from this server only, in the two shapes the server names:
+// the art of a matched library track, or the cover it fetched for the song.
+const _COVER_RE = /^\/api\/(?:art\/[A-Za-z0-9_-]+\/(?:sm|lg|full)\.jpg|stations\/nowplaying-art\/[a-z0-9-]{1,120})$/;
+/** The cover held for the title that plays, or null (none found, or not one of ours). */
+function _heldCover() {
+  const u = _artMeta && _artMeta.cover_url;
+  return typeof u === 'string' && _COVER_RE.test(u) ? u : null;
+}
+// [radio-now:end]
+
+/** What is held for the station, put on the player bar: the song and artist,
+ *  and the song's cover or the station's logo. */
+function _showHeld() {
+  if (!_nowTitle) return;
+  Player.setStationNowPlaying(_nowSong, _nowArtist);
+  Player.updateStationArt(_heldCover());
+}
+
+// The player builds the station's item anew at every (re)start of a stream —
+// the station's name, no song, the logo — and says so before the stream plays
+// (which can take seconds, or fail).  The station does not say the same title
+// to this page twice, so what is held goes back on the bar right then; each
+// item once (putting a song on an item announces that item again).
+let _itemShown = null;
+function _onStationItem(t) {
+  if (!t || t === _itemShown) return;
+  _itemShown = t;
+  if (!_current || !Player.stationMode || !t.station || t.sid !== _current.station.sid) return;
+  _showHeld();
+}
+Player.on('trackchange', _onStationItem);
 // Surf context: the station list (+ index) the playing station was launched
 // from, so the player-bar ◄◄ / ►► can move through it.  Set by _stationRows
 // when a row is clicked; realigned by _syncPlayCtx for non-list plays.
@@ -228,8 +294,7 @@ function play(station) {
   _wireAudioHealth();   // play() can be reached from global search, not just show()
   _syncPlayCtx(station);   // keep the ◄◄/►► surf context aligned to this station
   _current = { station, cands, i: 0 };
-  _nowTitle = '';
-  _artMeta = null;
+  _forgetNow();
   _resetBuffering();
   _reconnects = 0;
   _tryPlay();
@@ -261,7 +326,11 @@ async function _tryPlay() {
   _activeUrl = url;   // so the 'error' handler can ignore late errors from a superseded stream
   _renderNowPlaying(true);
   try {
-    await Player.playStation(station, url, c.s.codec);
+    const started = Player.playStation(station, url, c.s.codec);
+    // Its relay may run already and know the song: asked as the start is
+    // issued — the stream can take seconds to play, or refuse and play anyway.
+    _askNow();
+    await started;
     if (gen !== _playGen) return;   // superseded mid-load (user switched / reconnected)
     _renderNowPlaying();
   } catch (_) {
@@ -300,7 +369,7 @@ function _unavailable(station) {
   _resetBuffering();
   Player.stopStation();
   _current = null;
-  _artMeta = null;
+  _forgetNow();
   _renderNowPlaying();
   _updateRadioBar();    // (the ticker / surf targets leave with the station)
   _syncUi();
@@ -310,8 +379,7 @@ function stop() {
   _resetBuffering();
   Player.stopStation();
   _current = null;
-  _nowTitle = '';
-  _artMeta = null;
+  _forgetNow();
   _playCtx = { list: null, idx: -1 };
   _renderNowPlaying();
   _updateRadioBar();    // clear the radio-mode ticker + surf targets
@@ -1214,34 +1282,50 @@ document.addEventListener('click', (e) => {
 }, true);
 
 // Now-playing titles pushed from the relay over the library WebSocket.
-window.addEventListener('sb:radio-meta', (e) => {
-  const d = e.detail || {};
-  if (_current && d.sid === _current.station.sid) {
-    _nowTitle = d.title || '';
-    _artMeta = null;                  // new song — drop the previous cover/metadata
-    // Bottom-left player bar: show the now-playing Song (title) + Artist
-    // (subtitle), falling back to the station name between songs.
-    Player.setStationNowPlaying(d.song, d.artist);
-    Player.updateStationArt(null);    // back to the station logo until a cover lands
-    _updateNowTitle();
-    _updateInfoNow();
-    _updateRadioBar();                // ticker + LIVE + prev/next targets
-  }
-});
+function _onMeta(d) {
+  if (!_current || !d || d.sid !== _current.station.sid) return;
+  if (!_takeTitle(d)) return;         // (the same title said again: its cover stays)
+  // Bottom-left player bar: show the now-playing Song (title) + Artist
+  // (subtitle), falling back to the station name between songs; the art goes
+  // back to the station logo until a cover lands.
+  _showHeld();
+  _updateNowTitle();
+  _updateInfoNow();
+  _updateRadioBar();                  // ticker + LIVE + prev/next targets
+}
+window.addEventListener('sb:radio-meta', (e) => _onMeta(e.detail || {}));
 
 // Now-playing cover + metadata resolved by the relay (library/Discogs/MusicBrainz).
 // Swap the bottom-left art to the song cover; show the gathered album/year/source.
-window.addEventListener('sb:radio-art', (e) => {
-  const d = e.detail || {};
+function _onArt(d) {
   // Ignore a stale result (the song already changed) or a different station.
-  if (!_current || d.sid !== _current.station.sid || d.title !== _nowTitle) {
-    return;   // _artMeta was already cleared by the radio_meta song-change reset
-  }
-  _artMeta = d;
-  if (d.cover_url) Player.updateStationArt(d.cover_url);
+  if (!_current || !d || d.sid !== _current.station.sid) return;
+  if (!_takeArt(d)) return;
+  Player.updateStationArt(_heldCover());   // (the cover, or the logo when this finding has none)
   _updateInfoNow();
-  _updateNowTitle();                // "From <album> · <year>" on the card
-});
+  _updateNowTitle();                  // "From <album> · <year>" on the card
+}
+window.addEventListener('sb:radio-art', (e) => _onArt(e.detail || {}));
+
+// A station tells only at a change of song: tuning in to one whose relay runs
+// already (another device plays it), or a socket that was away for a change,
+// hears nothing.  Ask what it last said; an answer with no title changes
+// nothing, and one a newer title or cover overtook is dropped.
+async function _askNow() {
+  const cur = _current;
+  if (!cur || !Player.stationMode) return;
+  const seq = _nowSeq;
+  let m = null;
+  try {
+    const r = await fetch(`/api/stations/now/${encodeURIComponent(cur.station.sid)}`);
+    m = r.ok ? await r.json() : null;
+  } catch (_) { return; }
+  if (!m || _current !== cur || seq !== _nowSeq || !Player.stationMode) return;
+  _onMeta(m);
+  if (m.cover_url) _onArt(m);         // (an answer with nothing found leaves what is held)
+}
+// (app.js: the library socket connected — also after it was away)
+window.addEventListener('sb:socket-open', () => { _askNow(); });
 
 // A library track (or anything else) took over the player: the station is no
 // longer on air — the card, dial, presets and radio bar let go of it (the
@@ -1250,8 +1334,7 @@ Player.on('trackchange', () => {
   if (Player.stationMode || !_current) return;
   _resetBuffering();
   _current = null;
-  _nowTitle = '';
-  _artMeta = null;
+  _forgetNow();
   _playCtx = { list: null, idx: -1 };
   _renderNowPlaying();
   _updateRadioBar();

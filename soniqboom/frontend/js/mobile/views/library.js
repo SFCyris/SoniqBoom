@@ -14,7 +14,7 @@
  */
 import { Player } from '../../player.js';
 import { attachRowGestures, attachListGestures, attachDragReorder } from '../gestures.js';
-import { fmtDur, esc, trackActions, playlistEntry, countNoun } from './_common.js';
+import { fmtDur, esc, trackActions, playlistEntry, countNoun, freshArt } from './_common.js';
 import { artPlaceholderEmoji, probeAdlibDurations, staticArtUrl, compoLabel } from '../../utils.js';
 import { createVirtualList } from '../../vlist.js';
 import { offlineKind, offlineBadge, Offline } from '../../offline.js';
@@ -37,6 +37,8 @@ export function mountLibrary(root, ctx) {
                               // | 'composers' | 'games' | 'platforms' | 'parties' | 'playlists'
   let crumb   = null;         // when set, we're inside a group → showing tracks
   let tracks  = [];
+  // A loaded row → its position in the server's order when its page came.
+  const _posOf = new WeakMap();
   let groupItems = [];
   let groupField = '';
   let offset  = 0;
@@ -185,7 +187,7 @@ export function mountLibrary(root, ctx) {
     row.__item = t;
     if (t.id) row.dataset.trackId = t.id; else delete row.dataset.trackId;
     // Art: the emoji placeholder always paints; the cover fades in over it.
-    setArt(row, artPlaceholderEmoji(t), staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : ''));
+    setArt(row, artPlaceholderEmoji(t), freshArt(staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : '')));
     setTitle(row, t.title || '—', healthBadge(t), offlineKind(t));
     // (a party's list: the compo and place beside the artist)
     const compo = crumb && crumb.field === 'party' ? compoLabel(t, { party: false }) : '';
@@ -351,6 +353,131 @@ export function mountLibrary(root, ctx) {
       vl.render(true);
     }).catch(() => {});
   });
+
+  // Tracks took fields without a scan (app.js _catalogueChanged — an online
+  // collection's unplayed tunes filled from the song database, a catalogue
+  // built, refreshed or removed, a library restored): the open list reads
+  // what it shows again IN PLACE — the scroll position stays, and only the
+  // rows whose fields changed repaint.  A track list asks for its loaded rows
+  // by id (rows no longer in the library leave it; rows the library gained
+  // show once the list is opened again); a group list is read again whole.
+  // Events in a burst are answered once.
+  let _rereadTimer = null, _rereading = false, _rereadAgain = false;
+  document.addEventListener('soniqboom:catalogue-changed', () => {
+    clearTimeout(_rereadTimer);
+    _rereadTimer = setTimeout(rereadInPlace, 600);
+  });
+
+  // [m-reread:begin] — tests/js/mobile_reread.test.mjs runs this region as is
+  const _same = (a, b) => a === b
+    || (a && b && typeof a === 'object' && typeof b === 'object'
+        && JSON.stringify(a) === JSON.stringify(b));
+  // A list row leaves out the fields a track has no value for; the row read
+  // back by id spells each of them out with its empty default.  A field the
+  // list row lacks and the fresh row holds empty is the same field: no change.
+  const _empty = (v) => v == null || v === '' || v === 0 || v === false
+    || (typeof v === 'object' && !Object.keys(v).length);
+  // The fresh row's fields go into the list row ``t``; true when one differed.
+  function _takeFresh(t, row) {
+    let changed = false;
+    for (const k in row) {
+      // (a length found here for a row the server has none for stays)
+      if (k === 'duration' && !(row.duration > 0) && t.duration > 0) continue;
+      if (!(k in t) && _empty(row[k])) continue;
+      if (!_same(t[k], row[k])) { t[k] = row[k]; changed = true; }
+    }
+    return changed;
+  }
+  // The rows read back by id (``fresh``: id → row) go into the rows of
+  // ``list`` that were asked for: {changed: the rows that took a field,
+  // gone: how many of them the library no longer holds}.
+  function _applyFresh(list, asked, fresh, playing) {
+    const changed = new Set();
+    let gone = 0;
+    for (const t of list) {
+      if (!t || !asked.has(t.id)) continue;               // (a page that arrived meanwhile)
+      const row = fresh.get(t.id);
+      if (!row) { gone++; continue; }
+      // The playing tune of an online collection not read yet is the player's
+      // to read again (app.js: what changed there brings its package's other
+      // tunes, and a row may be the queue's own object) — its row waits.
+      if (playing && t.id === playing.id && !((playing.mtime || 0) > 0)) continue;
+      if (_takeFresh(t, row)) changed.add(t);
+    }
+    return { changed, gone };
+  }
+  /** The rows of a further page the list does not hold yet.  Pages are cut by
+   *  position, so a list whose order moved between two requests (a track
+   *  gained its artist) can hand a row out a second time. */
+  function _unseen(have, page) {
+    const ids = new Set();
+    for (const t of have) if (t && t.id) ids.add(t.id);
+    return page.filter(t => !t || !t.id || (!ids.has(t.id) && !!ids.add(t.id)));
+  }
+  // [m-reread:end]
+
+  async function rereadInPlace() {
+    if (_rereading) { _rereadAgain = true; return; }
+    _rereading = true;
+    try {
+      if (!crumb) revealSceneChips();
+      if (mode === 'tracks' || mode === 'pltracks') await rereadTracks();
+      else if (mode === 'groups') await rereadGroups();
+    } catch (err) {
+      console.error('Library re-read failed', err);     // (the list stays as it is)
+    } finally {
+      _rereading = false;
+      if (_rereadAgain) { _rereadAgain = false; rereadInPlace(); }
+    }
+  }
+
+  async function rereadTracks() {
+    const gen = viewGen, list = tracks, kind = mode;
+    const ids = [...new Set(list.filter((t) => t && t.id).map((t) => t.id))];
+    if (!ids.length) return;
+    const fresh = new Map();
+    for (let i = 0; i < ids.length; i += 5000) {          // (the server's cap per request)
+      const r = await fetch('/api/tracks/meta/batch', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ids.slice(i, i + 5000) }), credentials: 'same-origin',
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      for (const row of (await r.json()) || []) if (row && row.id) fresh.set(row.id, row);
+      if (gen !== viewGen || tracks !== list) return;     // the listener moved on meanwhile
+    }
+    const asked = new Set(ids);
+    const { changed, gone } = _applyFresh(list, asked, fresh, Player.currentTrack);
+    // A track list drops the rows that left the library (the server's list
+    // shrank with them: the next page starts that many rows earlier); a
+    // playlist keeps its entries — it is the server's to say what it holds.
+    if (gone && kind === 'tracks') {
+      if (gone === list.filter((t) => t && asked.has(t.id)).length) { render(); return; }
+      tracks = list.filter((t) => !(t && asked.has(t.id) && !fresh.has(t.id)));
+      offset = Math.max(0, offset - gone);
+      for (const row of vl.rows()) row.__item = null;
+      vl.setCount(tracks.length);
+      vl.render(true);
+      return;
+    }
+    if (!changed.size) return;
+    for (const row of vl.rows()) if (changed.has(row.__item)) row.__item = null;
+    vl.render(true);
+  }
+
+  async function rereadGroups() {
+    const gen = viewGen, shown = groupItems;
+    const res = await fetch(GROUP_ENDPOINTS[group]);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const items = await res.json();
+    if (gen !== viewGen || groupItems !== shown || mode !== 'groups') return;
+    if (!Array.isArray(items) || _same(items, shown)) return;
+    if (!items.length) { render(); return; }              // (nothing left: the empty note)
+    // The rows already showing an entry that did not change keep their paint.
+    const before = new Map(shown.map((it) => [JSON.stringify(it), it]));
+    groupItems = items.map((it) => before.get(JSON.stringify(it)) || it);
+    vl.setCount(groupItems.length);
+    vl.render(true);
+  }
 
   // ── Render dispatcher ────────────────────────────────────────────────
   function render() {
@@ -696,6 +823,7 @@ export function mountLibrary(root, ctx) {
       url = `/api/tracks?limit=${PAGE_SIZE}&offset=${offset}`;
     }
 
+    let again = false;
     try {
       const res = await fetch(url);
       const page = res.ok ? await res.json() : null;
@@ -712,9 +840,15 @@ export function mountLibrary(root, ctx) {
         }
       } else {
         emptyEl.classList.add('hidden');
-        appendTracks(page);
+        // (where each row stands in the server's order, for "play from here")
+        page.forEach((t, i) => { if (t && typeof t === 'object') _posOf.set(t, offset + i); });
+        const rows = _unseen(tracks, page);   // (only the rows the list does not hold)
+        if (rows.length) appendTracks(rows);
         offset += page.length;
         if (page.length < PAGE_SIZE) exhausted = true;
+        // A page that added nothing moved no row into view: no scroll will
+        // ask for the next one.
+        again = !rows.length && !exhausted;
       }
     } catch (err) {
       console.error('Library load failed', err);
@@ -723,6 +857,7 @@ export function mountLibrary(root, ctx) {
       if (loadingGen === gen) loadingGen = -1;
       if (gen === viewGen) loadEl.classList.add('hidden');
     }
+    if (again && gen === viewGen) loadTrackPage();
   }
 
   // "Play from here": build the queue as a bounded forward WINDOW fetched from
@@ -749,10 +884,23 @@ export function mountLibrary(root, ctx) {
       offset: startIdx,
       label: crumb ? crumb.label : 'All Tracks',
     };
-    const params = new URLSearchParams({ ...filter, limit: String(QUEUE_WINDOW), offset: String(startIdx) });
+    const pick = tracks[startIdx];
+    // The window starts where the row stood in the server's order when its
+    // page came — further on than its place in this list once repeated rows
+    // of a page were left out (_unseen) — and, when the track is not there,
+    // at its place in this list (rows that left the list moved it back).  The
+    // picked track is looked for in the window by id: the order may have
+    // moved since.  In neither window: the loaded rows play, from the picked one.
+    const starts = [pick ? _posOf.get(pick) : undefined, startIdx]
+      .filter((n, i, all) => Number.isInteger(n) && n >= 0 && all.indexOf(n) === i);
     try {
-      const win = await fetch(`${orderedUrl}?${params}`).then(r => (r.ok ? r.json() : null));
-      if (Array.isArray(win) && win.length) { Player.setQueue(win, 0, { source }); return; }
+      for (const from of starts) {
+        const params = new URLSearchParams({ ...filter, limit: String(QUEUE_WINDOW), offset: String(from) });
+        const win = await fetch(`${orderedUrl}?${params}`).then(r => (r.ok ? r.json() : null));
+        if (!Array.isArray(win)) break;
+        const at = pick ? win.findIndex(t => t && t.id === pick.id) : -1;
+        if (at >= 0) { Player.setQueue(win, at, { source: { ...source, offset: from } }); return; }
+      }
     } catch { /* fall through to the loaded slice */ }
     Player.setQueue(tracks, startIdx);   // fallback — never worse than before
   }
@@ -798,22 +946,22 @@ export function mountLibrary(root, ctx) {
     platforms:     'platform',
     parties:       'party',
   };
+  const GROUP_ENDPOINTS = {
+    artists:       '/api/library/artists',
+    album_artists: '/api/library/album-artists',
+    albums:        '/api/library/albums',
+    genres:        '/api/library/genres',
+    years:         '/api/library/years',
+    composers:     '/api/library/composers',
+    games:         '/api/library/games',
+    platforms:     '/api/library/platforms',
+    parties:       '/api/library/parties',
+  };
   async function loadGroupList() {
     const gen = viewGen;
     loadEl.classList.remove('hidden');
-    const endpointMap = {
-      artists:       '/api/library/artists',
-      album_artists: '/api/library/album-artists',
-      albums:        '/api/library/albums',
-      genres:        '/api/library/genres',
-      years:         '/api/library/years',
-      composers:     '/api/library/composers',
-      games:         '/api/library/games',
-      platforms:     '/api/library/platforms',
-      parties:       '/api/library/parties',
-    };
     try {
-      const res = await fetch(endpointMap[group]);
+      const res = await fetch(GROUP_ENDPOINTS[group]);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const items = await res.json();
       if (gen !== viewGen) return;

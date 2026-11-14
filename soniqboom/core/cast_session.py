@@ -107,15 +107,32 @@ def _downscale_art(raw: bytes) -> bytes | None:
     return None
 
 
+class _ArtPending(Exception):
+    """A track's online cover is being looked up: "no art" is not final."""
+
+
 async def _resolve_and_cap_art(track_id: str) -> bytes | None:
-    """Resolve cover bytes via the canonical art pipeline and size-cap them."""
-    from soniqboom.api.art import _resolve_full_art
+    """Resolve cover bytes via the canonical art pipeline and size-cap them.
+    A track with no cover of its own gets its stored online cover; while one
+    can still turn up (its lookup under way, waiting, or cut short),
+    ``_ArtPending`` (so the miss is not remembered)."""
+    from soniqboom.api.art import _resolve_full_art, online_cover_for
     raw, _mime = await _resolve_full_art(track_id)
+    if not raw:
+        raw, may_come = await online_cover_for(track_id, "full")
+        if may_come:
+            raise _ArtPending(track_id)
     if not raw:
         return None
     if len(raw) <= _ART_MAX_BYTES:
         return raw
     return await asyncio.to_thread(_downscale_art, raw)
+
+
+def forget_artwork() -> None:
+    """Forget the covers kept for now-playing frames — which cover a track
+    gets has changed (the online-cover setting)."""
+    _art_cache.clear()
 
 
 async def _airplay_artwork_bytes(track_id: str) -> bytes | None:

@@ -17,7 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
-from soniqboom.core import art_cache
+from soniqboom.core import art_cache, online_cover
 from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.data import get_track, get_config
 from soniqboom.core.metadata import cap_full_cover, id3_picture, resize_cover
@@ -1080,6 +1080,7 @@ async def cover_art(
     # the 404 path.
     mtime = _art_cached_mtime(track_id, size)
     track = None
+    online = online_cover.NOTHING
     if mtime is None:
         # No cached art yet → derive a freshness stamp from the source so
         # If-None-Match works on the first request.  Use the SAME folder-aware
@@ -1098,11 +1099,37 @@ async def cover_art(
             mtime = None
         except Exception:
             mtime = None
+        if track is not None:
+            online = await online_cover.state(track)
     etag = _make_etag(track_id, size, mtime)
+    # The answer that carries an online cover (``_online_response``) has its
+    # own tag; the track's own cover and "no cover" keep ``etag``.
+    etag_online = online_cover.etag(etag, online)
 
     # --- ETag: return 304 if client already has this version ----------------
+    # A client holding the "no cover" answer while an online cover is stored
+    # is not current (``etag`` then differs from ``etag_online``).  One holding
+    # the online cover is current only while the track's own cover is known to
+    # be missing — a setting change (Use Folder Art, the image names) can give
+    # the track a cover without changing ``etag``; the request then resolves
+    # again below.
     if_none_match = request.headers.get("if-none-match")
-    if if_none_match and if_none_match == etag:
+    if if_none_match and if_none_match == etag_online and (
+            not online.hit or _own_cover_missing(track_id, track, mtime)):
+        etag = etag_online
+        headers = {"ETag": etag}
+        if online.hit:
+            headers["Cache-Control"] = _ONLINE_CC       # the online cover still stands
+        elif track is not None:
+            # The client holds "no cover": the online lookup must be able to
+            # start here too, or a list that got the empty answer before the
+            # lookup could run (a restart, a pause) never gets the cover.
+            # While it is under way the answer is asked again at every use
+            # (see ``_no_art_response``); afterwards it is kept as usual.
+            if _ask_online(online, track_id, track, mtime):
+                headers["Cache-Control"] = _LOOKUP_PENDING_CC
+            elif _own_cover_missing(track_id, track, mtime):
+                headers["Cache-Control"] = _NO_ART_CC
         if mtime is None and track is not None and is_remote_path(track.path):
             # The client holds "no cover yet" for a network-share track, and
             # this ETag stays the same until its cover is cached — so what
@@ -1112,7 +1139,7 @@ async def cover_art(
             # folder's cover already cached for another of its tracks.  Never
             # a share listing per revalidation.
             await _fill_remote_art_later(track_id, track)
-        return Response(status_code=304, headers={"ETag": etag})
+        return Response(status_code=304, headers=headers)
 
     # --- Thumbnails (sm / lg) ----------------------------------------------
     if size in _SIZE_MAP:
@@ -1139,9 +1166,12 @@ async def cover_art(
         # browser's IMG.onerror fires and the UI's format emoji stays
         # visible — without paying the bitmap-decode + blob-alloc cost
         # of fetching the placeholder body just to inspect a header.
+        found, pending = await _online_response(online, track_id, track, size, etag_online, mtime)
+        if found is not None:
+            return found
         if fallback != "placeholder":
-            return _no_art_response(etag)
-        return _placeholder_response()
+            return _no_art_response(etag, pending=pending)
+        return _placeholder_response(_placeholder_cc(online, pending))
 
     # --- Full size ----------------------------------------------------------
     # ``_resolve_full_art`` already caches full + thumbs and broadcasts
@@ -1151,25 +1181,138 @@ async def cover_art(
     if full_data:
         return _etag_response(full_data, mime or "image/jpeg", etag)
 
+    found, pending = await _online_response(online, track_id, track, size, etag_online, mtime)
+    if found is not None:
+        return found
     if fallback != "placeholder":
-        return _no_art_response(etag)
-    return _placeholder_response()
+        return _no_art_response(etag, pending=pending)
+    return _placeholder_response(_placeholder_cc(online, pending))
 
 
-def _placeholder_response() -> Response:
+# ── Online covers (core/online_cover.py) ─────────────────────────────────────
+# The fallback for a track with no cover of its own.  Served from the online
+# store only: the track's record and its art-cache entry are never written, so
+# a cover the track gains later takes over through the usual path.
+
+def _own_cover_missing(track_id: str, track, source_mtime: float | None = None) -> bool:
+    """Is ``track`` known to have no cover of its own?  A local file: it was
+    read cleanly without one (the "no art" mark — in memory, or the stored one
+    still valid for ``source_mtime``); a file that could not be read is not
+    known.  A network-share file: the scan saw no picture in it."""
+    try:
+        if track is None:
+            return False
+        if is_remote_path(track.path):
+            return not getattr(track, "cover_art", None)
+        return bool(get_store().is_art_absent(track_id)
+                    or (source_mtime is not None
+                        and _is_art_absent_persisted(track_id, source_mtime)))
+    except Exception:
+        return False
+
+
+def _ask_online(online, track_id: str, track, source_mtime: float | None = None) -> bool:
+    """Queue the online lookup for ``track`` when its answer is not known and
+    its own cover is known to be missing (``_own_cover_missing``).  True when
+    a lookup is queued or running (``art_ready`` follows a cover)."""
+    try:
+        if online.subject is None or online.known:
+            return False
+        if not _own_cover_missing(track_id, track, source_mtime):
+            return False
+        return online_cover.request(online, track_id)
+    except Exception:
+        log.debug("online cover request failed for %s", track_id, exc_info=True)
+        return False
+
+
+async def _online_response(online, track_id: str, track, size: str, etag: str,
+                           source_mtime: float | None) -> tuple[Response | None, bool]:
+    """``(the stored online cover of a track whose own cover resolved to
+    nothing, as a response — None when there is none, whether its lookup is
+    then queued or running — see ``_ask_online``)``.  Only for a track known
+    to have no cover of its own (``_own_cover_missing``): one whose cover is
+    merely out of reach (its folder offline, a read error) gets none."""
+    if track is None or not _own_cover_missing(track_id, track, source_mtime):
+        return None, False
+    data = await online_cover.image(online, size)
+    if data:
+        return Response(content=data, media_type="image/jpeg", headers={
+            "Cache-Control": _ONLINE_CC,
+            "ETag": etag,
+            "X-SoniqBoom-Art": "online",
+        }), False
+    return None, _ask_online(online, track_id, track, source_mtime)
+
+
+# Cache rules of the two "no cover" answers.  While an online lookup is queued
+# or running the answer is about to change, so it is asked again at every use
+# (a conditional request): a cover found a moment later then reaches every
+# place that asks the same URL — the player bar, the album grid — not only the
+# pictures ``art_ready`` re-asks.
+#
+# The online cover itself is kept but checked at every page load (a 304 when
+# it still stands): the track's own cover takes over as soon as it has one, and
+# the cover is gone at the next load once the lookup is switched off — also in
+# a browser that was closed when ``art_refresh`` was sent.
+_ONLINE_CC = "no-cache"
+_NO_ART_CC = "public, max-age=60, must-revalidate"
+_LOOKUP_PENDING_CC = "no-cache"
+_PLACEHOLDER_CC = "public, max-age=31536000, immutable"
+_PLACEHOLDER_LOOKUP_CC = "max-age=3600"
+
+
+def _placeholder_cc(online, pending: bool) -> str:
+    """The placeholder picture's cache rule for a track in ``online`` state: a
+    track that is looked up online can still gain a cover (a lookup under way,
+    or a later one), so its placeholder is not kept for good."""
+    if pending:
+        return _LOOKUP_PENDING_CC
+    if online.subject is not None:
+        return _PLACEHOLDER_LOOKUP_CC
+    return _PLACEHOLDER_CC
+
+
+async def online_cover_for(track_id: str, size: str = "full") -> tuple[bytes | None, bool]:
+    """For the other cover endpoints (Subsonic, cast), AFTER ``_resolve_full_art``
+    found nothing: ``(the stored online cover as JPEG bytes — ``sm`` / ``lg`` /
+    ``full`` — or None, can one still turn up soon)``.  The second is True
+    while the track's answer is not known — a lookup queued or running, or
+    one that has to wait (the lookups paused) — or is a short-lived "none":
+    the caller must not remember "no cover" for long then.  Like
+    ``_online_response``, only for a track known to have no cover of its own."""
+    try:
+        track = await get_track(track_id)
+        if not track:
+            return None, False
+        online = await online_cover.state(track)
+        if not _own_cover_missing(track_id, track):       # (the mark ``_resolve_full_art`` just set)
+            return None, False
+        data = await online_cover.image(online, size)
+        if data:
+            return data, False
+        _ask_online(online, track_id, track)
+        return None, online.open and not online_cover.lookups_off()
+    except Exception:
+        log.debug("online cover failed for %s", track_id, exc_info=True)
+        return None, False
+
+
+def _placeholder_response(cache_control: str = _PLACEHOLDER_CC) -> Response:
     """Return the pre-baked placeholder JPEG with strong cache headers.
 
     ETag is a constant (placeholder bytes don't change between requests)
     so the browser keeps re-using its first download forever — a single
     HTTP round trip covers every tagless track in the library.
-    Immutable + 1-year max-age guarantees no revalidation.
+    Immutable + 1-year max-age guarantees no revalidation.  A track that is
+    looked up online gets a shorter rule (``_placeholder_cc``).
     """
     return Response(
         content=_PLACEHOLDER_JPEG,
         media_type="image/jpeg",
         headers={
             "ETag": _PLACEHOLDER_ETAG,
-            "Cache-Control": "public, max-age=31536000, immutable",
+            "Cache-Control": cache_control,
             # Hint to the UI's "is this real art?" check.  Frontend can
             # treat tracks served this header as art-less and avoid
             # showing a "View full size" affordance, etc.
@@ -1178,7 +1321,7 @@ def _placeholder_response() -> Response:
     )
 
 
-def _no_art_response(etag: str = "") -> Response:
+def _no_art_response(etag: str = "", *, pending: bool = False) -> Response:
     """``204 No Content`` with cache headers for the ``fallback=none`` path.
 
     The frontend IMG loaders use this so the browser's ``onerror`` handler
@@ -1195,10 +1338,12 @@ def _no_art_response(etag: str = "") -> Response:
     could never recover without a hard reload.  A short TTL plus the
     per-track ETag means a re-request after the art lands picks it up (the
     cached-art mtime changes the ETag, so the 304 short-circuit no longer
-    fires and the real cover is served).
+    fires and the real cover is served).  ``pending``: an online lookup for
+    the track is queued or running — the answer is then asked again at every
+    use instead of being kept for the minute.
     """
     headers = {
-        "Cache-Control": "public, max-age=60, must-revalidate",
+        "Cache-Control": _LOOKUP_PENDING_CC if pending else _NO_ART_CC,
         "X-SoniqBoom-Art": "none",
     }
     if etag:

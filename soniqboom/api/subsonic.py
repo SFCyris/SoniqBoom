@@ -4798,7 +4798,7 @@ async def get_cover_art(
                 _ART_BG.add(task)
                 task.add_done_callback(_ART_BG.discard)
                 return _art_response(data, "image/jpeg", None)
-            return _placeholder_art(_placeholder_ttl(store, resolved_id), large=large_ph)
+            return await _online_cover_art(store, resolved_id, bucket, large_ph)
 
         full_data, mime = await _resolve_full_art(resolved_id)
         if full_data:
@@ -4809,7 +4809,22 @@ async def get_cover_art(
         # short-lived, since the failure may be transient (I/O).
         log.debug("Subsonic cover art failed for %s", resolved_id, exc_info=True)
         return _placeholder_art(_PLACEHOLDER_SHORT_MAX_AGE, large=large_ph)
-    return _placeholder_art(_placeholder_ttl(store, resolved_id), large=large_ph)
+    return await _online_cover_art(store, resolved_id, bucket, large_ph)
+
+
+async def _online_cover_art(store, track_id: str, bucket: str, large_ph: bool) -> Response:
+    """For a track with no cover of its own: its stored online cover
+    (api/art.py ``online_cover_for``; cached an hour, as the track's own cover
+    takes over once it has one), else the placeholder — short-lived while an
+    online cover can still turn up (its lookup under way, waiting, or cut
+    short)."""
+    from soniqboom.api.art import online_cover_for
+    data, may_come = await online_cover_for(track_id, bucket)
+    if data:
+        return Response(content=data, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=3600"})
+    ttl = _PLACEHOLDER_SHORT_MAX_AGE if may_come else _placeholder_ttl(store, track_id)
+    return _placeholder_art(ttl, large=large_ph)
 
 
 # Ids a client may legitimately ask art for: track ids (uuid5, ``~<n>`` for

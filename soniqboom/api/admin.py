@@ -35,6 +35,7 @@ from soniqboom.core.data import (
     upsert_scan_dir,
 )
 from soniqboom.core import folder_album as _folder_album
+from soniqboom.core import online_cover
 from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
@@ -173,18 +174,19 @@ async def admin_scene_refresh(_tok: str = Depends(_require_token)):
     if not st.get("error") and scene_metadata.has_index():
         from soniqboom.core import scanner
         scanner._spawn_scene_autoapply()
-        _spawn_catalogue_tune_counts()
+        _spawn_catalogue_refill()
     return st
 
 
-def _spawn_catalogue_tune_counts() -> None:
-    """The Modland catalogue's unplayed tunes take their tune counts from a
-    new checksum list / song database / HVSC (``refill_tune_counts``)."""
+def _spawn_catalogue_refill() -> None:
+    """The Modland catalogue's unplayed tunes take their checksums, tune
+    counts and lengths from a new checksum list / song database / HVSC
+    (``modland_catalog.refill_unplayed``)."""
     try:
         from soniqboom.core import modland_catalog
         if modland_catalog.enabled():
             _t = asyncio.create_task(modland_catalog._refill_quietly(),
-                                     name="modland-catalog.tune-counts")
+                                     name="modland-catalog.refill")
             _BG_TASKS.add(_t)
             _t.add_done_callback(_BG_TASKS.discard)
     except Exception:                                   # noqa: BLE001
@@ -445,7 +447,7 @@ async def admin_songdb_refresh(_tok: str = Depends(_require_token)):
         from soniqboom.core import scanner
         scanner._spawn_scene_autoapply()
     if not st.get("error") and songdb.has_index():
-        _spawn_catalogue_tune_counts()
+        _spawn_catalogue_refill()
     return st
 
 
@@ -3357,15 +3359,19 @@ async def disk_usage(_tok: str = Depends(_require_token)):
 
 # ── Cache management ─────────────────────────────────────────────────────────
 
-def _purge_art_dir() -> tuple[int, list[str]]:
+def _purge_art_dir(*, keep_online: bool = False) -> tuple[int, list[str]]:
     """Recursively unlink every file in the on-disk art cache directory.
 
     Returns ``(removed_count, error_samples)``.  Continues on individual
     ``unlink`` failures so one locked/permission-denied file doesn't abort the
     whole clear.  Shared by the clear-art endpoint and the ``use_folder_art``
-    settings change (both need a full art re-evaluation on next request)."""
+    settings change (both need a full art re-evaluation on next request).
+    ``keep_online``: the online covers (``online/``, core/online_cover.py)
+    stay — they depend on no setting of the tracks' own covers; otherwise
+    they go too and what the server holds of them in memory is forgotten."""
     from soniqboom.config import get_art_cache_dir
     art_dir = get_art_cache_dir()
+    online_dir = os.path.join(str(art_dir), "online")
     count = 0
     errors: list[str] = []
 
@@ -3388,13 +3394,19 @@ def _purge_art_dir() -> tuple[int, list[str]]:
                                     f"{entry.name}: {exc.strerror or 'error'}"
                                 )
                         elif entry.is_dir(follow_symlinks=False):
+                            if keep_online and entry.path == online_dir:
+                                continue
                             _scan_and_unlink(entry.path)
                     except OSError:
                         continue
         except (PermissionError, FileNotFoundError, OSError):
             return
 
+    if not keep_online:
+        online_cover.forget_all()               # (queued lookups too: they would store into the gap)
     _scan_and_unlink(str(art_dir))
+    if not keep_online:
+        online_cover.forget_all()               # (an answer noted while the files went)
     return count, errors
 
 
@@ -3849,6 +3861,9 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # through (0 = off) — core/skip_rules.py.
         "skip_short_tunes": _skip_short_secs(),
         "use_folder_art": await get_config("use_folder_art", True),
+        # Look up a cover online for tracks that have none of their own
+        # (core/online_cover.py).
+        "online_cover_lookup": await online_cover.setting_value(),
         # Sidebar folder-tree filter.  When True, ``/api/fstree/children``
         # drops subdirectories whose subtree contains zero indexed audio
         # tracks (e.g. photo dumps, build dirs, video-only folders
@@ -3972,6 +3987,8 @@ async def put_discogs(body: dict, _tok: str = Depends(_require_token)):
         raise HTTPException(409, f"SoniqBoom.conf couldn't be read, so nothing was saved: {exc}")
     if token:
         await asyncio.to_thread(nowplaying_art.forget_misses)
+        # (the library's online covers ask Discogs too: their "none" is asked again)
+        await asyncio.to_thread(online_cover.forget_misses)
     return _discogs_state()
 
 
@@ -4089,7 +4106,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                         else:
                             hvsc_download.apply_finished(res, job=job, **loaded_counts())
                     _t = asyncio.create_task(_apply_new_hvsc(), name="hvsc-apply")
-                    _spawn_catalogue_tune_counts()
+                    _spawn_catalogue_refill()
                     _BG_TASKS.add(_t)
                     _t.add_done_callback(_BG_TASKS.discard)
             except Exception:
@@ -4192,6 +4209,7 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
         "filter_duplicates" in body
         or "dedup_folders" in body
         or "use_folder_art" in body
+        or "online_cover_lookup" in body
         or "folder_art_names" in body
         or "hide_empty_folders" in body
     ):
@@ -4225,8 +4243,23 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             # on-screen covers now.  Gated on old!=new so an unrelated Save (which
             # always re-sends this field) doesn't needlessly drop all art.
             if new_val != old_val:
-                _purge_art_dir()
+                _purge_art_dir(keep_online=True)
                 get_store().clear_art_absent()
+                from soniqboom.api.library import _broadcast
+                await _broadcast({"event": "art_refresh"})
+        if "online_cover_lookup" in body:
+            new_val = _flag(body["online_cover_lookup"])
+            old_val = await online_cover.enabled()
+            await set_config(online_cover.SETTING, new_val)
+            # Read per cover request; on an actual change every client asks
+            # for its on-screen covers again (online covers go when it is
+            # switched off, and are looked up when it is switched on).
+            if new_val != old_val:
+                try:
+                    from soniqboom.core import cast_session
+                    cast_session.forget_artwork()
+                except Exception:               # noqa: BLE001 — cast is optional
+                    pass
                 from soniqboom.api.library import _broadcast
                 await _broadcast({"event": "art_refresh"})
         if "folder_art_names" in body:

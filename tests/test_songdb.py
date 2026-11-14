@@ -151,6 +151,50 @@ def test_default_tune_seconds(row, track, expect):
     assert songdb.default_tune_seconds(row, track) == expect
 
 
+def test_default_tune_seconds_takes_a_longer_stop():
+    row = (0, "600000,p")
+    assert songdb.default_tune_seconds(row, {}) is None             # past the uade stop
+    assert songdb.default_tune_seconds(row, {}, max_ms=songdb._MAX_TRACKER_LENGTH_MS) == 600.0
+    assert songdb.default_tune_seconds((0, "7200001,p"), {},
+                                       max_ms=songdb._MAX_TRACKER_LENGTH_MS) is None
+
+
+def _tracker(**kw):
+    t = {"id": "t", "path": "ftp://ftp.modland.com:/pub/modules/Protracker/x/a.mod",
+         "title": "a", "artist": "x", "album": "", "format": "ProTracker",
+         "genre": ["Tracker", "Module"], "file_md5": A + "0" * 20, "duration": 0.0, "mtime": 0}
+    t.update(kw)
+    return t
+
+
+@pytest.mark.parametrize("track,lengths,expect", [
+    # an unplayed tracker of an online collection: the database's exact-end length
+    (_tracker(), (0, "600000,p"), {"duration": 600.0}),
+    # … never a trimmed, looping or timed-out end, nor one of several tunes
+    (_tracker(), (0, "600000,p+s"), None),
+    (_tracker(), (0, "600000,l"), None),
+    (_tracker(), (0, "600000,t"), None),
+    (_tracker(), (0, "5000,p 6000,p"), None),
+    # a played one has its file's length; a length already there stays
+    (_tracker(mtime=1700000000.0), (0, "600000,p"), None),
+    (_tracker(duration=12.0), (0, "600000,p"), None),
+    # a scanned tracker has libopenmpt's length (or none) — not the database's
+    (_tracker(path="/music/a.mod"), (0, "600000,p"), None),
+    # a uade module keeps its own rule: the stop, and the render revision
+    (_tracker(genre=["Amiga", "Module"]), (0, "600000,p"), None),
+    (_tracker(genre=["Amiga", "Module"]), (0, "95000,p"), "uade"),
+])
+def test_length_of_an_unplayed_collection_tracker(track, lengths, expect, monkeypatch):
+    from soniqboom.core import catalogue
+    from soniqboom.core.conversion_cache import _RENDER_REVS
+    monkeypatch.setattr(catalogue, "is_catalogue_path",
+                        lambda p: str(p or "").startswith("ftp://ftp.modland.com:"))
+    got = songdb.patch_for(track, key=A, meta=None, lengths=lengths, withdraw_ok=False)
+    if expect == "uade":
+        expect = {"duration": 95.0, "duration_rev": int(_RENDER_REVS["uade"])}
+    assert got == expect
+
+
 def test_build_rejects_implausible_input(tmp_path, monkeypatch):
     monkeypatch.setattr(songdb, "_MIN_META_ROWS", 10)
     monkeypatch.setattr(songdb, "_MIN_LENGTH_ROWS", 1)

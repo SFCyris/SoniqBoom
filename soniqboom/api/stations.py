@@ -199,7 +199,61 @@ async def del_favorite(sid: str, uid: str = Depends(listener_uid)):
 
 # ── Relay ─────────────────────────────────────────────────────────────────────
 
+# What each station last said it plays (``radio_meta``) and the cover found
+# for exactly that title (``radio_art``), by sid: a station tells only at a
+# change of song, so a listener who tunes in between two changes — or whose
+# socket was away for one — asks for it (``GET /stations/now/{sid}``).
+_NOW_MAX = 256
+_NOW_ART_KEYS = ("cover_url", "album", "year", "label", "source")
+_now_playing: dict[str, dict] = {}
+
+
+def _note_now(payload: dict) -> None:
+    sid, title = payload.get("sid"), payload.get("title") or ""
+    if not sid or not title:
+        return
+    event = payload.get("event")
+    cur = _now_playing.get(sid)
+    if event == "radio_meta":
+        art = (cur or {}).get("art") if cur and cur.get("title") == title else None
+        _now_playing.pop(sid, None)             # (re-inserted: the newest last)
+        _now_playing[sid] = {
+            "station": payload.get("station") or "", "title": title,
+            "artist": payload.get("artist") or "", "song": payload.get("song") or "",
+            "art": art,
+        }
+        while len(_now_playing) > _NOW_MAX:
+            _now_playing.pop(next(iter(_now_playing)))
+    elif event == "radio_art" and cur and cur.get("title") == title:
+        # (A cover that lands after the song changed is of no song playing.)
+        cur["art"] = {k: payload.get(k) for k in _NOW_ART_KEYS}
+
+
+def _station_live(sid: str) -> bool:
+    """Whether a relay of the station (any of its streams) is running."""
+    pre = f"{sid}#"
+    return any(k.startswith(pre) and k[len(pre):].isdigit() and h.alive
+               for k, h in list(_hub_registry._hubs.items()))
+
+
+@router.get("/now/{sid:path}")
+async def now_playing(sid: str):
+    """What the station plays now, as its relay last told every client
+    (``radio_meta``; ``cover_url`` … of a ``radio_art`` for that same title,
+    else none) — ``title`` is empty for a station no relay is running for and
+    for one that has not said."""
+    cur = _now_playing.get(sid) if _station_live(sid) else None
+    if not cur:
+        return {"sid": sid, "station": "", "title": "", "artist": "", "song": "",
+                "cover_url": None}
+    out = {"sid": sid, **{k: cur[k] for k in ("station", "title", "artist", "song")},
+           "cover_url": None}
+    out.update(cur.get("art") or {})
+    return out
+
+
 async def _broadcast_meta(payload: dict) -> None:
+    _note_now(payload)
     # Reuse the library WebSocket every client is already connected to.
     from soniqboom.api.library import _broadcast
     try:
@@ -1172,6 +1226,10 @@ async def relay(sid: str, v: int = 0, *, as_file: bool = False,
                 radiodir.report_click(stream["uuid"]))
             _bg_tasks.add(_t)
             _t.add_done_callback(_bg_tasks.discard)
+        if not _station_live(sid):
+            # A relay that starts says its title anew: what an earlier one
+            # last said is no longer known to be playing.
+            _now_playing.pop(sid, None)
         hub = StationHub(
             key,
             lambda set_info: _producer_with_reconnect(stream, st, set_info),

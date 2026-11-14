@@ -38,6 +38,95 @@ export function lazyArt(img, src) {
   img.src = src;
 }
 
+// [m-art:begin] — tests/js/mobile_art_again.test.mjs runs this region as is
+// ── Covers that change after they were asked ────────────────────────────────
+// ``art_ready``: the server now has a cover for a track it had none for when
+// its row was painted (a network share's cover fetched in the background, a
+// cover looked up online).  ``art_refresh``: a cover setting changed, so any
+// cover may differ.  app.js passes both to ``noteArtChanged``; the art slots
+// showing that track then ask again — past the browser's remembered "no
+// cover", hence the ``_t`` — and so does every slot painted for it later
+// (``freshArt``).  A slot is a placeholder span plus the cover <img>, and
+// records the URL it asked as ``__artSrc`` (list rows: on the row).
+const _artAgain = new Map();      // track id → token
+let _artEpoch = 0;                // token of every other track (0: none)
+const _ART_AGAIN_MAX = 5000;
+const _ART_URL = /^\/api\/art\/([^/?#]+)/;
+
+/** ``src`` as an art slot asks it: the ``/api/art/<id>…`` URL of a track whose
+ *  cover changed since the page loaded carries that change's token. */
+export function freshArt(src) {
+  const m = typeof src === 'string' ? _ART_URL.exec(src) : null;
+  if (!m) return src;
+  const bare = src.replace(/[?&]_t=\d+$/, '');
+  const t = _artAgain.get(m[1]) || _artEpoch;
+  return t ? `${bare}${bare.includes('?') ? '&' : '?'}_t=${t}` : bare;
+}
+
+/** The cover of track ``id`` changed (no id: any cover may have).  Sends
+ *  'soniqboom:art-changed' with ``detail.id`` (null: all) on the document. */
+export function noteArtChanged(id, now = Date.now()) {
+  if (id) {
+    if (_artAgain.size >= _ART_AGAIN_MAX && !_artAgain.has(id)) _artAgain.clear();
+    _artAgain.set(id, Math.max(now, (_artAgain.get(id) || _artEpoch) + 1));
+  } else {
+    _artAgain.clear();
+    _artEpoch = Math.max(now, _artEpoch + 1);
+  }
+  document.dispatchEvent(new CustomEvent('soniqboom:art-changed', { detail: { id: id || null } }));
+}
+
+/** A change may have been missed (the socket was away): the slots that show
+ *  no cover ask again — 'soniqboom:art-changed' with ``detail.missing``. */
+export function noteArtMissed(now = Date.now()) {
+  document.dispatchEvent(new CustomEvent('soniqboom:art-changed', { detail: { id: null, missing: now } }));
+}
+
+/** Ask ``src`` for the art slot ``art``: with the <img> it has, else a new
+ *  one that fades in once decoded and leaves again on "no cover". */
+export function askArt(art, src) {
+  let img = art.querySelector('img');
+  if (!img) {
+    img = new Image();
+    img.alt = '';
+    img.decoding = 'async';
+    img.onload  = () => img.classList.add('loaded');
+    img.onerror = () => img.remove();
+    art.appendChild(img);
+  }
+  img.classList.remove('loaded');
+  img.src = src;
+}
+
+/** Ask the cover of the slot ``art`` again when it shows track ``id`` (any
+ *  track without an id).  ``holder`` carries the slot's ``__artSrc``.
+ *  ``missing`` (a token): only a slot that shows no cover, under that token.
+ *  True when it was asked. */
+export function reaskArt(holder, art, id, missing = 0) {
+  const was = holder && holder.__artSrc;
+  const m = typeof was === 'string' ? _ART_URL.exec(was) : null;
+  if (!m || !art || (id && m[1] !== id)) return false;
+  if (missing) {
+    if (art.querySelector('img.loaded')) return false;
+    if (_artAgain.size >= _ART_AGAIN_MAX && !_artAgain.has(m[1])) _artAgain.clear();
+    _artAgain.set(m[1], Math.max(missing, (_artAgain.get(m[1]) || _artEpoch) + 1));
+  }
+  holder.__artSrc = freshArt(was);
+  askArt(art, holder.__artSrc);
+  return true;
+}
+
+// Every track row on the page (the lists, search, the queue).
+document.addEventListener('soniqboom:art-changed', (e) => {
+  const d = (e && e.detail) || {};
+  const id = d.id || null;
+  const sel = id ? `[data-track-id="${(window.CSS && CSS.escape) ? CSS.escape(id) : id}"]` : '[data-track-id]';
+  document.querySelectorAll(`.m-row${sel}`).forEach((row) => {
+    reaskArt(row, row.querySelector('.m-row-art'), id, d.missing);
+  });
+});
+// [m-art:end]
+
 // A playback problem reported / cleared (health.js): rows built here (search
 // results, the queue) repaint their badge in place.
 document.addEventListener('soniqboom:health-changed', (e) => {
@@ -89,7 +178,8 @@ export function buildTrackRow(track, opts = {}) {
   const ph = document.createElement('span');
   ph.textContent = artPlaceholderEmoji(track);
   art.appendChild(ph);
-  const artSrc = staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : null);
+  const artSrc = freshArt(staticArtUrl(track.cover_art) || (track.id ? `/api/art/${track.id}/sm.jpg?fallback=none` : null));
+  row.__artSrc = artSrc;      // (asked again when the cover changes — see freshArt)
   if (artSrc) {
     const img = new Image();
     img.alt = '';

@@ -3863,6 +3863,9 @@ function connectWS() {
     // we missed while disconnected.
     if (window.__sbWsConnectedBefore) _rebustMissingArt();
     window.__sbWsConnectedBefore = true;
+    // A station's song is told only when it changes: the stations module asks
+    // for the one playing (a change may have passed while the socket was away).
+    window.dispatchEvent(new CustomEvent('sb:socket-open'));
   };
 }
 

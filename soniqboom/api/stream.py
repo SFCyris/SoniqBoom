@@ -14392,7 +14392,7 @@ def catalogue_read_for_info(track_id: str, track, owner: str) -> None:
     intent — a play, the next-track prewarm, opening a tune's Track Info —
     never to decorate a list being scrolled (that would be one request per
     row).  What its indexes already tell (``modland_catalog.
-    refill_tune_counts``) is used without any fetch.  No-op for any other
+    refill_unplayed``) is used without any fetch.  No-op for any other
     path, a tune already read, a read running, an offline archive or a
     full download budget."""
     from soniqboom.core import catalogue

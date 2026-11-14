@@ -1562,6 +1562,10 @@
                 <input id="setting-folder-art-names" type="text" placeholder="cover.jpg,folder.jpg,front.jpg,album.jpg" autocomplete="off" spellcheck="false">
               </div>
               <div class="admin-setting">
+                <label for="setting-online-cover-lookup">Look up missing covers online <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="For a track with no embedded picture and no folder art, the album cover is looked up on MusicBrainz (Cover Art Archive) &mdash; and on Discogs when a token is saved &mdash; by the tagged artist and album, or artist and title when there is no album. A cover is shown only on an exact match. Covers are kept in SoniqBoom&rsquo;s image cache; your music files and folders are not changed. Chip and tracker music and online collections are not looked up.">&#9432;</span></label>
+                <input id="setting-online-cover-lookup" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
                 <label for="setting-sid-duration">SID duration (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fallback play length used only when HVSC has no entry for the tune. Tunes with HVSC data play their exact length instead.">&#9432;</span></label>
                 <input id="setting-sid-duration" type="number" min="30" max="600" step="10" value="180">
                 <div id="setting-sid-duration-hint"
@@ -1989,8 +1993,10 @@
             <p class="admin-hint" style="margin-bottom:8px">
               With a Discogs personal access token, the cover of the song a radio
               station is playing is looked up on Discogs first (after your own
-              library), then on MusicBrainz. Create a token while signed in to Discogs, on
-              its Developer Settings page (discogs.com/settings/developers).
+              library), then on MusicBrainz. Missing covers of library tracks are
+              looked up on MusicBrainz first, then on Discogs. Create a token while
+              signed in to Discogs, on its Developer Settings page
+              (discogs.com/settings/developers).
             </p>
             <div id="md-discogs-status" class="admin-hint" style="margin-bottom:8px"
                  role="status" aria-live="polite">Status: &mdash;</div>

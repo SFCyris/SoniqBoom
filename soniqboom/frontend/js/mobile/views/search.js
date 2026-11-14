@@ -30,7 +30,7 @@
  */
 import { Player } from '../../player.js';
 import { attachListGestures } from '../gestures.js';
-import { countNoun, esc, fmtDur, trackActions } from './_common.js';
+import { countNoun, esc, fmtDur, trackActions, freshArt } from './_common.js';
 import {
   SCOPES, FILTERS, FILTER_ORDER, FORMAT_FAMILIES, buildQuery, filterChips, normalizeFilters,
   rankBy, scopeLabel, scopeOf,
@@ -240,7 +240,7 @@ export function mountSearch(root, ctx) {
     const art = row.querySelector('.m-row-art');
     art.firstElementChild.textContent = artPlaceholderEmoji(t);
     const img = art.lastElementChild;
-    const src = staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : '');
+    const src = freshArt(staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : ''));
     if (row.__artSrc !== src) {
       row.__artSrc = src;
       img.classList.remove('loaded');

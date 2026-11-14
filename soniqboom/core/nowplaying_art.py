@@ -6,15 +6,16 @@
 Radio relays push the ICY ``StreamTitle`` (usually ``"Artist - Title"``).  We
 try to find a cover for it, in order:
 
-  0. **The user's own library** — exact, instant, private, no external call.
+  0. **The user's own library** — exact, private, no external call; only a
+     track whose cover is really there counts (``_local_cover``).
   1. **Discogs** — only when a token is configured (anonymous search 401s).
   2. **MusicBrainz + the Cover Art Archive** — free, no token; the workhorse.
 
 It is **confidence-gated** (the artist, and ideally the title, must match) so a
 wrong cover never replaces the station logo — when nothing confident is found
-the caller keeps showing the station image.  Results (hit *and* miss) are
-cached to disk so a repeated song is free and we stay well under the
-MusicBrainz 1 req/s limit.
+the caller keeps showing the station image.  What the external sources said
+(hit *and* miss) is cached to disk so a repeated song is free and we stay well
+under the MusicBrainz 1 req/s limit; the library is asked every time.
 
 This reuses ``artistinfo``'s MusicBrainz infrastructure (the shared rate gate,
 User-Agent, and JSON fetch) so radio lookups and artist-bio lookups share one
@@ -187,23 +188,52 @@ async def _fetch_image(url: str) -> bytes | None:
 
 # ── Source: local library ───────────────────────────────────────────────────
 
-def _local_match(artist: str, title: str) -> str | None:
-    """Return a track_id from the user's library whose artist AND title match
-    (normalised), or None.  Exact, instant, private — preferred over any
-    external lookup."""
+# How many matching tracks are asked for their cover before the library step
+# gives up (the same song is often there more than once: album, compilation).
+_LOCAL_TRIES = 4
+
+
+def _local_matches(artist: str, title: str) -> list[str]:
+    """Track ids from the user's library whose artist AND title match
+    (normalised) — those already known to hold a cover first.  A SID is only
+    among them when it holds one.  Exact, instant, private."""
     try:
         from soniqboom.core.store import get_store
         store = get_store()
         na, nt = _norm(artist), _norm(title)
+        known: list[str] = []
+        maybe: list[str] = []
         # Full-text search is in-memory + fast; cap the candidate set.
         for row in store.search(f"{artist} {title}", limit=25):
-            if _norm(row.get("artist", "")) == na and _norm(row.get("title", "")) == nt:
-                # Only useful if the track actually has art to serve.
-                if row.get("cover_art") or row.get("sid_md5") is None:
-                    return row.get("id")
-        return None
+            if _norm(row.get("artist", "")) != na or _norm(row.get("title", "")) != nt:
+                continue
+            tid = row.get("id")
+            if not tid:
+                continue
+            if row.get("cover_art"):
+                known.append(tid)
+            elif row.get("sid_md5") is None:
+                maybe.append(tid)             # its folder may hold the cover
+        return known + maybe
     except Exception:
+        return []
+
+
+async def _local_cover(artist: str, title: str) -> str | None:
+    """The first matching library track whose cover is really there (the
+    ``lg`` thumbnail the client will ask for), or None: a match without a
+    cover is no cover — the art route would answer its grey placeholder."""
+    tids = _local_matches(artist, title)[:_LOCAL_TRIES]
+    if not tids:
         return None
+    from soniqboom.api.art import cover_thumb
+    for tid in tids:
+        try:
+            if await cover_thumb(tid, "lg"):
+                return tid
+        except Exception:
+            continue
+    return None
 
 
 # ── Source: MusicBrainz + Cover Art Archive ─────────────────────────────────
@@ -371,16 +401,26 @@ async def lookup(artist: str, title: str) -> dict | None:
     """Resolve a cover + metadata for a now-playing (artist, title).
 
     Returns ``{cover_url, album, year, label, source}`` or None.  ``cover_url``
-    points at a locally-served image (``/api/art/<track_id>`` for a library hit,
-    ``/api/stations/nowplaying-art/<slug>`` for a fetched external cover) so the
-    browser never hotlinks the third party (no CORS, no IP leak)."""
+    points at a locally-served image (``/api/art/<track_id>/lg.jpg`` for a
+    library track whose cover is there, ``/api/stations/nowplaying-art/<slug>``
+    for a fetched external cover) so the browser never hotlinks the third party
+    (no CORS, no IP leak).  The library is asked first and every time; what the
+    external sources said is remembered (``_fetched``)."""
     if not artist or not title:
         return None
     key = _key(artist, title)
     if not key.strip("|"):
         return None
 
-    cached = _read_cache(key)
+    # 0. The user's own library — exact, private, and asked every time: the
+    # library changes (a track or its cover added or removed), so a hit is
+    # never remembered.
+    tid = await _local_cover(artist, title)
+    if tid:
+        return {"cover_url": f"/api/art/{tid}/lg.jpg", "album": "", "year": None,
+                "label": "", "source": "library"}
+
+    cached = _fetched(key)
     if cached is not None:
         return cached.get("result")
 
@@ -388,7 +428,7 @@ async def lookup(artist: str, title: str) -> dict | None:
         _locks.clear()                   # orphaned in-flight locks self-release
     lock = _locks.setdefault(key, asyncio.Lock())
     async with lock:
-        cached = _read_cache(key)         # double-check after acquiring
+        cached = _fetched(key)            # double-check after acquiring
         if cached is not None:
             return cached.get("result")
         result = await _resolve(artist, title)
@@ -399,13 +439,17 @@ async def lookup(artist: str, title: str) -> dict | None:
         return result
 
 
-async def _resolve(artist: str, title: str) -> dict | None:
-    # 0. Local library — exact, instant, private.
-    tid = _local_match(artist, title)
-    if tid:
-        return {"cover_url": f"/api/art/{tid}/lg.jpg", "album": "", "year": None,
-                "label": "", "source": "library"}
+def _fetched(key: str) -> dict | None:
+    """The remembered answer of the external sources for ``key``, or None.  A
+    library hit remembered by an earlier version is none: the library is asked
+    every time (``lookup``)."""
+    rec = _read_cache(key)
+    if rec is not None and ((rec.get("result") or {}).get("source") == "library"):
+        return None
+    return rec
 
+
+async def _resolve(artist: str, title: str) -> dict | None:
     # 1. Discogs (only if a token is configured), then 2. MusicBrainz/CAA —
     # never in offline mode (``netpolicy``).
     from soniqboom.core import netpolicy

@@ -132,6 +132,9 @@ CONFIG_TUNE_DETAILS = "modland_catalog_tune_details"
 TUNE_DETAILS = ("intent", "lists")
 # Bytes the index refreshes downloaded (full indexes + changelogs), in all.
 CONFIG_INDEX_BYTES = "modland_catalog_index_bytes"
+# Refreshes of Modland's checksum list (``scene_metadata``) still due after
+# an index refresh that found changes (``_checksums_follow``).
+CONFIG_CHECKSUMS_DUE = "modland_catalog_checksums_due"
 SCOPE_STANDARD = "standard"
 SCOPE_ALL = "all"
 SCOPES = (SCOPE_STANDARD, SCOPE_ALL)
@@ -196,6 +199,9 @@ _ARCHIVE_EXTS = (".zip", ".lha", ".lzh", ".7z", ".rar", ".lzx")
 _UPSERT_CHUNK = 250
 _DELETE_STEP = 100
 _SLICE_S = 0.008
+_REFILL_CHUNK = 250                 # field patches per store write (refill_unplayed)
+_REFILL_LENGTH_CHUNK = 32           # … of them with a length (the length-sorted index
+                                    # is re-ordered per row: a smaller write per slice)
 # The initial build's tracks: "Date added" sorts them as the oldest.
 _INITIAL_ADDED_AT = 1
 _INDEX_SCHEMA = 2                   # the sqlite index's layout (2: files.seen)
@@ -1757,7 +1763,8 @@ async def _delta_refresh() -> dict:
     nbytes = int(fetched.get("bytes") or 0)
     res.update(source="changelogs", changelogs=len(fetched.get("dates") or ()),
                downloaded=nbytes, moved=moved, index_added=done["added"],
-               index_deleted=done["deleted"], index_resized=done["resized"])
+               index_deleted=done["deleted"], index_resized=done["resized"],
+               index_updated=len(fetched.get("updated") or ()))
     log.info("Modland catalogue: updated from %d changelog(s) (%d bytes): %d added, "
              "%d removed, %d re-sized, %d moved in the index", res["changelogs"], nbytes,
              done["added"], done["deleted"], done["resized"], len(done["moved"]))
@@ -2205,6 +2212,26 @@ async def apply_index() -> dict:
                     if old is not None and old.get("file_size") == size and is_merged(old):
                         # Same file, new derivation rules: what its play read stays.
                         t = _rederive_merged(old, t)
+                    elif (old is not None and old.get("file_size") == size
+                          and old.get("file_md5")):
+                        # Same file, not played yet: the checksum Modland's list
+                        # gave it stays (``refill_unplayed``) with the length
+                        # and the album the song database joined on it (ahead
+                        # of a file-name album, as in ``songdb.patch_for``) —
+                        # the other fills joined on it ride the upsert
+                        # (``store._carry_enrichment``).
+                        t["file_md5"] = old["file_md5"]
+                        if (old.get("duration") or 0) > 0:
+                            t["duration"] = old["duration"]
+                            if old.get("duration_rev") is not None:
+                                t["duration_rev"] = old["duration_rev"]
+                        if (old.get("album_source") == "songdb"
+                                and (old.get("album") or "").strip()
+                                and (not (t.get("album") or "").strip()
+                                     or t.get("album_source") in ("folder",
+                                                                  "modland-filename"))):
+                            t["album"] = old["album"]
+                            t["album_source"] = "songdb"
                     return t
                 async for chunk in _slices(changed, _mk_changed):
                     store.upsert_tracks_batch(chunk)
@@ -2269,38 +2296,91 @@ def _hvsc_reconcile_soon() -> None:
         log.debug("HVSC user-data reconcile not scheduled", exc_info=True)
 
 
+_refill_busy = False                # a ``_refill_quietly`` run is going
+_refill_again = False               # … and was asked for again meanwhile
+
+
 async def _refill_quietly() -> None:
+    """``refill_unplayed``, one run at a time and never raising: a request
+    made while one runs has it run once more when it ends (its indexes may be
+    newer than the ones the running one read) and returns at once."""
+    global _refill_busy, _refill_again
+    if _refill_busy:
+        _refill_again = True
+        return
+    _refill_busy = True
     try:
-        await refill_tune_counts()
-    except Exception:                                   # noqa: BLE001
-        log.warning("Modland catalogue: tune counts not filled", exc_info=True)
+        while True:
+            _refill_again = False
+            try:
+                await refill_unplayed()
+            except Exception:                           # noqa: BLE001
+                log.warning("Modland catalogue: unplayed tunes not filled from the "
+                            "indexes", exc_info=True)
+            if not _refill_again:
+                break
+    finally:
+        _refill_busy = _refill_again = False
 
 
-def _tune_counts(rels: dict) -> dict:
-    """``rel → (tune count, first tune)`` of the catalogue files ``rels``
-    (rel → is it an Amiga module) holding more than one tune, from what is
-    known WITHOUT fetching them: Modland's checksum list (the scene index,
-    ``scene_metadata``) joined with the song database's tune lengths (Amiga
-    modules) and HVSC's Songlengths (C64 SIDs).  Empty when
-    the checksum list isn't installed.  Blocking."""
+def _takes_checksum(rel: str, size, c64: bool) -> bool:
+    """Does a read of this catalogue file store its whole-file checksum
+    (``file_md5`` — ``metadata._wants_scene_md5`` of the name ``_merge``
+    reads it under, within the size the extractor hashes; ``c64``: the row
+    has the C64 genre — its ``.sid`` is read with a ``sid_md5`` instead)?  A
+    row stamped with one its play would not store would lose it, and what
+    was joined on it, on that play."""
+    from soniqboom.core import metadata
+    try:
+        if int(size or 0) > metadata._SCENE_MD5_MAX:
+            return False
+    except (TypeError, ValueError):
+        return False
+    name = rel.rsplit("/", 1)[-1]
+    tok = folder_player_token(rel)
+    if tok:
+        name = f"{tok}.{os.path.splitext(name)[0]}"
+    return metadata._wants_scene_md5(os.path.splitext(name)[1].lower(), name,
+                                     {"sid_md5": ""} if c64 else {})
+
+
+def _index_facts(want: dict) -> tuple[dict, dict, dict]:
+    """What is known of the unplayed catalogue files ``want`` (rel → ``(track
+    id, Amiga module, C64 SID, tunes counted, size)``) WITHOUT fetching them,
+    from Modland's checksum list (the scene index, ``scene_metadata``):
+
+    * ``rel → md5`` — the whole-file checksum of every file a play stores
+      one for (``_takes_checksum``), the key the song database joins on;
+    * ``rel → (tune count, first tune)`` of the counted files holding more
+      than one tune — the song database's tune lengths (Amiga modules) and
+      HVSC's Songlengths (C64 SIDs);
+    * ``rel → [tune lengths]`` of the ``HVSC/`` SIDs HVSC's Songlengths list.
+
+    All empty when the checksum list isn't installed.  Blocking."""
     from soniqboom.core import scene_metadata as sm, songdb
-    out: dict = {}
-    if not rels or not sm.has_index():
-        return out
+    stamps: dict = {}
+    counts: dict = {}
+    sid_lens: dict = {}
+    if not want or not sm.has_index():
+        return stamps, counts, sid_lens
     md5s: dict = {}
     con = sm._connect_ro(sm._db_path())
     try:
         for md5, path in con.execute("SELECT md5, path FROM mods"):
-            if path in rels:
-                md5s[path] = (md5 or "").lower()
+            if md5 and path in want:
+                md5s[path] = md5.lower()
     finally:
         con.close()
     if not md5s:
-        return out
+        return stamps, counts, sid_lens
+    for rel, md5 in md5s.items():
+        _tid, _amiga, c64, _counted, size = want[rel]
+        if _takes_checksum(rel, size, c64):
+            stamps[rel] = md5
     if songdb.has_index():
         by_key: dict = {}
         for rel, md5 in md5s.items():
-            if md5 and not rel.startswith("HVSC/"):
+            if want[rel][3] and not rel.startswith("HVSC/"):
                 by_key.setdefault(md5[:12], []).append(rel)
         keys = list(by_key)
         scon = songdb._connect_ro(songdb._db_path())
@@ -2313,7 +2393,7 @@ def _tune_counts(rels: dict) -> dict:
                     n = len((subs or "").split())
                     if n > 1:
                         for rel in by_key.get(key, ()):
-                            out[rel] = (n, int(minsub or 0))
+                            counts[rel] = (n, int(minsub or 0))
         finally:
             scon.close()
     try:
@@ -2321,22 +2401,66 @@ def _tune_counts(rels: dict) -> dict:
         hv = get_hvsc()
         if hv.is_configured():
             for rel, md5 in md5s.items():
-                if rel.startswith("HVSC/") and md5:
-                    n = len(hv.lookup_durations_by_md5(md5))
-                    if n > 1:
-                        out[rel] = (n, 1)
+                if rel.startswith("HVSC/") and want[rel][3]:
+                    lens = [float(x) for x in hv.lookup_durations_by_md5(md5) if x]
+                    if lens:
+                        sid_lens[rel] = lens
+                    if len(lens) > 1:
+                        counts[rel] = (len(lens), 1)
     except Exception:                                   # noqa: BLE001
-        log.debug("HVSC tune counts unavailable", exc_info=True)
-    return out
+        log.debug("HVSC tune lengths unavailable", exc_info=True)
+    return stamps, counts, sid_lens
 
 
-async def refill_tune_counts() -> int:
-    """Give the unplayed catalogue tunes their tune count (the list's "N
-    tunes" badge, the Track Info tune list) from ``_tune_counts`` — before
-    a play, as a scanned file has it.  Run after a build / refresh, at start
-    and when the checksum list, song database or HVSC changes.  Returns the
+def _unplayed_patch(t: dict, rel: str, amiga: bool, stamp, count, lens, reg) -> dict:
+    """The fields ``_index_facts`` gives the unplayed row ``t`` (as it is
+    now) and it doesn't hold yet — with a new checksum, the playback-problem
+    mark the registry ``reg`` holds for that file."""
+    patch: dict = {}
+    if stamp and t.get("file_md5") != stamp:
+        patch["file_md5"] = stamp
+        if reg and not t.get("health"):
+            # A playback-problem mark made on this file (its checksum) while
+            # the row was in the library before: back with the checksum, as
+            # on a row added with one (``store._restore_mark``).
+            from soniqboom.core import skip_rules
+            probe = {"id": t.get("id"), "file_md5": stamp, "sid_md5": t.get("sid_md5")}
+            if skip_rules.restore(reg, probe):
+                patch.update({f: probe[f] for f in skip_rules.HEALTH_FIELDS if f in probe})
+    if count:
+        n, first = count
+        if t.get("subsongs") != n:
+            patch["subsongs"] = n
+        # uade numbers a module's tunes from its first subsong (``-g`` "min").
+        if amiga and first > 0 and t.get("subsong_base") != first:
+            patch["subsong_base"] = first
+    if lens:
+        # HVSC's lengths, as an unplayed tune of the online HVSC collection
+        # has them (``online_hvsc.build_track``): the first tune's is the
+        # row's until a play reads the SID's own default tune.
+        had = list(t.get("hvsc_lengths") or [])
+        if had != lens:
+            patch["hvsc_lengths"] = lens
+        dur = t.get("duration") or 0
+        if (not dur > 0 or (had and dur == had[0])) and dur != lens[0]:
+            patch["duration"] = lens[0]
+    return patch
+
+
+async def refill_unplayed() -> int:
+    """Give the unplayed catalogue tunes what the installed indexes know of
+    them (``_index_facts``) — before a play, as a scanned file has it, and
+    without fetching any of them: the whole-file checksum (``file_md5``, so
+    the song database's pass fills artist / label / game / year / length —
+    ``songdb.patch_for``; that pass is scheduled when a checksum was
+    written), the tune count (the list's "N tunes" badge, the Track Info
+    tune list) and a C64 SID's HVSC lengths.  Run after a build / refresh,
+    at start and when the checksum list, song database or HVSC changes; a
+    second run over unchanged indexes writes nothing.  A run that wrote
+    tells the open pages once (``scanner.announce_after_enrichment``: a
+    ``catalogue_changed`` after the song database's pass).  Returns the
     number of tunes updated."""
-    from soniqboom.core import uade_formats
+    from soniqboom.core import skip_rules, uade_formats
     store = _store()
     if not enabled():
         return 0
@@ -2352,37 +2476,72 @@ async def refill_tune_counts() -> int:
         if not t or is_merged(t):
             continue                        # a played tune has what the file says
         rel = t["path"][cut:]
-        amiga = (t.get("genre") or [None])[0] == "Amiga"
-        # Only kinds a scan counts the tunes of (uade modules, SIDs) — a
-        # tracker's count would vanish on its first play, as a scanned
-        # tracker shows none.
-        if not (amiga or rel.startswith("HVSC/")):
-            continue
-        if uade_formats.coso_bank_for(rel):
-            continue                        # (its tunes are counted from the song on its first play)
-        want[rel] = (amiga, tid, t.get("subsongs"), t.get("subsong_base"))
+        genre = t.get("genre") or ()
+        amiga = bool(genre) and genre[0] == "Amiga"
+        # Tunes are counted only for the kinds a scan counts them of (uade
+        # modules, SIDs) — a tracker's count would vanish on its first play,
+        # as a scanned tracker shows none — and not for a Hippel COSO song
+        # (counted from the song on its first play).
+        counted = ((amiga or rel.startswith("HVSC/"))
+                   and not uade_formats.coso_bank_for(rel))
+        want[rel] = (tid, amiga, "C64" in genre, counted, t.get("file_size"))
     if not want:
         return 0
     loop = asyncio.get_running_loop()
-    counts = await loop.run_in_executor(None, _tune_counts, want)
-    items = []
-    for rel, (n, first) in counts.items():
-        amiga, tid, have, base = want[rel]
-        patch = {}
-        if have != n:
-            patch["subsongs"] = n
-        # uade numbers a module's tunes from its first subsong (``-g`` "min").
-        if amiga and first > 0 and base != first:
-            patch["subsong_base"] = first
+    stamps, counts, sid_lens = await loop.run_in_executor(None, _index_facts, want)
+    reg = store.get_config(skip_rules.REG_KEY) if stamps else None
+    updated = stamped = marks = lengths = 0
+    items: list = []
+    t0 = time.perf_counter()
+
+    def _flush() -> None:
+        nonlocal updated, items, lengths
+        if items:
+            updated += store.update_track_fields_batch(items)
+            items = []
+        lengths = 0
+    for rel in (stamps.keys() | counts.keys() | sid_lens.keys()):
+        if (len(items) >= _REFILL_CHUNK or lengths >= _REFILL_LENGTH_CHUNK
+                or time.perf_counter() - t0 >= _SLICE_S):
+            _flush()
+            await asyncio.sleep(0)
+            t0 = time.perf_counter()
+            if stamps:                      # (a mark cleared meanwhile stays cleared)
+                reg = store.get_config(skip_rules.REG_KEY)
+        tid, amiga = want[rel][0], want[rel][1]
+        t = store._tracks.get(tid)
+        if not t or is_merged(t):
+            continue                        # played meanwhile
+        patch = _unplayed_patch(t, rel, amiga, stamps.get(rel), counts.get(rel),
+                                sid_lens.get(rel), reg)
         if patch:
             items.append((tid, patch))
-    for i in range(0, len(items), 2_000):
-        store.update_track_fields_batch(items[i:i + 2_000])
-        await asyncio.sleep(0)
-    if items:
-        log.info("Modland catalogue: tune counts for %d tunes (checksum list, song "
-                 "database, HVSC)", len(items))
-    return len(items)
+            stamped += "file_md5" in patch
+            marks += "health" in patch
+            lengths += "duration" in patch
+    _flush()
+    if marks:
+        skip_rules.bump()
+    if stamped:
+        # The checksum joins take the stamped tunes in: the song database's
+        # pass, and the library copies of the same file (``source_twins``).
+        try:
+            from soniqboom.core import scanner, source_twins
+            scanner._spawn_scene_autoapply()
+            source_twins.schedule()
+        except Exception:                               # noqa: BLE001
+            log.debug("scene enrichment not scheduled after the refill", exc_info=True)
+    if updated:
+        # Open pages re-read their view once: after the pass above when one
+        # is due (the joined fields come with it), now otherwise.
+        try:
+            from soniqboom.core import scanner
+            scanner.announce_after_enrichment(ROOT)
+        except Exception:                               # noqa: BLE001
+            log.debug("catalogue-changed not announced after the refill", exc_info=True)
+        log.info("Modland catalogue: %d unplayed tunes filled from the checksum list, "
+                 "song database and HVSC (%d checksums)", updated, stamped)
+    return updated
 
 
 async def _delete_sliced(store, ids: list, on_progress=None) -> int:
@@ -3207,12 +3366,18 @@ async def refresh(*, local_zip: Path | None = None, manual: bool = False) -> dic
     when they can do it (``_delta_refresh``), else by downloading the full
     index (``_full_refresh``).  A failed / implausible download keeps
     everything; a much smaller index refused before is taken on a manual
-    refresh (the status asked for that)."""
+    refresh (the status asked for that).  A refresh that ran lets an
+    installed checksum list follow (``_checksums_follow``)."""
     if not enabled():
         return {**status(), "error": "the Modland catalogue is off"}
     accept_shrink = bool(manual and _status.get("shrink_refused"))
+    got: dict = {}
 
     async def body():
+        res = got["res"] = await work()
+        return res
+
+    async def work():
         _check_no_conflict()
         _register_root()
         _start_refresh_loop()
@@ -3234,7 +3399,85 @@ async def refresh(*, local_zip: Path | None = None, manual: bool = False) -> dic
                                   accept_shrink=accept_shrink)
         _ensure_scan_dir()
         return res
-    return await _run_job("refresh", body)
+    st = await _run_job("refresh", body)
+    _checksums_follow(got.get("res"))
+    return st
+
+
+# What an index refresh's result counts of files that are new to the index or
+# no longer the file they were (a full index: not counted, taken as changed).
+_CHECKSUM_CHANGE_KEYS = ("added", "changed", "moved", "index_added", "index_resized",
+                         "index_updated")
+# Modland builds its checksum list some hours before the index of the same
+# night (their Last-Modified of 2026-11-14: 01:07 and 04:02 UTC), so the list
+# of the day a change shows up in the index may not hold it yet: the next list
+# is taken too.
+_CHECKSUM_REFRESHES = 2
+_checksums_task: asyncio.Task | None = None
+
+
+def _checksums_follow(res) -> None:
+    """After an index refresh that ran (``res``, its result): when it found
+    files new to the index or replaced, Modland's checksum list — if one is
+    installed; this never installs it — is refreshed too, now and at the
+    next refresh (``_CHECKSUM_REFRESHES``), each time only when the server
+    has another list than the installed one (``_refresh_checksums``).  The
+    count still due is kept in the library's settings, so a restart or a
+    failed download doesn't lose it."""
+    global _checksums_task
+    if not isinstance(res, dict) or not enabled():
+        return
+    try:
+        from soniqboom.core import scene_metadata as sm
+        if not sm.has_index():
+            return
+        store = _store()
+        if (res.get("source") == "full index"
+                or any(int(res.get(k) or 0) > 0 for k in _CHECKSUM_CHANGE_KEYS)):
+            if int(store.get_config(CONFIG_CHECKSUMS_DUE, 0) or 0) != _CHECKSUM_REFRESHES:
+                store.set_config(CONFIG_CHECKSUMS_DUE, _CHECKSUM_REFRESHES)
+        if int(store.get_config(CONFIG_CHECKSUMS_DUE, 0) or 0) <= 0:
+            return
+        if _checksums_task is not None and not _checksums_task.done():
+            return
+        _checksums_task = _spawn(_refresh_checksums(), "modland-catalog.checksums")
+    except Exception:                                   # noqa: BLE001
+        log.debug("Modland catalogue: checksum list refresh not started", exc_info=True)
+
+
+async def _refresh_checksums() -> bool:
+    """Bring the installed checksum list up to date (outside the job lock:
+    browsing and other jobs go on) and let what joins on it follow — the
+    library's scene pass and the unplayed tunes' fill (``refill_unplayed``).
+    Nothing is downloaded when the server still has the installed list, in
+    offline mode, or while another refresh of it runs; a refresh that did not
+    happen stays due.  True when a new list was installed."""
+    from soniqboom.core import scene_metadata as sm
+    loop = asyncio.get_running_loop()
+    try:
+        st = await loop.run_in_executor(None, lambda: sm.refresh_index(if_changed=True))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:                            # noqa: BLE001
+        log.info("Modland catalogue: checksum list not refreshed (%s)", exc)
+        return False
+    if st.get("error"):
+        log.info("Modland catalogue: checksum list not refreshed (%s)", st["error"])
+        return False
+    if st.get("unchanged"):
+        return False
+    store = _store()
+    left = max(0, int(store.get_config(CONFIG_CHECKSUMS_DUE, 0) or 0) - 1)
+    store.set_config(CONFIG_CHECKSUMS_DUE, left)
+    log.info("Modland catalogue: checksum list refreshed after the index (%d rows)",
+             int(st.get("index_rows") or 0))
+    try:
+        from soniqboom.core import scanner
+        scanner._spawn_scene_autoapply()
+    except Exception:                                   # noqa: BLE001
+        log.debug("scene enrichment not scheduled after the checksum list", exc_info=True)
+    await _refill_quietly()
+    return True
 
 
 async def _full_refresh(reason: str, moves: "dict[str, str] | None" = None, *,
@@ -3513,7 +3756,7 @@ async def startup() -> None:
             async def _counts():
                 await asyncio.sleep(30)
                 await _refill_quietly()
-            _spawn(_counts(), "modland-catalog.tune-counts")
+            _spawn(_counts(), "modland-catalog.refill")
         _start_refresh_loop()
     elif _has_tracks() or ROOT in store._scan_dirs:
         log.info("Modland catalogue: finishing an interrupted switch-off")
@@ -3583,13 +3826,26 @@ def merged_track(old: dict, meta: dict, local_stem: str) -> dict:
     if not d.get("format"):
         d["format"] = old.get("format") or format_for(rel)
     # A length measured by this play's render beats the extractor's
-    # placeholder (the catalogue row had none before).
-    if (old.get("duration") or 0) > 0 and not (d.get("duration") or 0) > 0:
+    # placeholder (the catalogue row had none before) — unless the row's
+    # length was joined on another file's checksum (``refill_unplayed``
+    # stamped the list's, and the file played is a different one): then the
+    # file's own reading stands and a render measures it.
+    same_file = not (old.get("file_md5") and d.get("file_md5")
+                     and old["file_md5"] != d["file_md5"])
+    if same_file and (old.get("duration") or 0) > 0 and (
+            not (d.get("duration") or 0) > 0
+            or (meta.get("duration") or 0) in (180, 180.0)):
         d["duration"] = old["duration"]
         d["duration_rev"] = old.get("duration_rev")
-    elif (old.get("duration") or 0) > 0 and (meta.get("duration") or 0) in (180, 180.0):
-        d["duration"] = old["duration"]
-        d["duration_rev"] = old.get("duration_rev")
+    if (old.get("album_source") == "songdb" and (old.get("album") or "").strip()
+            and not (d.get("album") or "").strip()
+            and old.get("file_md5") and old.get("file_md5") == d.get("file_md5")):
+        # The song database's album of this very file (joined before the play
+        # on the checksum of Modland's list — ``refill_unplayed``) stays, as
+        # on a rescan (``store._carry_enrichment``), ahead of the file-name
+        # album the path rule would put in its place.
+        d["album"] = old["album"]
+        d["album_source"] = "songdb"
     # The file's own author stays the artist, as for a scanned file
     # ("Steve Turner", not HVSC's folder "Turner Steve"); Modland's credit
     # fills an empty / placeholder one (``apply_path_fields``).

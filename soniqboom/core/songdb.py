@@ -31,6 +31,9 @@ EMPTY fields, never a field the user edited:
                    render-only format, no length until first played) when
                    the database's length ended where our renderer ends it
                    (the player's own song end); the first play re-measures it.
+                   An unplayed tracker module of an online collection
+                   takes it the same way (its row has no length of its own)
+                   until its first play reads the file.
 
 Artist and label have no provenance field of their own, so the names of the
 fields this pass filled are kept in ``songdb_fields``.  With the provenance a
@@ -115,6 +118,10 @@ _GOOD_ENDS = frozenset({"p"})
 # a Delta Music 2 song's), so a longer database length is never the length we
 # play.
 _MAX_LENGTH_MS = 511_000
+# An unplayed collection tracker's length (``_unplayed_collection_tracker``)
+# has no such stop; the cap only keeps a nonsense entry out (the longest
+# exact-end length of a Modland file in the 2026-11 database is under an hour).
+_MAX_TRACKER_LENGTH_MS = 2 * 3600 * 1000
 
 _status: dict = {
     "refreshing": False,
@@ -580,9 +587,28 @@ def _uade_served(t: dict) -> bool:
     return (t.get("path") or "").lower().endswith(".ahx")
 
 
-def default_tune_seconds(lengths: "tuple[int, str] | None", t: dict) -> float | None:
+def _unplayed_collection_tracker(t: dict) -> bool:
+    """A tracker module of an online collection (``core/catalogue``) nobody
+    has played yet: its row comes from the collection's index, so it has no
+    length of its own — a scanned tracker has libopenmpt's, and a played one
+    the length its file was read with."""
+    genre = t.get("genre") or []
+    if not ("Tracker" in genre and "Module" in genre):
+        return False
+    try:
+        if float(t.get("mtime") or 0) > 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    from soniqboom.core import catalogue
+    return catalogue.is_catalogue_path(t.get("path"))
+
+
+def default_tune_seconds(lengths: "tuple[int, str] | None", t: dict, *,
+                         max_ms: int = _MAX_LENGTH_MS) -> float | None:
     """Length in seconds of track ``t``'s tune from the database's
-    ``(first subsong, "len,end len,end …")`` row — or None.
+    ``(first subsong, "len,end len,end …")`` row — or None (``max_ms``: the
+    longest length taken).
 
     Only a one-tune file: SoniqBoom plays uade's own default tune ("cur"),
     which the database doesn't record, while its list starts at the first
@@ -603,9 +629,28 @@ def default_tune_seconds(lengths: "tuple[int, str] | None", t: dict) -> float | 
     if end not in _GOOD_ENDS or not ms.isdigit():
         return None
     ms_i = int(ms)
-    if not (0 < ms_i <= _MAX_LENGTH_MS):
+    if not (0 < ms_i <= max_ms):
         return None
     return round(ms_i / 1000.0, 2)
+
+
+def _album_back(t: dict) -> dict:
+    """The album patch withdrawing this pass's album from ``t``: the file
+    header's own game back (``folder_album.header_album_back``); else, on a
+    tune of an online collection, the game its collection path names
+    (``game_by_modland`` / ``game_by_modland_filename`` — the album its row
+    was built with, which no other pass puts back there); else empty."""
+    back = fa.header_album_back(t)
+    if back.get("album"):
+        return back
+    from soniqboom.core import catalogue
+    if catalogue.is_catalogue_path(t.get("path")):
+        for slot, src in (("game_by_modland", fa.SOURCE_MODLAND),
+                          ("game_by_modland_filename", fa.SOURCE_MODLAND_FILENAME)):
+            name = (t.get(slot) or "").strip()
+            if name:
+                return {"album": name, "album_source": src}
+    return back
 
 
 def patch_for(t: dict, *, key: str, meta: tuple | None,
@@ -659,7 +704,7 @@ def patch_for(t: dict, *, key: str, meta: tuple | None,
             if meta_known and album and cur != album:
                 upd["album"] = album
             elif meta_known and not album:
-                upd.update(fa.header_album_back(t))
+                upd.update(_album_back(t))
         elif album and (not cur or src in (fa.SOURCE_FOLDER, fa.SOURCE_MODLAND_FILENAME)):
             upd.update(album=album, album_source=SOURCE)
     # The song database's game name — recorded whether or not it is the album
@@ -686,6 +731,12 @@ def patch_for(t: dict, *, key: str, meta: tuple | None,
             from soniqboom.core.conversion_cache import _RENDER_REVS
             upd["duration"] = secs
             upd["duration_rev"] = int(_RENDER_REVS.get("uade", 0))
+    elif dur <= 0 and _unplayed_collection_tracker(t):
+        # Shown until the first play reads the file's own length (the
+        # database's tracker lengths are libopenmpt's, as ours are).
+        secs = default_tune_seconds(lengths, t, max_ms=_MAX_TRACKER_LENGTH_MS)
+        if secs:
+            upd["duration"] = secs
 
     if new_ours != ours:
         upd["songdb_fields"] = sorted(new_ours) or None
@@ -694,10 +745,11 @@ def patch_for(t: dict, *, key: str, meta: tuple | None,
 
 def reset_patch(t: dict) -> dict | None:
     """The patch that withdraws what this pass filled on ``t`` (at write time):
-    its album, year, artist and label — never a field the user edited."""
+    its album (``_album_back``), year, artist and label — never a field the
+    user edited."""
     upd: dict = {}
     if t.get("album_source") == SOURCE and not fa.album_edit_locked(t):
-        upd.update(fa.header_album_back(t))
+        upd.update(_album_back(t))
     if t.get("year_source") == SOURCE:
         upd.update(year=t.get("year_file"), year_source=None, year_file=None)
     ours = t.get("songdb_fields") or []
