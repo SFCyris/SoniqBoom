@@ -13,6 +13,13 @@
 # are not collected here; the release lists them in a package manifest.
 set -euo pipefail
 
+# No automatic maintenance or gc in the clones: git (2.49 and later) starts it
+# detached after a fetch, and it still writes in .git while the .git folders
+# are removed below ("rm: cannot remove …: Directory not empty").
+export GIT_CONFIG_COUNT=2 \
+    GIT_CONFIG_KEY_0=maintenance.auto GIT_CONFIG_VALUE_0=false \
+    GIT_CONFIG_KEY_1=gc.auto GIT_CONFIG_VALUE_1=0
+
 OUT="${1:?usage: $0 <out-dir>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DF="$ROOT/Dockerfile"
