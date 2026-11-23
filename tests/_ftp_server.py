@@ -28,7 +28,8 @@ class FtpServer:
                  abort_after: int | None = None, abort_retrs: int = 1,
                  password: str | None = None, max_conns: int | None = None,
                  welcome: str | None = None, mlsd: bool = True,
-                 mlsd_ascii_only: bool = False) -> None:
+                 mlsd_ascii_only: bool = False, oob_inline: bool = True,
+                 abor_silent: bool = False, mute_after_abort: bool = False) -> None:
         self.root = Path(root).resolve()
         self.rate = rate                 # bytes / s per transfer, None = unthrottled
         # 2: an interrupted RETR answers 426, then ABOR answers 226 (RFC 959);
@@ -42,6 +43,14 @@ class FtpServer:
         self.welcome = welcome           # extra greeting lines (a multi-line 220)
         self.mlsd = mlsd
         self.mlsd_ascii_only = mlsd_ascii_only   # refuse an MLSD sent in TYPE I
+        # False: urgent (OOB) data is not read inline, so the last byte of an
+        # ``ABOR`` sent with MSG_OOB (ftplib's ``abort``) never reaches the
+        # command reader and that ``ABOR`` goes unanswered until a later line
+        # ends it.
+        self.oob_inline = oob_inline
+        self.abor_silent = abor_silent   # never answer ABOR, in-band or not
+        # answer nothing more on a connection whose transfer the client cut short
+        self.mute_after_abort = mute_after_abort
         self.commands: Counter = Counter()
         self.conns = 0
         self.peak_conns = 0
@@ -56,7 +65,8 @@ class FtpServer:
         class Handler(socketserver.StreamRequestHandler):
             def setup(self):
                 super().setup()
-                self.request.setsockopt(socket.SOL_SOCKET, socket.SO_OOBINLINE, 1)
+                if server.oob_inline:
+                    self.request.setsockopt(socket.SOL_SOCKET, socket.SO_OOBINLINE, 1)
                 self.cwd = "/"
                 self.type = "A"
                 self.rest = 0
@@ -113,6 +123,10 @@ class FtpServer:
                     line = line.replace("�", "").strip()
                     cmd, _, arg = line.partition(" ")
                     cmd = cmd.upper()
+                    if aborted and server.mute_after_abort:
+                        with server._lock:
+                            server.commands["MUTED"] += 1
+                        continue
                     with server._lock:
                         server.commands[cmd] += 1
                     if cmd == "MLSD" and not server.mlsd:
@@ -236,6 +250,8 @@ class FtpServer:
                             aborted = True
                             if server.abor_replies == 2:
                                 self.reply("426 connection closed; transfer aborted")
+                    elif cmd == "ABOR" and server.abor_silent:
+                        aborted = False
                     elif cmd == "ABOR":
                         self.reply("226 abort successful" if aborted else "225 no transfer to abort")
                         aborted = False

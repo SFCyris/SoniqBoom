@@ -1620,6 +1620,82 @@ _FTP_MAX_PER_CONN = 40
 # ``_TypedFTP``.
 _FTP_TRUST_IDLE_S = 20.0
 
+# How an early-stopped ``RETR`` is ended, per (host, port), learnt at run time:
+#   "oob"    ``ABOR`` sent as urgent data (``ftplib.FTP.abort``, RFC 959), the default;
+#   "inband" ``ABOR`` sent as an ordinary command line;
+#   "close"  no ``ABOR``: the connection is closed and a new one logs in.
+# A server that loses the urgent byte (it never reads TCP urgent data
+# inline) never sees the end of that ``ABOR`` line and does not answer it, so
+# every stopped read waited out the socket timeout (15 s) and then burned the
+# connection: measured on the suite FTP server with ``oob_inline=False``,
+# 8 MP3 tags read in 30.4 s against 0.37 s, the same in 2.0.2–2.1.2.  An
+# ``ABOR`` unanswered within ``_FTP_ABORT_WAIT_S`` (or an urgent one answered
+# with a reply ``ftplib`` refuses) moves the server one step down; "close"
+# only after ``_FTP_ABORT_CLOSE_AFTER`` unanswered in-band stalls in a row —
+# misses of ABORs sent before the last counted one belong to that same stall
+# and count once — and "close" tries in-band again after
+# ``_FTP_ABORT_RETRY_S`` (a login per read is the costliest way to end one).
+_FTP_ABORT_WAIT_S = 5.0
+_FTP_ABORT_CLOSE_AFTER = 2
+_FTP_ABORT_RETRY_S = 1800.0
+_FTP_ABORT_MODE: "dict[tuple[str, int], str]" = {}
+_FTP_ABORT_MISSES: "dict[tuple[str, int], int]" = {}
+_FTP_ABORT_LAST_MISS: "dict[tuple[str, int], float]" = {}   # monotonic: last counted miss
+_FTP_ABORT_CLOSED_AT: "dict[tuple[str, int], float]" = {}   # monotonic: when "close" began
+_FTP_ABORT_LOCK = threading.Lock()
+
+
+def ftp_abort_mode(host: str, port: int) -> str:
+    """How an early-stopped transfer to ``host:port`` is ended ("oob",
+    "inband" or "close"; see ``_FTP_ABORT_MODE``).  A "close" older than
+    ``_FTP_ABORT_RETRY_S`` turns back into "inband"."""
+    key = (host, port)
+    mode = _FTP_ABORT_MODE.get(key, "oob")
+    if mode == "close":
+        with _FTP_ABORT_LOCK:
+            since = _FTP_ABORT_CLOSED_AT.get(key, 0.0)
+            if (_FTP_ABORT_MODE.get(key) == "close"
+                    and time.monotonic() - since >= _FTP_ABORT_RETRY_S):
+                _FTP_ABORT_MODE[key] = mode = "inband"
+                _FTP_ABORT_MISSES.pop(key, None)
+                _FTP_ABORT_CLOSED_AT.pop(key, None)
+                log.info("FTP %s:%s: trying in-band ABOR again", host, port)
+    return mode
+
+
+def _abort_answered(key: "tuple[str, int]") -> None:
+    """An in-band ``ABOR`` was answered: the miss count starts over."""
+    with _FTP_ABORT_LOCK:
+        _FTP_ABORT_MISSES.pop(key, None)
+
+
+def _abort_unanswered(key: "tuple[str, int]", mode: str, sent_at: float,
+                      *, refused: bool = False) -> None:
+    """An ``ABOR`` sent in ``mode`` at ``sent_at`` (monotonic) got no answer in
+    time (or, ``refused``, an urgent one got a reply ftplib rejects): step
+    down — only from the mode it was sent in, and only once per stall."""
+    with _FTP_ABORT_LOCK:
+        if _FTP_ABORT_MODE.get(key, "oob") != mode:
+            return                      # another miss of this stall already stepped
+        if mode == "inband":
+            if sent_at <= _FTP_ABORT_LAST_MISS.get(key, -1.0):
+                return                  # sent before the last counted miss: same stall
+            _FTP_ABORT_LAST_MISS[key] = time.monotonic()
+            n = _FTP_ABORT_MISSES.get(key, 0) + 1
+            _FTP_ABORT_MISSES[key] = n
+            if n < _FTP_ABORT_CLOSE_AFTER:
+                return
+        nxt = "inband" if mode == "oob" else "close"
+        _FTP_ABORT_MODE[key] = nxt
+        _FTP_ABORT_MISSES.pop(key, None)
+        if nxt == "close":
+            _FTP_ABORT_CLOSED_AT[key] = time.monotonic()
+    log.info("FTP %s:%s %s ABOR (%s)%s: early-stopped transfers now %s",
+             key[0], key[1], "refused an" if refused else "did not answer",
+             "urgent" if mode == "oob" else "in-band",
+             "" if refused else f" within {_FTP_ABORT_WAIT_S:.0f} s",
+             "send ABOR in-band" if nxt == "inband" else "close the connection")
+
 # How long ``pool.borrow()`` waits when the pool is at capacity before
 # raising TimeoutError.  Generous because under heavy scan load every
 # slot can be doing a multi-second download.  ``read_file`` 's retry loop
@@ -1730,11 +1806,36 @@ class _PooledFTP:
         on the connection by one (a ``SIZE`` read the previous command's
         answer; the next ``REST`` + ``RETR`` failed and burned the
         connection).  So: ``NOOP`` after the abort and read up to its 200,
-        skipping whatever the abort left behind — no timeout needed, it works
-        with servers that send one reply as well as two."""
+        skipping whatever the abort left behind — it works with servers that
+        send one reply as well as two.
+
+        How the ``ABOR`` is sent is learnt per server (``_FTP_ABORT_MODE``);
+        its answer is waited for ``_FTP_ABORT_WAIT_S`` at most, not the
+        connection's timeout.  In "close" mode, and whenever the exchange
+        fails, the connection is marked broken: the pool closes it."""
         ftp = self.conn
+        key = (getattr(ftp, "host", ""), getattr(ftp, "port", 0))
+        mode = ftp_abort_mode(*key)
+        if mode == "close":
+            self.mark_broken()
+            return
+        sock = getattr(ftp, "sock", None)
+        was = sock.gettimeout() if sock is not None else None
+        sent_at = time.monotonic()
         try:
-            ftp.abort()
+            if sock is not None:
+                sock.settimeout(_FTP_ABORT_WAIT_S)
+            if mode == "oob":
+                try:
+                    ftp.abort()
+                except ftplib.error_proto:
+                    # A first reply ftplib rejects (a 451 for the transfer …):
+                    # the in-band exchange below reads any reply.
+                    self.mark_broken()
+                    _abort_unanswered(key, mode, sent_at, refused=True)
+                    return
+            else:
+                ftp.putcmd("ABOR")
             ftp.putcmd("NOOP")
             for _ in range(4):
                 try:
@@ -1742,8 +1843,15 @@ class _PooledFTP:
                 except (ftplib.error_temp, ftplib.error_perm):
                     continue               # a late 4xx/5xx for the transfer
                 if resp.startswith("200"):
+                    if mode == "inband":
+                        _abort_answered(key)
+                    if sock is not None:
+                        sock.settimeout(was)
                     return
             self.mark_broken()
+        except TimeoutError:
+            self.mark_broken()
+            _abort_unanswered(key, mode, sent_at)
         except Exception:
             self.mark_broken()
 
