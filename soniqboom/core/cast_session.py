@@ -116,8 +116,8 @@ async def _resolve_and_cap_art(track_id: str) -> bytes | None:
     A track with no cover of its own gets its stored online cover; while one
     can still turn up (its lookup under way, waiting, or cut short),
     ``_ArtPending`` (so the miss is not remembered)."""
-    from soniqboom.api.art import _resolve_full_art, online_cover_for
-    raw, _mime = await _resolve_full_art(track_id)
+    from soniqboom.api.art import FOLDER_WAIT_S, _resolve_full_art, online_cover_for
+    raw, _mime = await _resolve_full_art(track_id, wait_folder=FOLDER_WAIT_S)
     if not raw:
         raw, may_come = await online_cover_for(track_id, "full")
         if may_come:

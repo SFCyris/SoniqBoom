@@ -4766,6 +4766,7 @@ async def get_cover_art(
         # Late import so subsonic.py stays loadable even if art.py has a
         # transient init error (we'd rather degrade art than crash routing).
         from soniqboom.api.art import (
+            FOLDER_WAIT_S,
             _resolve_full_art,
             _SIZE_MAP,
             _make_etag,
@@ -4783,7 +4784,7 @@ async def get_cover_art(
             thumb = await art_cache.get_art(resolved_id, bucket)
             if thumb:
                 return _art_response(thumb, "image/jpeg", etag)
-            full_data, _mime = await _resolve_full_art(resolved_id)
+            full_data, _mime = await _resolve_full_art(resolved_id, wait_folder=FOLDER_WAIT_S)
             if full_data:
                 # Resize ONLY the requested bucket, off the loop.  A fresh
                 # extraction already queued the full + both thumbs for the
@@ -4800,7 +4801,7 @@ async def get_cover_art(
                 return _art_response(data, "image/jpeg", None)
             return await _online_cover_art(store, resolved_id, bucket, large_ph)
 
-        full_data, mime = await _resolve_full_art(resolved_id)
+        full_data, mime = await _resolve_full_art(resolved_id, wait_folder=FOLDER_WAIT_S)
         if full_data:
             return _art_response(full_data, mime or "image/jpeg", etag)
     except Exception:              # noqa: BLE001 — e.g. a corrupt embedded image

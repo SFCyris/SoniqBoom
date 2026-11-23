@@ -7,6 +7,11 @@ Directory structure:
   <cache_dir>/sm/<id[:2]>/<id[2:4]>/<id>.jpg   -- 200px thumbnail
   <cache_dir>/lg/<id[:2]>/<id[2:4]>/<id>.jpg   -- 550px thumbnail
   <cache_dir>/full/<id[:2]>/<id[2:4]>/<id>.dat  -- original art bytes
+  <cache_dir>/src/<id[:2]>/<id[2:4]>/<id>.folder -- marker: the cover is a copy
+                                                 of the folder's image (2.1.2)
+A folder's shared cover is kept under the id ``folder:<…>`` (``api/art.
+_folder_cache_key``); online covers under ``online/`` (``core/online_cover``);
+which image each folder holds in ``folders-v1.json`` (``core/folder_art_index``).
 """
 from __future__ import annotations
 
@@ -140,8 +145,49 @@ def art_exists(track_id: str, size: str) -> bool:
 _ART_SIZES = ("sm", "lg", "full")
 
 
+# ── Where a track's cached cover came from ────────────────────────────────
+#
+# A track whose file has no picture shows its folder's image, cached under the
+# TRACK's id like any other cover.  When that image is replaced or removed,
+# those copies are stale (``api/art.refresh_changed_folders``) — but a cover
+# the file itself carries must stay.  So a cover copied from the folder image
+# gets an empty marker file beside the cache: ``src/<id[:2]>/<id[2:4]>/<id>.folder``.
+# Removed with the track's covers (``_delete_art_sync``) and by
+# ``unmark_from_folder`` when the track's own picture is cached.
+
+def _folder_mark_path(track_id: str) -> Path:
+    return get_art_cache_dir() / "src" / track_id[:2] / track_id[2:4] / f"{track_id}.folder"
+
+
+def mark_from_folder(track_id: str) -> None:
+    """(blocking) Note that ``track_id``'s cached cover is its folder's image."""
+    p = _folder_mark_path(track_id)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.touch()
+    except OSError as exc:
+        log.debug("folder mark of %s not written: %s", track_id, exc)
+
+
+def unmark_from_folder(track_id: str) -> None:
+    """(blocking) ``track_id``'s cached cover is its own (not the folder's)."""
+    try:
+        _folder_mark_path(track_id).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.debug("folder mark of %s not removed: %s", track_id, exc)
+
+
+def is_from_folder(track_id: str) -> bool:
+    """(blocking) Was ``track_id``'s cached cover copied from its folder's
+    image (and marked so — covers cached before 2.1.2 carry no mark)?"""
+    return _folder_mark_path(track_id).exists()
+
+
 def _delete_art_sync(track_id: str) -> int:
     """Remove every cached art variant for one track.  Returns bytes freed."""
+    unmark_from_folder(track_id)
     freed = 0
     for size in _ART_SIZES:
         p = _art_path(track_id, size)
@@ -158,6 +204,33 @@ async def delete_art(track_id: str) -> int:
     """Remove cached art (sm/lg/full) for a single track.  Returns bytes freed."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _delete_art_sync, track_id)
+
+
+def _delete_thumbs_sync(track_id: str) -> None:
+    for size in ("sm", "lg"):
+        try:
+            _art_path(track_id, size).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.debug("thumbnail of %s not removed: %s", track_id, exc)
+
+
+async def delete_thumbs_batch(track_ids: list[str]) -> None:
+    """Remove the sm / lg thumbnails (not the full cover) of many tracks —
+    for covers whose full image was just replaced; the thumbnails are made
+    again from it when asked for."""
+    if not track_ids:
+        return
+    loop = asyncio.get_event_loop()
+
+    def _chunk(ids: list[str]) -> None:
+        for tid in ids:
+            _delete_thumbs_sync(tid)
+    await asyncio.gather(*(
+        loop.run_in_executor(None, _chunk, track_ids[i : i + 256])
+        for i in range(0, len(track_ids), 256)
+    ))
 
 
 async def delete_art_batch(track_ids: list[str]) -> tuple[int, int]:

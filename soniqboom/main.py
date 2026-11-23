@@ -2296,6 +2296,21 @@ async def startup():
     load_all()
 
     _ss_phase("maintenance", "Running startup maintenance")
+    # Which image each folder holds (core/folder_art_index): read in a worker
+    # thread now, not by the first cover request on the event loop.
+    try:
+        from soniqboom.core import folder_art_index as _fai_boot
+        asyncio.get_running_loop().run_in_executor(None, _fai_boot.preload)
+    except Exception:                                   # noqa: BLE001
+        log.debug("folder image index not preloaded", exc_info=True)
+    # The folder state of remote shares from the last run (core/
+    # remote_dirstate): the first background check of a share after a
+    # restart is a fast walk instead of a full one.
+    try:
+        from soniqboom.core import remote_dirstate as _rds_boot
+        asyncio.get_running_loop().run_in_executor(None, _rds_boot.preload)
+    except Exception:                                   # noqa: BLE001
+        log.debug("remote folder state not preloaded", exc_info=True)
     # One-shot maintenance: purge ghost tracks created from AppleDouble (``._*``)
     # sidecars on FTP/SMB shares and repair titles that leaked from temp-file
     # basenames in older builds.  Idempotent; cheap on a healthy library.
@@ -3525,6 +3540,20 @@ async def shutdown():
         n = await asyncio.to_thread(_save_browse_cache, get_data_dir())
         log.info("Browse cache: re-persisted %d root(s) at shutdown", n)
     await _step("browse-cache", _persist_browse_cache(), timeout=10.0)
+
+    # Which image each folder holds (core/folder_art_index): its debounced
+    # writer may hold the last few seconds of changes.
+    async def _flush_folder_index() -> None:
+        from soniqboom.core import folder_art_index
+        await asyncio.to_thread(folder_art_index.flush)
+    await _step("folder-index", _flush_folder_index(), timeout=3.0)
+
+    # The folder state of remote shares (core/remote_dirstate): its debounced
+    # writer may hold the last walks.
+    async def _flush_remote_folders() -> None:
+        from soniqboom.core import remote_dirstate
+        await asyncio.to_thread(remote_dirstate.flush)
+    await _step("remote-folders", _flush_remote_folders(), timeout=5.0)
 
     # ── Step 4: Merger (3 s budget — interruptible since merger.py fix) ───
     async def _stop_merger() -> None:

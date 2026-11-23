@@ -55,7 +55,7 @@ def lib(w, monkeypatch):
         return 100.0
     monkeypatch.setattr(A, "_source_mtime_for_async", source_mtime)
 
-    async def resolve(tid):
+    async def resolve(tid, **_kw):         # (wait_folder: Subsonic / cast)
         L.resolved.append(tid)
         if tid in L.own:
             L.cached[tid] = 77.0                # (the real one caches what it found)
@@ -283,9 +283,14 @@ async def test_switched_off_the_online_cover_goes_and_comes_back(lib):
     assert len(lib.w.queries()) == 1
 
 
-async def test_a_network_share_track_goes_by_what_the_scan_saw(lib):
+async def test_a_network_share_track_goes_by_what_the_scan_saw(lib, tmp_path, monkeypatch):
+    from soniqboom.core import folder_art_index as fai
+    monkeypatch.setattr(fai, "_path", lambda: tmp_path / "folders.json")
+    fai._reset_for_tests()
     share = "smb://nas.invalid/Music:/Queen"
     lib.add("r1", path=f"{share}/Jazz/01.mp3")                       # no picture in the file
+    # … nor in its folder (the scan's folder-cover warm-up listed it)
+    fai.record(fai.key_for_path(f"{share}/Jazz/01.mp3"), None)
     lib.add("r2", path=f"{share}/Innuendo/01.mp3", album="Innuendo", cover_art="/api/art/r2")
     lib.unreadable.update({"r1", "r2"})         # (a share file's read leaves no mark here)
     a, b = await get("r1"), await get("r2")

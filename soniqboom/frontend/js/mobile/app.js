@@ -42,6 +42,14 @@ window.Toast = Toast;
 
 import { MobileRadio, paintStationArt, forgetStationArt } from './radio-player.js';
 import { freshArt, reaskArt, noteArtChanged, noteArtMissed } from './views/_common.js';
+import { forgetCover, forgetAllCovers } from '../cover_status.js';
+// A cover changed (art_ready: that track; art_refresh or a reconnect: any —
+// _common.js sends 'soniqboom:art-changed' for each): forget what the batched
+// cover status (cover_status.js) said, so list rows told "no cover" ask again.
+document.addEventListener('soniqboom:art-changed', (e) => {
+  const d = (e && e.detail) || {};
+  if (d.id && !d.missing) forgetCover(String(d.id)); else forgetAllCovers();
+});
 import { mountLibrary }    from './views/library.js';
 import { mountSearch }     from './views/search.js';
 import { mountRadio }      from './views/radio.js';

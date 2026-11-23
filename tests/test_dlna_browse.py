@@ -214,7 +214,7 @@ def test_cover_route_serves_a_shown_tracks_cover(store, monkeypatch, path, expec
     monkeypatch.setattr(catalogue, "is_catalogue_path", lambda p: str(p).endswith(".sid"))
     seen = []
 
-    async def thumb(tid, bucket, *, resolve=True):
+    async def thumb(tid, bucket, *, resolve=True, wait_folder=0.0):
         seen.append((tid, bucket, resolve))
         return b"\xff\xd8jpeg" if tid != "flac1" else None
     monkeypatch.setattr(art, "cover_thumb", thumb)

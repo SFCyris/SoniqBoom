@@ -3407,6 +3407,11 @@ def _purge_art_dir(*, keep_online: bool = False) -> tuple[int, list[str]]:
     _scan_and_unlink(str(art_dir))
     if not keep_online:
         online_cover.forget_all()               # (an answer noted while the files went)
+    # What each folder holds (core/folder_art_index) lives in the same folder
+    # and was just removed; forget it in memory too, so "this folder has no
+    # image" is found out again under the new rule.
+    from soniqboom.core import folder_art_index
+    folder_art_index.forget_all()
     return count, errors
 
 
@@ -3428,6 +3433,13 @@ async def clear_art_cache(_tok: str = Depends(_require_token)):
     # after a "clear image cache" until the next restart.  Clear it too so every
     # track is genuinely re-evaluated (embedded + folder art) on next request.
     get_store().clear_art_absent()
+    # Open pages remember which rows have no cover (``POST /api/art/status``,
+    # js/cover_status.js) and which covers they hold: they ask again.
+    try:
+        from soniqboom.api.library import _broadcast
+        await _broadcast({"event": "art_refresh"})
+    except Exception:                                   # noqa: BLE001
+        log.debug("art_refresh not sent", exc_info=True)
     out: dict = {"cleared": count, "path": str(art_dir)}
     if errors:
         out["failed"] = len(errors)
@@ -4286,8 +4298,15 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
             # unchanged shouldn't wipe every sentinel + storm a full re-eval.
             if csv != prev:
                 from soniqboom.api.art import purge_absent_sentinels
+                from soniqboom.core import folder_art_index
                 get_store().clear_art_absent()
                 purge_absent_sentinels()
+                # Which image each folder holds was recorded under the old
+                # names — forget it; list rows that were told "no cover"
+                # (``POST /api/art/status``) ask again.
+                folder_art_index.forget_all()
+                from soniqboom.api.library import _broadcast
+                await _broadcast({"event": "art_refresh"})
 
     # Log verbosity dials — applied LIVE (no restart) and persisted via config
     # so startup's ``log_control.apply_from_config`` restores them.  The

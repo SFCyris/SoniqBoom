@@ -1638,6 +1638,31 @@ def _in_failed_archive(path: str, failed: "set[str]") -> bool:
     return any("::".join(parts[:k]) in failed for k in range(1, len(parts)))
 
 
+def _note_folder_image(dirpath: str, filenames, priority: "list[str]", *,
+                       complete: bool, gen: int) -> None:
+    """Record the cover image of a walked local folder
+    (``core/folder_art_index``) from the file names the walk already has —
+    no extra listing.  ``complete`` False (a watcher scan lists only what
+    changed): only an image seen is recorded, never "none".  One ``stat``
+    for a folder that holds an image (its ``mtime`` is part of the cover
+    stamp, ``api/art._known_source_mtime``)."""
+    from soniqboom.core import folder_art_index as fai
+    from soniqboom.core.data import path_hash as _ph
+    if not priority:
+        return
+    name = fai.pick(filenames, priority)
+    if name is None and not complete:
+        return
+    mtime = None
+    if name is not None:
+        try:
+            mtime = os.stat(os.path.join(dirpath, name)).st_mtime
+        except OSError:
+            return                                  # listed but not readable: unknown
+    fai.record(fai.key_for_local_dir(dirpath), name, mtime=mtime,
+               dir_hash=_ph(dirpath), gen=gen)
+
+
 def _find_audio_files(directories: list[str], scan_zips: bool = True,
                       scope: "dict[str, frozenset[str]] | None" = None,
                       known_archives: "dict[str, tuple[float | None, list[str]]] | None" = None,
@@ -1665,6 +1690,13 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
         return is_supported_music_name(name)
 
     result: dict[str, list[Path]] = {}
+    # The folder cover names, read once for the whole walk (``_note_folder_image``).
+    from soniqboom.core import folder_art_index as _fai
+    try:
+        _folder_names = _fai.folder_image_names()
+    except Exception:                               # noqa: BLE001
+        _folder_names = []
+    _folder_gen = _fai.generation()
     # Roots for which os.walk hit a read error (permission denied, a
     # disconnected network mount, an I/O fault).  os.walk swallows these
     # silently and yields a PARTIAL (or empty) file list that is indistinguishable
@@ -1691,6 +1723,11 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
         _walk = (_scope_walk(_scoped, _on_walk_error, str(p)) if _scoped is not None
                  else os.walk(p, onerror=_on_walk_error))
         for dirpath, _dirs, filenames in _walk:
+            try:
+                _note_folder_image(dirpath, filenames, _folder_names,
+                                   complete=_scoped is None, gen=_folder_gen)
+            except Exception:                       # noqa: BLE001 — never fails a walk
+                log.debug("folder image not recorded for %s", dirpath, exc_info=True)
             for fn in filenames:
                 if _is_junk_filename(fn):
                     skipped_junk += 1
@@ -2523,6 +2560,25 @@ class _Isolated:
         return False
 
 
+def _scan_thumb(cover_data_uri: "str | None") -> "bytes | None":
+    """(worker process) The 200 px list thumbnail of an embedded cover, or
+    None.  Made during the scan of a LOCAL file (opportunity "A") so a list
+    row's first view is a cache hit instead of opening the file again — on a
+    folder mounted from a NAS that is a network read per row.  Only the small
+    size is kept: the player's larger sizes are still read from the file when
+    first asked for, which keeps the art cache about 15 KB per track."""
+    if not cover_data_uri or "," not in cover_data_uri:
+        return None
+    try:
+        import base64 as _b64
+        from soniqboom.core.metadata import resize_cover
+        raw = _b64.b64decode(cover_data_uri.split(",", 1)[1])
+        out = resize_cover(raw, 200) if raw else None
+        return out or None
+    except Exception:                                   # noqa: BLE001 — a thumbnail never fails a file
+        return None
+
+
 def _extract_one(path: Path, isolate: bool = False) -> tuple[Path, TrackMeta | str, bytes | None, bytes | None]:
     """Run in a **worker process** — extract metadata for a single file
     (``isolate``: ``_Isolated``).
@@ -2553,7 +2609,7 @@ def _extract_one(path: Path, isolate: bool = False) -> tuple[Path, TrackMeta | s
         actual_path = Path(path_str.split('::')[0]) if '::' in path_str else path
         meta.mtime = actual_path.stat().st_mtime
 
-        return path, meta, None, None
+        return path, meta, _scan_thumb(getattr(meta, "cover_art", None)), None
     except Exception as exc:
         return path, f"{type(exc).__name__}: {exc}", None, None
 
@@ -2590,8 +2646,9 @@ def _extract_batch(paths: "tuple[str, ...]", budget: float, isolate: bool = Fals
     local scan in one job (one round trip, not one per file).  Returns
     ``(results, seconds)``: ``results[i]`` is the i-th file's metadata as a
     plain dict (``TrackMeta.model_dump()``, embedded art reduced to its
-    ``/api/art`` URL — a local scan stores no art, and the bytes would
-    cross the process boundary for nothing) or its error text.  Once
+    ``/api/art`` URL; the 200 px list thumbnail ``_extract_one`` made of it,
+    ~15 KB, rides along as ``_sm_thumb`` — the original stays behind, it
+    would cross the process boundary for nothing) or its error text.  Once
     ``budget`` seconds have passed the files left are not extracted (no
     result: the caller sends them again), so a batch of slow files stays far
     below ``_EXTRACT_STUCK_S``.  ``isolate``: ``_Isolated`` (the files run
@@ -2623,6 +2680,8 @@ def _extract_batch(paths: "tuple[str, ...]", budget: float, isolate: bool = Fals
                 res = res.model_dump()
                 if res.get("cover_art"):
                     res["cover_art"] = f"/api/art/{res['id']}"
+                if _sm:
+                    res["_sm_thumb"] = _sm
             out.append(res)
             if time.monotonic() - t0 >= budget:
                 break
@@ -2637,8 +2696,11 @@ def _scan_row(meta: "dict | TrackMeta", dir_h: str, root_h: str) -> dict:
     ``_build_track(...)`` + ``Track.model_dump()`` (less the empty
     embedding) give, without validating again what ``extract`` validated —
     the dir/root hashes set and embedded art replaced by its ``/api/art``
-    URL (a local track's art is read from the file when asked for)."""
+    URL (a local track's art is read from the file when asked for).  The
+    list thumbnail a batch result carries (``_sm_thumb``) never becomes part
+    of the row (``_one`` takes it first; dropped here too)."""
     d = meta if isinstance(meta, dict) else meta.model_dump()
+    d.pop("_sm_thumb", None)
     d["dir_hash"] = dir_h
     d["scan_root_hash"] = root_h
     d["cover_art"] = f"/api/art/{d['id']}" if d.get("cover_art") else None
@@ -4279,6 +4341,11 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         None, _find_audio_files, directories, _settings.scan_zips, scope, _known_archives,
         _failed_archives,
     )
+    try:
+        from soniqboom.api.art import announce_folder_changes
+        await announce_folder_changes()
+    except Exception:                                   # noqa: BLE001
+        log.debug("folder cover announcements failed", exc_info=True)
     if scope:
         # A watcher scan also tries the root's given-up files whose wait is
         # over — the next automatic scan does, wherever they lie.
@@ -4604,9 +4671,46 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
 
         track_buffer: list[dict] = []           # store rows (``_scan_row``)
 
+        # Cached covers of the files this scan re-read (``_note_scan_art``):
+        # ids whose cached cover is stale (the file changed) and the new
+        # list thumbnails, written with each buffer flush.
+        art_stale: list[str] = []
+        art_thumbs: dict[str, bytes] = {}
+
+        def _note_scan_art(row: dict, sm_thumb: "bytes | None") -> None:
+            """A local file was (re-)read: when it changed since its cover was
+            cached, that cover is stale — a re-tagged file kept showing its
+            old picture before — so it is dropped (all sizes; the larger ones
+            are read from the file again when asked for); the new list
+            thumbnail, when the file has a cover, is stored (opportunity
+            "A")."""
+            tid = row.get("id")
+            if not tid:
+                return
+            old = store.get_track(tid)
+            if old is not None and abs(float(old.get("mtime") or 0)
+                                       - float(row.get("mtime") or 0)) >= 1.0:
+                art_stale.append(tid)
+            if sm_thumb:
+                art_thumbs[tid] = sm_thumb
+
+        async def _flush_art() -> None:
+            nonlocal art_stale, art_thumbs
+            from soniqboom.core import art_cache
+            stale, thumbs = art_stale, art_thumbs
+            art_stale, art_thumbs = [], {}
+            try:
+                if stale:
+                    await art_cache.delete_art_batch(stale)
+                if thumbs:
+                    await art_cache.store_art_batch(thumbs, "sm")
+            except Exception:                           # noqa: BLE001 — covers never fail a scan
+                log.debug("scan covers not written", exc_info=True)
+
         async def _flush_buffer():
             """Write buffered rows in sub-batches, yielding between chunks."""
             nonlocal track_buffer
+            await _flush_art()
             if not track_buffer:
                 return
             n = len(track_buffer)
@@ -4658,11 +4762,14 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
             _progress.processed += 1
             await _tick()
 
-        async def _one(path: Path, result) -> None:
+        async def _one(path: Path, result, sm_thumb: "bytes | None" = None) -> None:
             """One extracted file (its metadata, or the error text): buffered
             for the store or counted as an error, progress, and what the
-            stall checks read."""
+            stall checks read.  ``sm_thumb``: its list thumbnail (a batch
+            result carries it as ``_sm_thumb``) — see ``_note_scan_art``."""
             nonlocal source_errors, last_ok, hang_run
+            if isinstance(result, dict) and "_sm_thumb" in result:
+                sm_thumb = result.pop("_sm_thumb")
             if _not_playable_here(result):
                 log.debug("Skipped %s: %s", path, result)
             elif isinstance(result, str):
@@ -4675,6 +4782,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                     log.error("Failed to build track %s: %s", path, exc)
                     row = None
                 if row is not None:
+                    _note_scan_art(row, sm_thumb)
                     track_buffer.append(row)
                     dir_counts[scan_root] += 1
                     all_track_ids.append(row["id"])
@@ -4809,7 +4917,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                 self.slots.pop(id(items), None)
                 if len(items) == 1:
                     path, result, _sm, _lg = await fut
-                    await _one(path, result)
+                    await _one(path, result, _sm)
                     return []
                 results, secs = await fut
                 if results:
@@ -6638,22 +6746,51 @@ def _find_remote_audio_entries(
 
     def _skip_any(dir_entry) -> bool:
         return _skip_system(dir_entry) or (_inner is not None and _inner(dir_entry))
+    # B: each folder this walk lists is recorded in core/folder_art_index
+    # from the listing in hand (its image, or that it holds none) — the
+    # folder-cover warm-up then downloads known images by name and lists
+    # nothing again.  A folder whose listing failed is not recorded.
+    from soniqboom.core import folder_art_index as _fai
+    from soniqboom.core.data import path_hash as _ph
+    try:
+        _img_names = _fai.folder_image_names()
+    except Exception:                                   # noqa: BLE001
+        _img_names = []
+    _img_gen = _fai.generation()
     try:
         walk_kwargs: dict = {"error_sink": listing_errors, "skip_subtree_fn": _skip_any}
+        # Folders whose listing failed, by path.  (Matched by path, not by
+        # "errors since the last folder": an FTP walk lists several folders
+        # at once, so a folder's error can be reported while another one is
+        # yielded first.  A folder's error always lands before the folder
+        # itself is yielded.)
+        _failed_paths: set[str] = set()
         n_errors = 0
         for _dirpath, _dir_entries, file_entries in source.walk_with_stat("/", **walk_kwargs):
+            if len(listing_errors) > n_errors:
+                _failed_paths.update(_dirstate_norm(p) for p, _ in listing_errors[n_errors:])
+                n_errors = len(listing_errors)
+            _this_failed = _dirstate_norm(_dirpath) in _failed_paths
+            if _img_names and not _this_failed:
+                try:
+                    _d = str(PurePosixPath("/" + str(_dirpath).lstrip("/")))
+                    _img = _fai.pick([fe.name for fe in file_entries], _img_names)
+                    # (the image's date from the listing: a replaced image is
+                    # a change — ``folder_art_index.take_changed``)
+                    _img_mt = next((getattr(fe, "mtime", None) for fe in file_entries
+                                    if fe.name == _img), None) if _img else None
+                    _fai.record(_fai.key_for_remote_dir(root_path, _d), _img,
+                                mtime=_img_mt or None, dir_hash=_ph(_d), gen=_img_gen)
+                except Exception:                       # noqa: BLE001 — never fails a walk
+                    log.debug("folder image not recorded for %s", _dirpath, exc_info=True)
             # A system folder is not one of the library's: not recorded as a
             # subfolder either (an album with an ``@eaDir`` stays a leaf).
             _dir_entries = [d for d in _dir_entries if not is_system_folder(d.name)]
             if walk_plan is not None:
                 # A listing that failed is reported to ``error_sink`` (FTP
                 # then yields the folder as empty): never record it as empty.
-                new_errs = listing_errors[n_errors:]
-                n_errors = len(listing_errors)
-                walk_plan.record(
-                    _dirpath, _dir_entries, file_entries,
-                    failed=any(_dirstate_norm(p) == _dirstate_norm(_dirpath)
-                               for p, _ in new_errs))
+                walk_plan.record(_dirpath, _dir_entries, file_entries,
+                                 failed=_this_failed)
             for fe in file_entries:
                 if _is_junk_filename(fe.name):
                     skipped_junk += 1
@@ -6761,12 +6898,19 @@ async def _prefetch_folder_art_remote(
     source,
     entries: list,
     *,
-    inflight: int = 1,
+    inflight: "int | None" = None,
 ) -> dict:
     """Warm the shared folder-art cache for every unique parent directory
     observed during the walk.
 
-    ``inflight`` defaults to 1.  Higher values let the prefetch
+    ``inflight`` None (the default) follows the share's measured link
+    (``core/link_speed``): 1 folder at a time on a fast link or one not
+    measured, 4 on a slow one — on the internet test rig 4 at a time warmed
+    40 folders in 6.5 s instead of 25.4 s, while on the intranet rig one at
+    a time already took 0.67 s.  Every outcome is recorded in
+    ``core/folder_art_index`` — the image found, or (after a listing that
+    worked) that the folder holds none — so a cover request never lists a
+    folder the warm-up saw.  Higher values let the prefetch
     contend with the main extract loop for FTP-pool slots.  Observed
     on a re-index of a large share: a 4-wide prefetch combined with
     the 6-wide extract window pushed an 8-slot pool to saturation
@@ -6777,7 +6921,9 @@ async def _prefetch_folder_art_remote(
     slack capacity that's left when extract workers escalate between
     partial-fetch stages.
 
-    The art endpoint looks up ``folder:{dir_hash}`` before doing a fresh
+    The art endpoint looks up the folder's shared cover (``api/art.
+    _folder_cache_key`` — for a share ``folder:<index key>``, share root
+    included; ``folder:{dir_hash}`` before 2.1.2) before doing a fresh
     ``list_dir`` + ``read_file`` (see ``_try_folder_art`` in
     ``soniqboom/api/art.py``).  Lazy population works for the *second*
     track in a folder; for the *first* track the user still pays a
@@ -6795,7 +6941,7 @@ async def _prefetch_folder_art_remote(
         e.g. ``/REOL/foo.flac``) this is ``/REOL`` for nested
         files and ``/`` for root-level files.
 
-    Concurrency: bounded by ``inflight`` (default 4) so the prefetch
+    Concurrency: bounded by ``inflight`` (see above) so the prefetch
     doesn't starve the main extract loop that's competing for the
     same FTP pool.  All reads use ``lane='scan'`` for the same reason.
 
@@ -6805,7 +6951,7 @@ async def _prefetch_folder_art_remote(
     """
     from soniqboom.core import art_cache
     from soniqboom.core.data import get_config
-    from soniqboom.api.art import _find_folder_art_remote, _parse_folder_art_names
+    from soniqboom.api.art import _parse_folder_art_names
 
     stats = {
         "unique_dirs": 0, "warmed": 0,
@@ -6844,19 +6990,30 @@ async def _prefetch_folder_art_remote(
         )
         return stats
 
-    sem = asyncio.Semaphore(inflight)
+    if inflight is None:
+        from soniqboom.core import link_speed
+        try:
+            await asyncio.to_thread(link_speed.ensure_measured, source)
+        except Exception:                               # noqa: BLE001
+            pass
+        inflight = link_speed.limits(source).warm_width
+    from soniqboom.core import folder_art_index as _fai
+    _fgen = _fai.generation()
+    sem = asyncio.Semaphore(max(1, int(inflight)))
     loop = asyncio.get_event_loop()
     stats_lock = asyncio.Lock()
 
-    # ``_find_folder_art_remote`` defaults ``lane='stream'``; bind
-    # ``lane='scan'`` via a partial so the run_in_executor call site
-    # stays positional-args-only (the executor doesn't forward kwargs).
+    # (run_in_executor forwards no keyword arguments: the reads below pass
+    # ``lane='scan'`` positionally or through a partial)
     import functools as _ft
-    _find_with_scan_lane = _ft.partial(_find_folder_art_remote, lane="scan")
+    from soniqboom.api.art import _find_folder_art_remote_named
 
     async def _warm_one(parent_dir: str) -> None:
         dir_h = path_hash(parent_dir)
-        cache_key = f"folder:{dir_h}"
+        # (the shared cache id of a share folder holds the share root —
+        # ``api/art._folder_cache_key``; ``dir_h`` alone is the same for
+        # every share's folder of that name)
+        cache_key = f"folder:{_fai.key_for_remote_dir(scan_root, parent_dir or '/')}"
         try:
             cached = await art_cache.get_art(cache_key, "full")
         except Exception:
@@ -6867,12 +7024,29 @@ async def _prefetch_folder_art_remote(
             return
         await _await_resume()
         remote_dir = parent_dir if parent_dir else "/"
+        known = _fai.lookup(_fai.key_for_remote_dir(scan_root, remote_dir))
+        if known is not None and known.name is None:
+            async with stats_lock:
+                stats["no_art"] += 1                    # this scan's walk saw none: nothing to fetch
+            return
         async with sem:
             try:
-                data, _mime = await loop.run_in_executor(
-                    None, _find_with_scan_lane,
-                    scan_root, remote_dir, source, priority,
-                )
+                if known is not None:
+                    # The walk saw the image: download it by name, no listing.
+                    _img = str(PurePosixPath("/" + remote_dir.lstrip("/")) / known.name)
+                    data = await loop.run_in_executor(
+                        None, _ft.partial(source.read_file, _img, lane="scan"))
+                    _name, _listed = known.name, True
+                else:
+                    data, _mime, _name, _listed = await loop.run_in_executor(
+                        None, _find_folder_art_remote_named,
+                        remote_dir, source, priority, "scan",
+                    )
+                if _listed:
+                    # (an image that would not download stays unknown)
+                    if data or _name is None:
+                        _fai.record(_fai.key_for_remote_dir(scan_root, remote_dir),
+                                    _name if data else None, dir_hash=dir_h, gen=_fgen)
             except Exception as exc:
                 log.debug(
                     "Folder-art prefetch list failed for %s: %s",
@@ -6884,8 +7058,12 @@ async def _prefetch_folder_art_remote(
         if data:
             try:
                 from soniqboom.core.metadata import cap_full_cover
-                loop = asyncio.get_running_loop()
-                capped = await loop.run_in_executor(None, cap_full_cover, data)
+                # (no ``loop = …`` here: assigning the name made it local to
+                # ``_warm_one`` and the listing above failed with
+                # UnboundLocalError for every folder — the warm-up warmed
+                # nothing from 1.7.0 to 2.1.1)
+                capped = await asyncio.get_running_loop().run_in_executor(
+                    None, cap_full_cover, data)
                 await art_cache.store_art(cache_key, capped, "full")
                 async with stats_lock:
                     stats["warmed"] += 1
@@ -6904,6 +7082,11 @@ async def _prefetch_folder_art_remote(
         *(_warm_one(p) for p in parents),
         return_exceptions=True,
     )
+    try:
+        from soniqboom.api.art import announce_folder_changes
+        await announce_folder_changes()
+    except Exception:                                   # noqa: BLE001
+        log.debug("folder cover announcements failed", exc_info=True)
     # Completion logging is handled by ``_art_prefetch_done`` (the
     # done_callback the caller attaches) so the log line appears
     # AFTER the task finishes from the event loop's perspective —
@@ -7584,6 +7767,14 @@ async def _remote_scan_body(
             if touch:
                 store.update_track_fields_batch(touch)
             if material:
+                # A changed file's cached thumbnails were made from its old
+                # cover — dropped before the new full cover below is stored
+                # (they are made again from it when asked for).
+                try:
+                    from soniqboom.core import art_cache as _ac
+                    await _ac.delete_art_batch([td["id"] for td in material])
+                except Exception:                       # noqa: BLE001
+                    log.debug("stale covers not dropped", exc_info=True)
                 await upsert_tracks_batch(material)
             batch_state["changed"] = batch_state.get("changed", 0) + len(material)
             batch_state["unchanged"] = batch_state.get("unchanged", 0) + len(touch)
@@ -7597,6 +7788,17 @@ async def _remote_scan_body(
                 except Exception:                       # noqa: BLE001
                     log.debug("HVSC join bookkeeping not saved", exc_info=True)
             await asyncio.sleep(0)
+        # The full cover of every re-read file that has one is written anew:
+        # its thumbnails were made from the old one (a file whose only change
+        # is its picture is a "touch" above, not a material change).
+        try:
+            from soniqboom.core import art_cache as _ac
+            await _ac.delete_thumbs_batch(list(art_buffer))
+            # (the file's own picture: no longer marked as a copy of its
+            # folder's image — ``art_cache.mark_from_folder``)
+            await asyncio.to_thread(lambda ids=list(art_buffer): [_ac.unmark_from_folder(i) for i in ids])
+        except Exception:                               # noqa: BLE001
+            log.debug("stale thumbnails not dropped", exc_info=True)
         await store_full_art_batch(art_buffer)
         track_buffer = []
         art_buffer = {}
@@ -7724,6 +7926,8 @@ async def _remote_scan_body(
     # certainly multi-MB art for which the full fetch wins anyway.
     from soniqboom.core.metadata import HEADER_BUDGET_MULTIPLIERS
     _GROWING_BUDGET_MULTIPLIERS = HEADER_BUDGET_MULTIPLIERS
+    # The ladder stage of an MP4 file's front + ``moov`` index (see below).
+    _MP4_INDEX_STAGE = -1
 
     async def _fetch_zip_member(remote_path: str) -> bytes:
         """Fetch one member of a remote archive (.zip/.lha/.lzh): download the
@@ -7865,6 +8069,7 @@ async def _remote_scan_body(
             #     "looks incomplete" heuristic; we only escalate if
             #     the current stage's bytes didn't satisfy mutagen.
             from soniqboom.core.metadata import HEADER_BUDGET as _HB
+            from soniqboom.core import tag_window as _tw
             ext = os.path.splitext(remote_path.lower())[1]
             base_budget = _HB.get(ext)
             listing_size = entry_stat_map.get(remote_path, (0, 0.0))[0]
@@ -7885,6 +8090,22 @@ async def _remote_scan_body(
                 # "escalated" through three identical attempts, each able
                 # to re-trigger a full archive download under cache
                 # pressure.  One stage, one verdict.
+                stages.append(("full", None))
+            elif (ext in _tw.MP4_EXTS and _tw.supports_ranges(source)
+                  and listing_size > 2 * _tw.MP4_FRONT):
+                # MP4 / M4A (2.1.2): the tags, length, codec and cover all
+                # sit in the ``moov`` index, at the start or the end of the
+                # file — fetch the front and the index (``tag_window
+                # .mp4_window``), not the audio.  Before, every .m4a was
+                # downloaded whole (no front window works: the index may be
+                # at the end).  Measured on a simulated link (suite FTP
+                # server behind a delay proxy), an 8 MB AAC file with a
+                # 289 KB cover: 8.07 MB → 0.33–0.40 MB per file, 100 →
+                # 24–29 ms on a 1 ms LAN and 3.16 → 0.85 s at 60 ms, with
+                # the same title / artist / album / length / cover.  An
+                # unexpected layout (``mp4_window`` → None) or a window
+                # that reads as incomplete falls back to the whole file.
+                stages.append(("index", _MP4_INDEX_STAGE))
                 stages.append(("full", None))
             elif base_budget is None or (listing_size and listing_size <= base_budget * 2):
                 stages.append(("full", None))
@@ -7911,6 +8132,17 @@ async def _remote_scan_body(
                     if stage_budget is None:
                         file_data = await _fetch_full(remote_path)
                         was_partial = False
+                    elif stage_budget == _MP4_INDEX_STAGE:
+                        file_data = await loop.run_in_executor(
+                            None, lambda: _tw.mp4_window(
+                                source, remote_path, listing_size, lane="scan"))
+                        if file_data is None:
+                            log.debug("No MP4 index window for %s — fetching it whole",
+                                      remote_path)
+                            with _phase_lock:
+                                _phase_counts["download"] -= 1
+                            continue
+                        was_partial = True
                     else:
                         file_data = await _fetch_partial(remote_path, stage_budget)
                         was_partial = True
@@ -8036,6 +8268,11 @@ async def _remote_scan_body(
                     # A length mutagen measured over the front window only
                     # (CBR MP3, Ogg) becomes the whole file's.
                     await _fix_window_length(meta, remote_path, file_data, listing_size)
+                if (was_partial and meta.format == "ALAC" and listing_size > 0
+                        and (meta.duration or 0) > 0):
+                    # ALAC's bitrate is the file's size over its length
+                    # (``metadata._mp4``) — the index window's size isn't.
+                    meta.bitrate = int(listing_size * 8 / meta.duration)
                 if parent_dir not in hash_map:
                     new_hashes = await store_hash_lookups_batch([parent_dir])
                     hash_map.update(new_hashes)
@@ -8415,6 +8652,8 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
     and patch the browse cache inside the root's commit window."""
     added = updated = errors = 0
     ready: list = []
+    _art_stale: list[str] = []
+    _art_thumbs: dict[str, bytes] = {}
     if to_scan:
         def _pdir(s: str) -> str:
             return str(Path(s.split("::")[0]).parent) if "::" in s else str(Path(s).parent)
@@ -8433,6 +8672,22 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
                 errors += 1
                 continue
             ready.append(track)
+            # As a full local scan (``_note_scan_art``): a changed file's
+            # cached cover is stale; its new list thumbnail is kept.
+            _old = store.get_track(track.id)
+            if _old is not None and abs(float(_old.get("mtime") or 0)
+                                        - float(track.mtime or 0)) >= 1.0:
+                _art_stale.append(track.id)
+            if _sm:
+                _art_thumbs[track.id] = _sm
+        try:
+            from soniqboom.core import art_cache as _ac
+            if _art_stale:
+                await _ac.delete_art_batch(_art_stale)
+            if _art_thumbs:
+                await _ac.store_art_batch(_art_thumbs, "sm")
+        except Exception:                               # noqa: BLE001
+            log.debug("refreshed folder's covers not written", exc_info=True)
 
     gone = [t["id"] for p_str, t in existing.items()
             if p_str not in found and not _in_failed_archive(p_str, _failed_archives)]

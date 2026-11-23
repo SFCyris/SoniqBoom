@@ -27,7 +27,8 @@ class FtpServer:
                  host: str = "127.0.0.1", abor_replies: int = 2, size: bool = True,
                  abort_after: int | None = None, abort_retrs: int = 1,
                  password: str | None = None, max_conns: int | None = None,
-                 welcome: str | None = None, mlsd: bool = True) -> None:
+                 welcome: str | None = None, mlsd: bool = True,
+                 mlsd_ascii_only: bool = False) -> None:
         self.root = Path(root).resolve()
         self.rate = rate                 # bytes / s per transfer, None = unthrottled
         # 2: an interrupted RETR answers 426, then ABOR answers 226 (RFC 959);
@@ -40,6 +41,7 @@ class FtpServer:
         self.max_conns = max_conns
         self.welcome = welcome           # extra greeting lines (a multi-line 220)
         self.mlsd = mlsd
+        self.mlsd_ascii_only = mlsd_ascii_only   # refuse an MLSD sent in TYPE I
         self.commands: Counter = Counter()
         self.conns = 0
         self.peak_conns = 0
@@ -56,6 +58,7 @@ class FtpServer:
                 super().setup()
                 self.request.setsockopt(socket.SOL_SOCKET, socket.SO_OOBINLINE, 1)
                 self.cwd = "/"
+                self.type = "A"
                 self.rest = 0
                 self.pasv: socket.socket | None = None
 
@@ -114,6 +117,11 @@ class FtpServer:
                         server.commands[cmd] += 1
                     if cmd == "MLSD" and not server.mlsd:
                         self.reply("500 MLSD not understood")
+                    elif cmd == "MLSD" and server.mlsd_ascii_only and self.type == "I":
+                        self.reply("504 MLSD only in ASCII mode")
+                    elif cmd == "TYPE":
+                        self.type = (arg or "A").strip().upper()[:1]
+                        self.reply("200 ok")
                     elif cmd == "USER":
                         self.reply("331 password please")
                     elif cmd == "PASS":
@@ -130,7 +138,7 @@ class FtpServer:
                     elif cmd == "FEAT":
                         self.wfile.write(b"211-Features:\r\n MLSD\r\n SIZE\r\n MDTM\r\n REST STREAM\r\n UTF8\r\n211 End\r\n")
                         self.wfile.flush()
-                    elif cmd in ("OPTS", "TYPE", "NOOP", "MODE", "STRU"):
+                    elif cmd in ("OPTS", "NOOP", "MODE", "STRU"):
                         self.reply("200 ok")
                     elif cmd == "PWD":
                         self.reply(f'257 "{self.cwd}"')

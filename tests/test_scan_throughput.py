@@ -280,6 +280,9 @@ def test_batch_rows_equal_the_validated_track_rows(tmp_path):
         want = _old_row(meta, root, parent, hashes)
         res = dict(res)
         res["added_at"] = want["added_at"]                     # stamped at each extract
+        # The list thumbnail rides along for a file with a cover (2.1.2) and
+        # never reaches the row.
+        assert ("_sm_thumb" in res) == bool(want["cover_art"]), p
         got = scanner._scan_row(res, hashes[parent], hashes[root])
         assert got == want, p
         assert list(got) == list(want), p                     # same key order: same JSON

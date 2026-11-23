@@ -17,7 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
-from soniqboom.core import art_cache, online_cover
+from soniqboom.core import art_cache, folder_art_index, folder_covers, online_cover
 from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.data import get_track, get_config
 from soniqboom.core.metadata import cap_full_cover, id3_picture, resize_cover
@@ -49,9 +49,10 @@ _FOLDER_ART_PRIORITY_DEFAULT = [
 #
 # Two perf wins layered here:
 #
-# 1. **Shared folder-art cache keyed by ``dir_hash``** — when one track in
-#    a folder triggers a folder-art fetch, the result is also cached under
-#    ``folder:{dir_hash}`` so the OTHER 999 tracks in that folder don't
+# 1. **Shared folder-art cache** — when one track in a folder triggers a
+#    folder-art fetch, the result is also cached under the folder's id
+#    (``_folder_cache_key``: ``folder:{dir_hash}`` for a local folder, the
+#    share root + folder for a network share) so the OTHER 999 tracks in that folder don't
 #    each have to repeat the ``list_dir`` + ``read_file`` round trip.
 #    For a 1000-track FLAC album with one cover.jpg, this turns the FTP
 #    cost from O(1000) list_dir calls + O(1000) read_file calls into
@@ -111,6 +112,22 @@ def _folder_art_cache_key(dir_hash: str) -> str:
     ``_art_path`` keys by track_id and uuid4s never start with ``folder:``,
     so there's no collision risk."""
     return f"{_FOLDER_ART_KEY_PREFIX}{dir_hash}"
+
+
+def _folder_cache_key(path_str: str, dir_hash: "str | None") -> "str | None":
+    """The cache id of the shared cover of ``path_str``'s folder.  A local
+    folder: by its ``dir_hash`` (the hash of its absolute path — unique).  A
+    network-share folder: by its ``core/folder_art_index`` key, which holds
+    the share root — a share track's ``dir_hash`` hashes only the folder's
+    path INSIDE the share, so two shares' ``/Music`` shared one cached image
+    (and the first share's cover showed for the other's tracks) until 2.1.2.
+    None when there is no key (no ``dir_hash`` for a local path)."""
+    if path_str and is_remote_path(path_str):
+        k = folder_art_index.key_for_path(path_str)
+        if k:
+            return f"{_FOLDER_ART_KEY_PREFIX}{k}"
+        return None
+    return _folder_art_cache_key(dir_hash) if dir_hash else None
 
 
 def _parse_folder_art_names(csv: str | None) -> list[str]:
@@ -186,24 +203,18 @@ def _extract_cover(path: Path, *, raise_on_error: bool = False) -> tuple[bytes, 
                 p = audio.pictures[0]
                 return p.data, (p.mime or "image/jpeg")
 
-        elif ext in (".ogg", ".opus"):
-            import struct
+        elif ext in (".ogg", ".opus", ".oga"):
             from mutagen.oggvorbis import OggVorbis
             try:
                 audio = OggVorbis(path)
             except Exception:
                 from mutagen.oggopus import OggOpus
                 audio = OggOpus(path)
-            for b64 in audio.get("metadata_block_picture", []):
-                raw = _b64.b64decode(b64)
-                # FLAC PICTURE block: [4B type][4B mime_len][mime][4B desc_len][desc][4B w][4B h][4B depth][4B colors][4B data_len][data]
-                off = 4
-                mime_len = struct.unpack(">I", raw[off:off+4])[0]; off += 4
-                mime = raw[off:off+mime_len].decode(); off += mime_len
-                desc_len = struct.unpack(">I", raw[off:off+4])[0]; off += 4 + desc_len
-                off += 16  # width, height, depth, colors
-                data_len = struct.unpack(">I", raw[off:off+4])[0]; off += 4
-                return raw[off:off+data_len], (mime or "image/jpeg")
+            # (the same reader as the scan: front cover first, then COVERART)
+            from soniqboom.core.metadata import vorbis_picture
+            data, mime = vorbis_picture(audio.tags)
+            if data:
+                return data, mime
 
         elif ext in (".wv", ".ape"):
             from mutagen.apev2 import APEv2
@@ -216,10 +227,26 @@ def _extract_cover(path: Path, *, raise_on_error: bool = False) -> tuple[bytes, 
                 if null != -1:
                     return data[null+1:], "image/jpeg"
 
+        elif ext in _COVER_VIA_SCAN:
+            # Formats whose picture only the scan's extractor reads (ID3 in
+            # WAV / DSD, ASF in WMA, APEv2 in Musepack / TTA …): read it the
+            # same way, so the endpoint shows what the scan recorded — not a
+            # folder image in its place.
+            from soniqboom.core.metadata import extract
+            uri = getattr(extract(path, "cover"), "cover_art", None)
+            if uri and "," in uri:
+                head, b64 = uri.split(",", 1)
+                mime = head[5:].split(";", 1)[0] if head.startswith("data:") else "image/jpeg"
+                return _b64.b64decode(b64), (mime or "image/jpeg")
+
     except Exception:
         if raise_on_error:
             raise
     return None, None
+
+
+# (see ``_extract_cover``: tagged formats without their own branch there)
+_COVER_VIA_SCAN = (".wav", ".wave", ".dsf", ".dff", ".wma", ".mpc", ".tta", ".ofr", ".tak")
 
 
 def _extract_cover_from_zip(virtual_path: str, *, raise_on_error: bool = False) -> tuple[bytes, str] | tuple[None, None]:
@@ -302,6 +329,51 @@ def _find_folder_art_local(
     return None, None
 
 
+def _folder_art_local_indexed(
+    track_dir: Path, priority: list[str], dir_hash: str | None = None,
+    gen: int | None = None,
+) -> tuple[bytes, str] | tuple[None, None]:
+    """In a worker thread: a local folder's image, using what the scan
+    recorded (``core/folder_art_index``) — "no image" without a ``listdir``,
+    a known image name opened directly.  A folder not recorded yet is listed
+    here (one ``listdir``, case-insensitive names as ``_find_folder_art_local``)
+    and the outcome recorded, so it is listed once, not once per track.  On a folder mounted from a NAS each listing
+    is a network round trip — that is what this saves."""
+    key = folder_art_index.key_for_local_dir(str(track_dir))
+    entry = folder_art_index.lookup(key)
+    if entry is not None:
+        if entry.name is None:
+            return None, None
+        try:
+            with open(track_dir / entry.name, "rb") as fh:
+                data = fh.read()
+            return data, ("image/png" if entry.name.lower().endswith(".png") else "image/jpeg")
+        except OSError:
+            pass                                    # gone or renamed: listed again below —
+                                                    # recorded over the old entry, so the
+                                                    # change is seen (``take_changed``)
+    try:
+        names = os.listdir(track_dir)
+    except OSError:
+        return None, None                           # not reachable: nothing recorded
+    name = folder_art_index.pick(names, priority)
+    mtime = None
+    if name is not None:
+        try:
+            mtime = os.stat(track_dir / name).st_mtime
+        except OSError:
+            mtime = None
+    folder_art_index.record(key, name, mtime=mtime, dir_hash=dir_hash, gen=gen)
+    if name is None:
+        return None, None
+    try:
+        with open(track_dir / name, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None, None
+    return data, ("image/png" if name.lower().endswith(".png") else "image/jpeg")
+
+
 def _find_folder_art_remote(
     scan_root: str, remote_dir: str, source, priority: list[str],
     *, lane: str = "stream",
@@ -319,21 +391,37 @@ def _find_folder_art_remote(
 
     Returns (image_bytes, mime) or (None, None).
     """
+    data, mime, _name, _listed = _find_folder_art_remote_named(
+        remote_dir, source, priority, lane)
+    return data, mime
+
+
+def _find_folder_art_remote_named(
+    remote_dir: str, source, priority: list[str], lane: str = "stream",
+) -> tuple:
+    """``_find_folder_art_remote`` that also says what it saw:
+    ``(bytes, mime, name, listed)`` — ``name`` the image chosen (None: the
+    folder holds none of ``priority``), ``listed`` whether the listing
+    worked at all (False: nothing is known — never record "none" then).
+    An image that will not download falls through to the next name; when
+    none downloads, ``bytes`` is None with ``name`` still set."""
     try:
         entries = source.list_dir(remote_dir)
     except Exception:
-        return None, None
+        return None, None, None, False
     names = {e.name.lower(): e for e in entries if not e.is_dir}
+    first = None
     for lname in priority:
         entry = names.get(lname)
         if entry is not None:
+            first = first or entry.name
             try:
                 data = source.read_file(entry.path, lane=lane)
                 mime = "image/png" if lname.endswith(".png") else "image/jpeg"
-                return data, mime
+                return data, mime, entry.name, True
             except Exception:
                 continue
-    return None, None
+    return None, None, first, True
 
 
 def _absent_sentinel_path(track_id: str) -> Path:
@@ -436,6 +524,269 @@ def _newest_folder_art_mtime(track_dir: Path) -> float | None:
         _FOLDER_MTIME_MEMO.clear()
     _FOLDER_MTIME_MEMO[key] = (newest, now + _FOLDER_MTIME_TTL)
     return newest
+
+
+# ── G: "has this track's cover changed?" from what the scan recorded ────────
+#
+# A track without a cached cover is checked on every request: the "no cover"
+# mark is honoured only while the file and its folder images are unchanged
+# (``_is_art_absent_persisted``), and the ETag carries the same stamp.  That
+# check used to be a live ``stat`` of the file plus a ``scandir`` of its
+# folder per request — on a folder mounted from a NAS two network round trips
+# for a row that has no cover.  The scan already knows both: the file's
+# ``mtime`` (kept current by every scan and the folder watcher) and the
+# folder's image with its ``mtime`` (``core/folder_art_index``).  So the
+# stamp now comes from those; the live check still runs, in the background,
+# at most once per folder per ``_VERIFY_EVERY_S`` (``_verify_later``) — a
+# file re-tagged or a cover dropped into a folder the watcher does not see
+# (a network mount) is picked up there and the row told (``art_ready``).
+_UNKNOWN = object()
+_VERIFY_EVERY_S = 300.0
+_VERIFY_MAX = 20_000
+_verified: dict[str, float] = {}                # folder key → time.monotonic()
+
+
+def _known_source_mtime(track):
+    """The cover stamp of a LOCAL ``track`` from stored values — the larger of
+    its file's ``mtime`` and its folder image's — or ``_UNKNOWN`` (a network
+    share, no stored mtime, or a folder the scan has not recorded): the
+    caller checks live."""
+    path = getattr(track, "path", "") or ""
+    if not path or is_remote_path(path):
+        return _UNKNOWN
+    try:
+        mt = float(getattr(track, "mtime", 0) or 0)
+    except (TypeError, ValueError):
+        mt = 0.0
+    if mt <= 0:
+        return _UNKNOWN
+    entry = folder_art_index.lookup(folder_art_index.key_for_path(path))
+    if entry is None:
+        return _UNKNOWN
+    if entry.name is not None and entry.mtime:
+        mt = max(mt, float(entry.mtime))
+    _verify_later(track)
+    return mt
+
+
+async def _source_stamp(track, *, urls: bool = True) -> float | None:
+    """The cover stamp of ``track`` (see above): stored values when known,
+    else the live ``_source_mtime_for``.  ``urls`` False: None for an
+    ``http(s)://`` path (the cover endpoint's ETag never stamped those)."""
+    path = getattr(track, "path", "") or ""
+    if not urls and path.startswith(("http://", "https://")):
+        return None
+    known = _known_source_mtime(track)
+    if known is not _UNKNOWN:
+        return known
+    return await _source_mtime_for_async(path)
+
+
+def _verify_later(track) -> None:
+    """Check ``track``'s file and folder live, in the background — at most
+    once per folder per ``_VERIFY_EVERY_S`` (see above)."""
+    key = folder_art_index.key_for_path(getattr(track, "path", "") or "")
+    if not key:
+        return
+    now = time.monotonic()
+    last = _verified.get(key)
+    if last is not None and now - last < _VERIFY_EVERY_S:
+        return
+    if len(_verified) >= _VERIFY_MAX:
+        _verified.clear()
+    _verified[key] = now
+    try:
+        t = asyncio.get_running_loop().create_task(_verify(track))
+    except RuntimeError:
+        return
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_resolve_done)
+
+
+def _verify_sync(path: str, dir_hash: str | None, gen: int) -> float | None:
+    """(worker thread) Re-record the track's folder from a live listing and
+    return the file's live ``mtime`` (None: not reachable)."""
+    try:
+        live = Path(folder_art_index.member_free(path)).stat().st_mtime
+    except OSError:
+        return None
+    d = Path(folder_art_index.local_dir_of(path))
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return live
+    name = folder_art_index.pick(names, folder_art_index.folder_image_names())
+    mtime = None
+    if name is not None:
+        try:
+            mtime = os.stat(d / name).st_mtime
+        except OSError:
+            mtime = None
+    folder_art_index.record(folder_art_index.key_for_local_dir(str(d)), name,
+                            mtime=mtime, dir_hash=dir_hash, gen=gen)
+    return live
+
+
+def _changed_since_marked(rows: list) -> list:
+    """(worker thread) The ids among ``rows`` (store rows of one folder) that
+    carry a "no cover" mark older than their file's live ``mtime`` — the
+    file changed after it was found without a cover.  One ``stat`` per
+    marked track (an unmarked one has a cached cover or none to look for)."""
+    out = []
+    store = get_store()
+    for r in rows:
+        tid, path = r.get("id"), r.get("path") or ""
+        if not tid or not path or is_remote_path(path):
+            continue
+        if not (store.is_art_absent(tid) or _absent_sentinel_path(tid).exists()):
+            continue
+        try:
+            live = Path(folder_art_index.member_free(path)).stat().st_mtime
+        except OSError:
+            continue
+        if not _is_art_absent_persisted(tid, live):
+            out.append(tid)
+    return out
+
+
+async def _verify(track) -> None:
+    await asyncio.to_thread(_verify_sync, track.path,
+                            getattr(track, "dir_hash", None) or None,
+                            folder_art_index.generation())
+    dir_hash = getattr(track, "dir_hash", None)
+    try:
+        rows = get_store().filter_tracks(dir_hash=dir_hash, limit=2000) if dir_hash else []
+    except Exception:                               # noqa: BLE001
+        rows = []
+    if not rows:
+        rows = [{"id": track.id, "path": track.path}]
+    for tid in await asyncio.to_thread(_changed_since_marked, rows):
+        # Changed since it was found without a cover (re-tagged on a network
+        # mount the watcher does not see): forget the mark and look again.
+        # (A file still without a cover is marked again with a newer time,
+        # so it is not read again at the next check.)
+        get_store().discard_art_absent(tid)
+        _clear_art_absent_persisted(tid)
+        _resolve_in_background(tid)
+    await announce_folder_changes()
+
+
+def _stale_folder_copies(key: str, rows: list, old: "bytes | None") -> list:
+    """(worker thread) The ids among ``rows`` (the tracks of folder ``key``)
+    whose cached cover is a copy of the folder's image: marked so
+    (``art_cache.is_from_folder``), or unmarked but byte for byte the
+    folder's old shared image ``old`` (copies cached before the marks).  The
+    byte rule can also catch a file whose OWN embedded picture is that very
+    image (rips that embed ``folder.jpg``): dropping its cached copy only
+    means it is read from the file again — ``cover_art`` is never touched.
+    A share's ``dir_hash`` is the same for every share's folder of that name:
+    rows of another folder are left alone."""
+    out = []
+    for r in rows:
+        tid, path = r.get("id"), r.get("path") or ""
+        if not tid or folder_art_index.key_for_path(path) != key:
+            continue
+        if art_cache.is_from_folder(tid):
+            out.append(tid)
+            continue
+        if old:
+            try:
+                p = art_cache._art_path(tid, "full")
+                if p.exists() and p.stat().st_size == len(old) and p.read_bytes() == old:
+                    out.append(tid)
+            except OSError:
+                continue
+    return out
+
+
+async def refresh_changed_folders() -> int:
+    """Folders whose image was replaced or removed since the last call
+    (``folder_art_index.take_changed``): ``refresh_folder`` for each.  A
+    folder whose refresh fails is queued again (``folder_art_index.requeue``).
+    Returns how many tracks were told."""
+    changes = folder_art_index.take_changed()
+    sent = 0
+    for i, (key, dir_hash) in enumerate(changes):
+        try:
+            sent += await refresh_folder(key, dir_hash)
+        except Exception:                           # noqa: BLE001
+            log.debug("folder covers of %s not refreshed", key, exc_info=True)
+            folder_art_index.requeue(changes[i:])
+            break
+    return sent
+
+
+async def refresh_folder(key: str, dir_hash: str, old: "bytes | None" = None) -> int:
+    """Folder ``key``'s image was replaced or removed: its shared cover and
+    every track's copy of it (``_stale_folder_copies``) are dropped and
+    ``art_ready`` is sent for those tracks, so they show the new image, or
+    none — or, for a file that carries its own picture, that picture again
+    (read from the file; its ``cover_art`` is never changed here).  ``old``:
+    the folder's previous shared image, when the caller already replaced it
+    (a folder job).  Before 2.1.2 such copies stayed until the art cache was
+    cleared."""
+    from soniqboom.api.library import _broadcast
+    ids = [f"{_FOLDER_ART_KEY_PREFIX}{key}"] if folder_art_index.is_remote_key(key) else []
+    ids.append(_folder_art_cache_key(dir_hash))          # (a share folder's pre-2.1.2 id too)
+    if old is None:
+        for cid in ids:
+            old = old or await art_cache.get_art(cid, "full")
+        await art_cache.delete_art_batch(ids)
+    folder_covers.forget_folder(key)
+    try:
+        rows = get_store().filter_tracks(dir_hash=dir_hash, limit=_REFRESH_MAX_ROWS)
+    except Exception:                               # noqa: BLE001
+        rows = []
+    stale = await asyncio.to_thread(_stale_folder_copies, key, rows, old)
+    if stale:
+        await art_cache.delete_art_batch(stale)
+    sent = 0
+    for tid in stale:
+        get_store().discard_art_absent(tid)
+        _clear_art_absent_persisted(tid)
+        await _broadcast({"event": "art_ready", "track_id": tid})
+        sent += 1
+    return sent
+
+
+# (a share's ``dir_hash`` is shared by every share's folder of that name:
+# the rows are filtered by their real folder in ``_stale_folder_copies``)
+_REFRESH_MAX_ROWS = 20_000
+
+
+async def announce_folder_changes() -> int:
+    """Send ``art_ready`` for the tracks of every folder that gained an image
+    since the last call (``folder_art_index.take_flips``) — their list rows
+    were told "no cover" and ask again.  At most 2000 tracks per call.  Also
+    refreshes the folders whose image was replaced or removed
+    (``refresh_changed_folders``)."""
+    try:
+        await refresh_changed_folders()
+    except Exception:                               # noqa: BLE001
+        log.debug("changed folder covers not refreshed", exc_info=True)
+    hashes = folder_art_index.take_flips()
+    if not hashes:
+        return 0
+    from soniqboom.api.library import _broadcast
+    sent = 0
+    for h in hashes:
+        try:
+            rows = get_store().filter_tracks(dir_hash=h, limit=2000 - sent)
+        except Exception:                           # noqa: BLE001
+            continue
+        for r in rows:
+            tid = r.get("id") if isinstance(r, dict) else getattr(r, "id", None)
+            if not tid:
+                continue
+            # (both marks: the stored one is still "valid" when the image kept
+            # an older date — a Finder / ``cp -p`` copy)
+            get_store().discard_art_absent(tid)
+            _clear_art_absent_persisted(tid)
+            await _broadcast({"event": "art_ready", "track_id": tid})
+            sent += 1
+        if sent >= 2000:
+            break
+    return sent
 
 
 async def _source_mtime_for_async(path_str: str) -> float | None:
@@ -599,7 +950,8 @@ def _etag_response(
     )
 
 
-async def cover_thumb(track_id: str, bucket: str, *, resolve: bool = True) -> bytes | None:
+async def cover_thumb(track_id: str, bucket: str, *, resolve: bool = True,
+                      wait_folder: float = 0.0) -> bytes | None:
     """A track's cover as the ``bucket`` (``sm`` / ``lg``) JPEG thumbnail: the
     cached one, else made from the cached full cover — or, with ``resolve``,
     from the cover ``_resolve_full_art`` finds (the thumbnail is then cached).
@@ -608,7 +960,7 @@ async def cover_thumb(track_id: str, bucket: str, *, resolve: bool = True) -> by
     if thumb:
         return thumb
     if resolve:
-        full, _mime = await _resolve_full_art(track_id)
+        full, _mime = await _resolve_full_art(track_id, wait_folder=wait_folder)
     else:
         full = await art_cache.get_art(track_id, "full")
     if not full:
@@ -636,7 +988,13 @@ def _read_if_present(path: Path, read) -> tuple:
     return True, data, mime, False
 
 
-async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, None]:
+# How long a caller that gets no ``art_ready`` (Subsonic, DLNA, cast) waits
+# for a network share's folder image being fetched (``folder_covers.wait``).
+FOLDER_WAIT_S = 3.0
+
+
+async def _resolve_full_art(track_id: str, *, wait_folder: float = 0.0,
+                            ) -> tuple[bytes, str] | tuple[None, None]:
     """Return full-size cover bytes and mime, trying filesystem cache then file extraction.
 
     Fallback chain:
@@ -679,7 +1037,7 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
     #   * a genuinely-tagless, unchanged file stays cached (fast path);
     #   * an offline mount yields src_mtime=None → not honoured → we re-attempt
     #     (and the read guard below keeps us from poisoning it).
-    src_mtime = await _source_mtime_for_async(path_str)
+    src_mtime = await _source_stamp(track)
     if _is_art_absent_persisted(track_id, src_mtime):
         get_store().mark_art_absent(track_id)          # keep / refresh the hint
         return None, None
@@ -760,16 +1118,32 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
 
     # ── Step 2: try folder art (folder.jpg / cover.jpg) ───────────────────
     use_folder_art = await get_config("use_folder_art", True)
+    if use_folder_art and is_remote_path(path_str) and getattr(track, "cover_art", None):
+        # The scan saw a picture IN the file of this share track: its own
+        # cover is recovered (the backfill below) and the folder's image is
+        # not put in its place — unless that recovery just found none.
+        from soniqboom.core import art_backfill
+        if not art_backfill.failed_recently(track_id):
+            use_folder_art = False
     if use_folder_art:
         # Pass dir_hash so the SHARED folder-art cache can short-
         # circuit the list_dir + read_file round trip for every
         # other track in the same directory.
         folder_data, folder_mime = await _try_folder_art(
             path_str, loop, dir_hash=getattr(track, "dir_hash", None) or None,
+            track=track,
         )
+        if not folder_data and wait_folder > 0 and folder_covers.pending(track):
+            # (a caller that cannot be told later: wait for the folder's job,
+            # then take what it cached)
+            await folder_covers.wait(track, wait_folder)
+            folder_data, folder_mime = await _try_folder_art(
+                path_str, loop, dir_hash=getattr(track, "dir_hash", None) or None,
+                track=track,
+            )
         if folder_data:
             _clear_art_absent_persisted(track_id)
-            _persist_and_notify(track_id, folder_data)
+            _persist_and_notify(track_id, folder_data, from_folder=True)
             return folder_data, folder_mime or "image/jpeg"
 
     # No art found.  Remember it to skip repeated extraction — BUT only when we
@@ -818,9 +1192,19 @@ async def _resolve_full_art(track_id: str) -> tuple[bytes, str] | tuple[None, No
 
 async def _try_folder_art(
     path_str: str, loop: asyncio.AbstractEventLoop,
-    *, dir_hash: str | None = None,
+    *, dir_hash: str | None = None, track=None,
 ) -> tuple[bytes, str] | tuple[None, None]:
     """Attempt to find folder art for the track at *path_str*.
+
+    What the scan recorded about the folder comes first
+    (``core/folder_art_index``): a folder known to hold no image is answered
+    without touching it, one known to hold ``cover.jpg`` is read without
+    listing it.  A NETWORK-share folder that is not in the shared cache yet
+    is never fetched here when ``track`` is given: its job is queued
+    (``core/folder_covers``) and this returns nothing at once — the request
+    answers "no cover yet" (not to be cached) and ``art_ready`` follows.
+    Without ``track`` (no caller left that needs it, kept for safety) a
+    network folder is still looked up in place.
 
     Supports local paths, ZIP paths (uses outer directory), and remote paths
     (smb:// / ftp://).
@@ -833,8 +1217,8 @@ async def _try_folder_art(
     fetches into O(1).
     """
     # ── Shared dir cache hit ───────────────────────────────────────────
-    if dir_hash:
-        cache_key = _folder_art_cache_key(dir_hash)
+    cache_key = _folder_cache_key(path_str, dir_hash)
+    if cache_key:
         cached = await art_cache.get_art(cache_key, "full")
         if cached:
             mime = "image/png" if cached[:4] == b"\x89PNG" else "image/jpeg"
@@ -851,6 +1235,12 @@ async def _try_folder_art(
         from soniqboom.core import catalogue
         if catalogue.is_catalogue_path(path_str):
             return None, None       # a catalogue's folders hold no art we may fetch
+        entry = folder_art_index.lookup(folder_art_index.key_for_path(path_str))
+        if entry is not None and entry.name is None:
+            return None, None       # the scan saw this folder: it holds no image
+        if track is not None:
+            folder_covers.request(track)
+            return None, None       # fetched in the background; art_ready follows
         from soniqboom.core.filesource import get_source, parse_remote_path
         scan_root, remote_path = parse_remote_path(path_str)
         if not remote_path:
@@ -868,18 +1258,12 @@ async def _try_folder_art(
         except Exception:
             data, mime = None, None
 
-    elif '::' in path_str:
-        # ZIP path — use the parent directory of the outer ZIP file
-        outer_zip = Path(path_str.split('::')[0])
-        track_dir = outer_zip.parent
-        data, mime = await loop.run_in_executor(
-            None, _find_folder_art_local, track_dir, priority,
-        )
-
     else:
-        track_dir = Path(path_str).parent
+        # A local folder (an archive member: its archive's folder).
+        track_dir = Path(folder_art_index.local_dir_of(path_str))
         data, mime = await loop.run_in_executor(
-            None, _find_folder_art_local, track_dir, priority,
+            None, _folder_art_local_indexed, track_dir, priority,
+            dir_hash, folder_art_index.generation(),
         )
 
     # ── Populate shared dir cache for future hits in this folder ──────
@@ -887,9 +1271,9 @@ async def _try_folder_art(
     # doesn't wait for the write to land on disk.  Subsequent tracks
     # in the same dir benefit from the cache as soon as the write
     # completes (typically a few milliseconds later).
-    if data and dir_hash:
+    if data and cache_key:
         try:
-            async def _store_capped(bytes_=data, key=_folder_art_cache_key(dir_hash)):
+            async def _store_capped(bytes_=data, key=cache_key):
                 loop = asyncio.get_running_loop()
                 capped = await loop.run_in_executor(None, cap_full_cover, bytes_)
                 await art_cache.store_art(key, capped, "full")
@@ -954,9 +1338,15 @@ async def _fill_remote_art_later(track_id: str, track) -> None:
         from soniqboom.core.art_backfill import request_backfill
         request_backfill(track)                 # (coalesced; backs off after a failure)
         return
-    dir_hash = getattr(track, "dir_hash", None)
-    if dir_hash and await art_cache.get_art(_folder_art_cache_key(dir_hash), "full"):
+    key = _folder_cache_key(track.path, getattr(track, "dir_hash", None))
+    if key and await art_cache.get_art(key, "full"):
         _resolve_in_background(track_id)
+        return
+    if not _use_folder_art_now():
+        return
+    entry = folder_art_index.lookup(folder_art_index.key_for_path(track.path))
+    if entry is None or entry.name is not None:
+        folder_covers.request(track)            # (one job per folder; art_ready follows)
 
 
 def _resolve_in_background(track_id: str) -> None:
@@ -986,7 +1376,7 @@ def _bg_resolve_done(t: "asyncio.Task") -> None:
         log.debug("Background cover lookup failed: %s", t.exception())
 
 
-def _persist_and_notify(track_id: str, data: bytes) -> None:
+def _persist_and_notify(track_id: str, data: bytes, *, from_folder: bool = False) -> None:
     """Cache freshly-extracted art (full + thumbs), update the DB cover ref, and
     THEN broadcast ``art_ready`` so list/grid ``<img>`` elements refresh.
 
@@ -1004,9 +1394,21 @@ def _persist_and_notify(track_id: str, data: bytes) -> None:
             # cap is still well above the 550px lg thumbnail.
             loop = asyncio.get_running_loop()
             full = await loop.run_in_executor(None, cap_full_cover, data)
+            # Where it came from (``art_cache.mark_from_folder``) — noted
+            # BEFORE the copy is written, so a stop in between leaves no
+            # unmarked copy: a copy of the folder's image goes when that image
+            # changes; the file's own picture stays.
+            await loop.run_in_executor(
+                None, art_cache.mark_from_folder if from_folder else art_cache.unmark_from_folder,
+                track_id)
             await art_cache.store_art(track_id, full, "full")
             await _generate_and_cache_thumbs(track_id, full)
-            await _update_track_cover_ref(track_id)
+            if not from_folder:
+                # (``cover_art`` says "the file carries a picture" — what the
+                # scan recorded.  A copy of the folder's image must not claim
+                # it: a share track would then wait for an embedded cover that
+                # is not there, and its folder could never be told apart.)
+                await _update_track_cover_ref(track_id)
         except Exception:
             log.debug("art persist failed for %s", track_id, exc_info=True)
         try:
@@ -1020,6 +1422,98 @@ def _persist_and_notify(track_id: str, data: bytes) -> None:
         t.add_done_callback(_bg_tasks.discard)
     except RuntimeError:
         pass
+
+
+# ── F: which list rows can skip their cover request ─────────────────────────
+#
+# A list window asks one cover per row.  Over HTTP/1.1 a browser runs about
+# six requests at once, so 30 rows of tracks WITHOUT a cover (most of a
+# retro-music library) queue in front of the rows that have one — and each
+# "no cover" answer is asked again every minute.  The web app now sends the
+# ids of its rows that carry no embedded cover in ONE request; the ids
+# answered here as known to have no cover at all are not requested as
+# images.  Rows with an embedded cover keep the plain image request: the
+# browser's own cache serves those without any request.
+#
+# "Known" is deliberately narrow — anything that might still produce a
+# cover is not listed, and the row asks as before:
+#   * no embedded cover (the scan saw none) and none cached for the track;
+#   * its folder recorded as holding no image (``core/folder_art_index``),
+#     or folder art switched off — a folder not recorded yet is not known;
+#   * no folder job under way (``core/folder_covers``);
+#   * no online cover, and none that may still come: the track is not looked
+#     up online, or its "none" is a lasting one, or lookups cannot run.
+# A row told "no cover" asks again when ``art_ready`` (its cover appeared —
+# also sent for a folder that gains an image, ``announce_folder_changes``)
+# or ``art_refresh`` (a setting changed) arrives.
+_STATUS_MAX_IDS = 300
+# Ogg Vorbis / Opus: scans before 2.1.2 did not record their pictures, and
+# a file not changed since is not read again — so an empty ``cover_art`` on
+# such a row proves nothing.  It is answered "no cover" only once the file
+# itself was read without one (its "no cover" mark, ``_absent_sentinel_path``
+# or the in-memory one); until then the row asks its image as before.
+_SCAN_BLIND_COVER = (".ogg", ".opus", ".oga")
+
+
+def _no_cover_candidates(ids: "list[str]", use_folder: bool) -> "list[str]":
+    """(worker thread — the ``art_exists`` checks stat the cache folder)
+    The ids whose OWN cover is known to be missing (all but the online
+    check)."""
+    store = get_store()
+    out = []
+    for tid in ids:
+        d = store.get_track(tid)
+        if not d or d.get("cover_art"):
+            continue
+        path = d.get("path") or ""
+        if (folder_art_index.member_free(path).lower().endswith(_SCAN_BLIND_COVER)
+                or path.lower().endswith(_SCAN_BLIND_COVER)) and not (
+                    store.is_art_absent(tid) or _absent_sentinel_path(tid).exists()):
+            continue
+        if art_cache.art_exists(tid, "sm") or art_cache.art_exists(tid, "full"):
+            continue
+        if use_folder:
+            key = _folder_cache_key(path, d.get("dir_hash"))
+            if key and art_cache.art_exists(key, "full"):
+                continue
+            entry = folder_art_index.lookup(folder_art_index.key_for_path(path))
+            if entry is None or entry.name is not None:
+                continue
+        out.append(tid)
+    return out
+
+
+@router.post("/status")
+async def art_status(request: Request):
+    """``{"ids": [...]}`` → ``{"none": [...]}``: the ids (at most 300) known
+    to have no cover at all — their rows need not ask (see above)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Expected JSON")
+    ids = body.get("ids") if isinstance(body, dict) else None
+    if not isinstance(ids, list):
+        raise HTTPException(400, "Expected ids")
+    ids = [str(i) for i in ids[:_STATUS_MAX_IDS] if isinstance(i, str) and i]
+    use_folder = _use_folder_art_now()
+    candidates = await asyncio.to_thread(_no_cover_candidates, ids, use_folder)
+    none: list[str] = []
+    lookups_off = online_cover.lookups_off()
+    for tid in candidates:
+        track = await get_track(tid)
+        if track is None or folder_covers.pending(track):
+            continue
+        online = await online_cover.state(track)
+        if online.hit or (online.open and not lookups_off):
+            continue                        # an online cover is there or may come
+        none.append(tid)
+        # A local folder's "no image" is checked live in the background (at
+        # most once per folder per ``_VERIFY_EVERY_S``): a cover dropped in
+        # later — the folder watcher does not watch pictures — reaches these
+        # rows by ``art_ready`` (``announce_folder_changes``).
+        if not is_remote_path(track.path):
+            _verify_later(track)
+    return {"none": none}
 
 
 @router.get("/{track_id}/{size}.jpg")
@@ -1091,10 +1585,8 @@ async def cover_art(
         # resolve it.
         try:
             track = await get_track(track_id)
-            if track and not track.path.startswith(
-                ("http://", "https://"),
-            ):
-                mtime = await _source_mtime_for_async(track.path)
+            if track:
+                mtime = await _source_stamp(track, urls=False)
         except OSError:
             mtime = None
         except Exception:
@@ -1139,6 +1631,8 @@ async def cover_art(
             # folder's cover already cached for another of its tracks.  Never
             # a share listing per revalidation.
             await _fill_remote_art_later(track_id, track)
+            if folder_covers.pending(track):
+                headers["Cache-Control"] = _LOOKUP_PENDING_CC
         return Response(status_code=304, headers=headers)
 
     # --- Thumbnails (sm / lg) ----------------------------------------------
@@ -1169,6 +1663,8 @@ async def cover_art(
         found, pending = await _online_response(online, track_id, track, size, etag_online, mtime)
         if found is not None:
             return found
+        pending = pending or (track is not None and (folder_covers.pending(track)
+                                             or _backfill_pending(track_id)))
         if fallback != "placeholder":
             return _no_art_response(etag, pending=pending)
         return _placeholder_response(_placeholder_cc(online, pending))
@@ -1184,6 +1680,8 @@ async def cover_art(
     found, pending = await _online_response(online, track_id, track, size, etag_online, mtime)
     if found is not None:
         return found
+    pending = pending or (track is not None and (folder_covers.pending(track)
+                                         or _backfill_pending(track_id)))
     if fallback != "placeholder":
         return _no_art_response(etag, pending=pending)
     return _placeholder_response(_placeholder_cc(online, pending))
@@ -1198,17 +1696,59 @@ def _own_cover_missing(track_id: str, track, source_mtime: float | None = None) 
     """Is ``track`` known to have no cover of its own?  A local file: it was
     read cleanly without one (the "no art" mark — in memory, or the stored one
     still valid for ``source_mtime``); a file that could not be read is not
-    known.  A network-share file: the scan saw no picture in it."""
+    known.  A network-share file: the scan saw no picture in it AND its
+    folder holds none (or could not be read just now) — see below."""
     try:
         if track is None:
             return False
         if is_remote_path(track.path):
-            return not getattr(track, "cover_art", None)
+            # No embedded cover (the scan saw none) AND no folder image: the
+            # folder is known to hold none (``core/folder_art_index``), folder
+            # art is switched off, or the folder could not be read just now
+            # (``folder_covers.unreachable`` — the online cover stands in
+            # until the share answers).  A folder not known yet is fetched
+            # first (``core/folder_covers``) — an online cover must not race
+            # the share's own image.
+            if getattr(track, "cover_art", None):
+                return False
+            if not _use_folder_art_now():
+                return True
+            entry = folder_art_index.lookup(folder_art_index.key_for_path(track.path))
+            if entry is not None:
+                return entry.name is None
+            return folder_covers.unreachable(track)
         return bool(get_store().is_art_absent(track_id)
                     or (source_mtime is not None
                         and _is_art_absent_persisted(track_id, source_mtime)))
     except Exception:
         return False
+
+
+def _backfill_pending(track_id: str) -> bool:
+    """Is the embedded cover of ``track_id`` being recovered from its share?"""
+    try:
+        from soniqboom.core import art_backfill
+        return art_backfill.pending(track_id)
+    except Exception:                               # noqa: BLE001
+        return False
+
+
+def _use_folder_art_now() -> bool:
+    """The "Use folder art" setting, read synchronously (default on)."""
+    try:
+        return bool(get_store().get_config("use_folder_art", True))
+    except Exception:                               # noqa: BLE001
+        return True
+
+
+async def ask_online_for(track_id: str) -> bool:
+    """Queue the online lookup for ``track_id`` now that its own cover is
+    known to be missing (a folder job found no image) — see ``_ask_online``."""
+    track = await get_track(track_id)
+    if not track:
+        return False
+    online = await online_cover.state(track)
+    return _ask_online(online, track_id, track)
 
 
 def _ask_online(online, track_id: str, track, source_mtime: float | None = None) -> bool:
@@ -1285,6 +1825,8 @@ async def online_cover_for(track_id: str, size: str = "full") -> tuple[bytes | N
         track = await get_track(track_id)
         if not track:
             return None, False
+        if folder_covers.pending(track) or _backfill_pending(track_id):
+            return None, True                   # the share's own or folder image is on its way
         online = await online_cover.state(track)
         if not _own_cover_missing(track_id, track):       # (the mark ``_resolve_full_art`` just set)
             return None, False

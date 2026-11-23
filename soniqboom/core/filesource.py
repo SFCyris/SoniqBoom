@@ -19,6 +19,8 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -514,6 +516,13 @@ class _FileObjStream(SourceStream):
 
 
 _WALK_MAX_DEPTH = 64          # folders below this depth are not walked (a loop's backstop)
+
+# FTP folders listed at once by a walk (``FTPFileSource.walk_with_stat``).
+# Measured 2026-11-22 on a simulated link (suite FTP server behind a delay
+# proxy), 211 folders: one at a time 2.24 s on a 1 ms LAN / 60.9 s at 60 ms;
+# 4 at once 0.43 s / 15.9 s; 6 at once 0.34 s / 14.2 s.  Four takes most of
+# the gain and leaves the rest of the scan connections free.
+_FTP_WALK_WIDTH = 4
 
 
 class _LoopGuard:
@@ -1404,6 +1413,21 @@ class SMBFileSource(FileSource):
         # Front-only ranged read — same one-shot transfer as read_at(0, n).
         return self.read_at(path, 0, max_bytes, lane=lane)
 
+    def probe_rtt(self, n: int = 3) -> float | None:
+        """Median of ``n`` ``stat`` calls on the share root — how fast this
+        share's link is (``core/link_speed``).  A ``stat`` can take more than
+        one SMB round trip, so this reads a little slow; the worst a slow
+        reading does on a fast LAN is a few more covers fetched at once."""
+        import smbclient
+        from soniqboom.core.link_speed import median_rtt
+        samples: list[float] = []
+        root = self._smb_path("/")
+        for _ in range(max(1, n)):
+            t0 = time.perf_counter()
+            self._call(smbclient.stat, root)
+            samples.append(time.perf_counter() - t0)
+        return median_rtt(samples)
+
     def open_stream(self, path: str, *, offset: int = 0, lane: str = "stream",
                     length: int | None = None) -> SourceStream:
         import smbclient
@@ -1566,6 +1590,36 @@ _FTP_KEEPALIVE_S = max(15, int(os.environ.get("SONIQBOOM_FTP_KEEPALIVE_S", "60")
 # handle ``xfer_count`` so each pooled connection has its own counter.
 _FTP_MAX_PER_CONN = 40
 
+# Fewer round trips per transfer (2.1.2).  Before every borrow of an idle
+# connection the pool sent a ``NOOP`` to check it was still alive, and
+# ftplib sends ``TYPE I`` before every download and ``TYPE A`` before every
+# listing — two extra round trips on every file and every folder.  Measured
+# on a simulated link (suite FTP server behind a delay proxy, one 20 KB file
+# after another on one connection), 2026-11-22:
+#
+#     =========================  =============  ==============
+#     per small file             1 ms LAN       60 ms internet
+#     =========================  =============  ==============
+#     before                     7.3 ms         293 ms
+#     no NOOP for a fresh one    6.0 ms         229 ms
+#     … and no repeated TYPE     4.8 ms         166 ms
+#     =========================  =============  ==============
+#
+# So a connection handed back less than ``_FTP_TRUST_IDLE_S`` ago is lent
+# again WITHOUT the check, provided its socket has nothing to read: a server
+# that dropped an idle connection closes it (or sends "421 timeout" first),
+# and either makes the socket readable — caught without a round trip.  An
+# idle connection with something to read is never lent (not even after a
+# NOOP, which would take a late reply for its own answer).  A
+# connection that dies silently in those seconds fails on the real command,
+# exactly as one that dies between a NOOP and the command always could; the
+# callers' retries (downloads) and the MLSD → LIST fallback (listings) take
+# a fresh connection.  ``stat`` and ``is_dir`` have no retry, so they still
+# NOOP a reused connection (``borrow(verify=True)``).  The keep-alive still
+# NOOPs idle connections every ``_FTP_KEEPALIVE_S``.  The TYPE side is
+# ``_TypedFTP``.
+_FTP_TRUST_IDLE_S = 20.0
+
 # How long ``pool.borrow()`` waits when the pool is at capacity before
 # raising TimeoutError.  Generous because under heavy scan load every
 # slot can be doing a multi-second download.  ``read_file`` 's retry loop
@@ -1610,12 +1664,16 @@ class _PooledFTP:
     exception, so most call sites don't need to think about it.
     """
 
-    __slots__ = ("conn", "xfer_count", "_broken", "lane")
+    __slots__ = ("conn", "xfer_count", "_broken", "lane", "checked_at")
 
     def __init__(self, conn: ftplib.FTP):
         self.conn = conn
         self.xfer_count = 0
         self._broken = False
+        # When this connection last answered (opened, handed back after a
+        # command, or a keep-alive NOOP) — ``fresh_enough`` lends it again
+        # without a NOOP shortly after (see ``_FTP_TRUST_IDLE_S``).
+        self.checked_at = time.monotonic()
         # Lane this handle is currently borrowed under ("stream"|"scan"|"browse").
         # Set by the pool on each borrow; used so _release decrements the
         # right per-lane in-use counter (drives the admin FTP-lanes viz).
@@ -1630,6 +1688,36 @@ class _PooledFTP:
         """Signal the pool to close this connection on return instead of
         putting it back in the idle queue."""
         self._broken = True
+
+    def has_input(self) -> bool:
+        """Has this IDLE connection's control socket something to read?  Then
+        it is not lent again: the server closed it (EOF), sent "421" before
+        closing it, or a late reply has arrived — which a ``NOOP`` would take
+        for its own answer, shifting every later reply by one.  No round
+        trip: a non-blocking peek (``select`` would fail for descriptors
+        past 1023 and drop every connection of a busy server).  Bytes
+        ftplib has already read into its own buffer are not seen here."""
+        sock = getattr(self.conn, "sock", None)
+        if sock is None:
+            return True
+        try:
+            was = sock.gettimeout()
+            sock.settimeout(0.0)                 # (a timeout would WAIT before the peek)
+            try:
+                sock.recv(1, socket.MSG_PEEK)
+            finally:
+                sock.settimeout(was)
+        except (BlockingIOError, InterruptedError):
+            return False                         # nothing waiting: the normal case
+        except (OSError, ValueError):            # reset / closed / bad descriptor
+            return True
+        return True                              # a byte waiting, or b"" = EOF
+
+    def fresh_enough(self, now: float) -> bool:
+        """May this idle connection be lent without a ``NOOP``?  Yes when it
+        answered less than ``_FTP_TRUST_IDLE_S`` ago and ``has_input`` is
+        False."""
+        return now - self.checked_at < _FTP_TRUST_IDLE_S and not self.has_input()
 
     def abort_transfer(self) -> None:
         """Stop a ``RETR`` the caller quit reading early and leave the control
@@ -1723,6 +1811,16 @@ class _FTPConnectionPool:
         self._waiting_stream = 0
         self._waiting_scan   = 0
         self._waiting_browse = 0
+        # Connections a "scan" borrow may not take (``set_interactive_reserve``,
+        # set by ``core/link_speed`` once the share's link is measured).  The
+        # lane priority above only helps when a connection is handed BACK:
+        # during a scan that downloads whole files every connection can stay
+        # busy for a whole download, and a cover (folder listing + image, two
+        # borrows) waited 9.2 s on a simulated internet link and ~280 ms on a
+        # simulated LAN.  With one connection out of the scan's reach: 0.64 s
+        # and ~43 ms, the scan no slower on the LAN (6 % on the internet link)
+        # — table in ``core/link_speed``.
+        self._interactive_reserve = 0
         # Set when a reactive too-many-clients trip resizes the pool DOWN, so
         # _maybe_relax_cap knows to reconcile the live size back up later even
         # for a trip that persisted no cap (observed<2 first-connection
@@ -1761,8 +1859,12 @@ class _FTPConnectionPool:
             self._kalive_thread.start()
 
     @contextmanager
-    def borrow(self, lane: str = "scan") -> Iterator[_PooledFTP]:
-        """Acquire a connection.  ``lane`` is a priority hint:
+    def borrow(self, lane: str = "scan", *, verify: bool = False) -> Iterator[_PooledFTP]:
+        """Acquire a connection.  ``verify``: NOOP a reused idle connection
+        even when it answered moments ago (``_FTP_TRUST_IDLE_S``) — for the
+        callers without a retry (``stat``, ``is_dir``), where one silently
+        dead connection would read as "missing" / "unreachable".  ``lane``
+        is a priority hint:
 
         * ``"stream"`` — high priority.  Jumps the queue when the pool
           is saturated, so a play attempt during a heavy scan returns
@@ -1781,7 +1883,7 @@ class _FTPConnectionPool:
         if lane not in ("stream", "scan", "browse"):
             lane = "scan"
         handle = self._acquire(getattr(_BORROW_WAIT, "s", None) or _FTP_BORROW_TIMEOUT_S,
-                               lane=lane)
+                               lane=lane, verify=verify)
         try:
             yield handle
         except BaseException:
@@ -1790,7 +1892,8 @@ class _FTPConnectionPool:
         finally:
             self._release(handle)
 
-    def _acquire(self, timeout: float, *, lane: str = "scan") -> _PooledFTP:
+    def _acquire(self, timeout: float, *, lane: str = "scan",
+                 verify: bool = False) -> _PooledFTP:
         deadline = time.monotonic() + timeout
         # Track whether we've been registered as a waiter, so we
         # decrement the right counter on every exit path (success,
@@ -1810,6 +1913,10 @@ class _FTPConnectionPool:
                 higher_priority_ahead = (
                     (lane == "scan" and (self._waiting_stream > 0 or self._waiting_browse > 0))
                     or (lane == "browse" and self._waiting_stream > 0)
+                    # The interactive reserve: a scan never holds the last
+                    # ``_interactive_reserve`` connections (an idle one stays
+                    # idle for the next cover / browse / play).
+                    or (lane == "scan" and self._scan_at_reserve())
                 )
 
                 # 1. Reuse an idle connection if one validates cleanly,
@@ -1818,7 +1925,14 @@ class _FTPConnectionPool:
                     while self._idle:
                         handle = self._idle.pop()
                         try:
-                            handle.conn.voidcmd("NOOP")
+                            # Never one with unread input (closed, "421", a
+                            # late reply); no NOOP for one that answered
+                            # moments ago (``_FTP_TRUST_IDLE_S``).
+                            if handle.has_input():
+                                raise ConnectionError("idle FTP connection has unread input")
+                            if verify or time.monotonic() - handle.checked_at >= _FTP_TRUST_IDLE_S:
+                                handle.conn.voidcmd("NOOP")
+                                handle.checked_at = time.monotonic()
                             self._in_use_count += 1
                             handle.lane = lane
                             if lane == "stream": self._in_use_stream += 1
@@ -1955,6 +2069,34 @@ class _FTPConnectionPool:
                 log.warning("FTP %s refused the login (%s) — not retrying it "
                             "in the background for %.0f s", self._label, exc, delay)
 
+    def _scan_at_reserve(self) -> bool:
+        """(under ``self._cond``) Does a further "scan" borrow reach into the
+        interactive reserve?  Only on a pool big enough to keep the scan at
+        least two connections.  The reserve is kept free BEYOND what playback
+        (the stream lane) holds — a playing track otherwise used up the
+        reserved connection and covers waited for the scan again — but the
+        scan is never held below two."""
+        r = self._interactive_reserve
+        if r <= 0 or self._max_size < r + 2:
+            return False
+        return self._in_use_scan >= max(2, self._max_size - r - self._in_use_stream)
+
+    def set_interactive_reserve(self, n: int) -> None:
+        """Keep ``n`` connections out of the scan lane's reach (0 = none) —
+        see ``_interactive_reserve``.  Waiters re-check at once.  Called on
+        the event loop (``link_speed.limits``): an unchanged value returns
+        without taking the pool lock, which ``_acquire`` holds across an
+        idle connection's ``NOOP`` — a network round trip (58 ms on the
+        simulated internet link)."""
+        n = max(0, int(n))
+        if n == self._interactive_reserve:
+            return                              # (an int read: no lock needed)
+        with self._cond:
+            if n == self._interactive_reserve:
+                return
+            self._interactive_reserve = n
+            self._cond.notify_all()
+
     def _release(self, handle: _PooledFTP) -> None:
         need_topup = False
         with self._cond:
@@ -1994,6 +2136,9 @@ class _FTPConnectionPool:
                 ):
                     need_topup = True
             else:
+                # It just answered the borrower's commands (a broken one is
+                # recycled above) — ``fresh_enough`` trusts it for a while.
+                handle.checked_at = time.monotonic()
                 self._idle.append(handle)
             # Notify ALL waiters when a higher-priority borrow (stream or
             # browse) is pending — they have to re-check whether the head
@@ -2332,6 +2477,7 @@ class _FTPConnectionPool:
         for handle in snapshot:
             try:
                 handle.conn.voidcmd("NOOP")
+                handle.checked_at = time.monotonic()
                 alive.append(handle)
             except Exception:
                 try:
@@ -2458,6 +2604,93 @@ _FTP_POOLS: dict[tuple, _FTPConnectionPool] = {}
 _FTP_POOLS_LOCK = threading.Lock()
 
 
+# Servers that refused an MLSD sent while the connection was in binary mode
+# (``_TypedFTP``): their listings switch to ASCII as before.
+_MLSD_NEEDS_ASCII: "set[tuple[str, int]]" = set()
+
+
+class _TypedFTP(ftplib.FTP):
+    """``ftplib.FTP`` that sends ``TYPE`` only when the mode changes.
+
+    ftplib sends ``TYPE I`` before every download (``retrbinary``) and
+    ``TYPE A`` before every listing (``retrlines``, which ``mlsd`` uses) — on a
+    pooled connection alternating listings and downloads that is a round
+    trip per operation for nothing (``_FTP_TRUST_IDLE_S`` has the numbers).
+    The mode is a property of the session (RFC 959), so this remembers the
+    one the server last accepted and answers a repeat itself.
+
+    An MLSD is also left in binary mode: its listing is UTF-8 lines either
+    way (RFC 3659 §7.2: as if ``TYPE L 8`` were set, whatever the TYPE) and
+    common clients send it after ``TYPE I``.  A server that refuses it in
+    binary (a 5xx other than 550 / 500 / 502) is asked again in ASCII on the
+    same connection and, when that works, remembered
+    (``_MLSD_NEEDS_ASCII``), so its later listings switch as they always
+    did."""
+
+    _sb_type: "str | None" = None       # the mode the server last accepted
+    _sb_keep = False                   # inside an MLSD left in binary mode
+
+    @staticmethod
+    def _type_of(cmd: str) -> "str | None":
+        parts = cmd.split()
+        if len(parts) == 2 and parts[0].upper() == "TYPE":
+            return parts[1].upper()
+        return None
+
+    def sendcmd(self, cmd):
+        want = self._type_of(cmd)
+        if want is None:
+            return super().sendcmd(cmd)
+        if self._sb_keep or want == self._sb_type:
+            return f"200 Type remains {self._sb_type}."
+        self._sb_type = None                # unknown until the server answers
+        resp = super().sendcmd(cmd)
+        self._sb_type = want
+        return resp
+
+    def voidcmd(self, cmd):
+        want = self._type_of(cmd)
+        if want is None:
+            return super().voidcmd(cmd)
+        if self._sb_keep or want == self._sb_type:
+            return f"200 Type remains {self._sb_type}."
+        self._sb_type = None
+        resp = super().voidcmd(cmd)
+        self._sb_type = want
+        return resp
+
+    def retrlines(self, cmd, callback=None):
+        if (cmd[:4].upper() != "MLSD" or self._sb_type != "I"
+                or (self.host, self.port) in _MLSD_NEEDS_ASCII):
+            return super().retrlines(cmd, callback)
+        got = [0]
+        sink = callback if callback is not None else ftplib.print_line
+
+        def counted(line, _sink=sink):
+            got[0] += 1
+            _sink(line)
+
+        self._sb_keep = True
+        try:
+            return super().retrlines(cmd, counted)
+        except ftplib.error_perm as exc:
+            # Only a refusal that may be about the mode is asked again: not
+            # 550 (no such folder), not 500 / 502 (no MLSD at all — the
+            # MLSD → LIST latch handles that), and not once lines were
+            # delivered (asking again would repeat them).  A 4xx is passing
+            # trouble, never evidence about the mode: raised as before.
+            if str(exc)[:3] in ("550", "500", "502") or got[0]:
+                raise
+            self._sb_keep = False
+            resp = super().retrlines(cmd, callback)     # TYPE A, as before
+            _MLSD_NEEDS_ASCII.add((self.host, self.port))
+            log.info("FTP %s:%d lists with MLSD in ASCII mode only (%s)",
+                     self.host, self.port, str(exc)[:80])
+            return resp
+        finally:
+            self._sb_keep = False
+
+
 def _build_ftp_factory(host: str, port: int, username: str, password: str,
                        encoding: str) -> Callable[[], ftplib.FTP]:
     """Return a zero-arg factory that opens + logs in one new FTP socket.
@@ -2471,7 +2704,7 @@ def _build_ftp_factory(host: str, port: int, username: str, password: str,
         last_exc: BaseException | None = None
         for attempt in range(_CONNECT_ATTEMPTS):
             try:
-                ftp = ftplib.FTP()
+                ftp = _TypedFTP()
                 ftp.encoding = encoding
                 ftp.connect(host, port, timeout=15)
                 try:
@@ -3384,31 +3617,96 @@ class FTPFileSource(FileSource):
         # takes and returns, and the one the scanner's keys are in.  A path is
         # never translated back from the server's absolute spelling (a
         # sub-folder named like the remote path would map onto the root).
+        #
+        # Several folders are listed at once (``_walk_width``): each listing
+        # is a few round trips of waiting, so one at a time leaves the link
+        # idle.  Everything else stays on the CALLER's thread, in the same
+        # order of events per folder as before: a folder is yielded once its
+        # listing is in, and only after the caller resumes are its subfolders
+        # checked (``skip_subtree_fn``, which reads what the caller recorded
+        # for the folder) and queued.  Results are taken in the order the
+        # listings were started, so a walk of an unchanged share yields the
+        # same sequence every time.
         stack = ["/" + (top or "").strip("/")]
         guard = _LoopGuard()
-        while stack:
-            current = stack.pop()
-            if guard.depth(current) > _WALK_MAX_DEPTH:
-                if error_sink is not None:
-                    error_sink.append((current, "too deep"))
-                continue
-            try:
-                entries = self._list_entries(current, error_sink=error_sink)
-            except Exception as exc:
-                log.warning("walk_with_stat: _list_entries(%s) failed: %s",
-                            current, exc)
-                if error_sink is not None:
-                    error_sink.append((current, str(exc)))
-                continue
-            if guard.is_loop(current, entries):
-                continue
-            dir_entries = [e for e in entries if e.is_dir]
-            file_entries = [e for e in entries if not e.is_dir]
-            yield current, dir_entries, file_entries
-            for d in dir_entries:
-                if skip_subtree_fn is not None and skip_subtree_fn(d):
+        width = self._walk_width()
+        pool = ThreadPoolExecutor(width, thread_name_prefix="ftp-walk") if width > 1 else None
+        started: "deque[tuple[str, Future | None]]" = deque()
+
+        def _start() -> None:
+            while stack and len(started) < width:
+                path = stack.pop()
+                if guard.depth(path) > _WALK_MAX_DEPTH:
+                    if error_sink is not None:
+                        error_sink.append((path, "too deep"))
                     continue
-                stack.append(d.path)
+                started.append((path, pool.submit(self._list_entries, path,
+                                                  error_sink=error_sink)
+                                if pool is not None else None))
+
+        try:
+            _start()
+            while started:
+                current, fut = started.popleft()
+                try:
+                    entries = (fut.result() if fut is not None
+                               else self._list_entries(current, error_sink=error_sink))
+                except Exception as exc:
+                    log.warning("walk_with_stat: _list_entries(%s) failed: %s",
+                                current, exc)
+                    if error_sink is not None:
+                        error_sink.append((current, str(exc)))
+                    _start()
+                    continue
+                if guard.is_loop(current, entries):
+                    _start()
+                    continue
+                dir_entries = [e for e in entries if e.is_dir]
+                file_entries = [e for e in entries if not e.is_dir]
+                yield current, dir_entries, file_entries
+                for d in dir_entries:
+                    if skip_subtree_fn is not None and skip_subtree_fn(d):
+                        continue
+                    stack.append(d.path)
+                _start()
+        finally:
+            # A caller that stops early (or fails) leaves listings running:
+            # not started ones are dropped, running ones finish on their own
+            # and hand their connection back.
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+
+    def _walk_width(self) -> int:
+        """How many folders a walk lists at once: ``_FTP_WALK_WIDTH``, at most
+        the server's scan connections, and one fewer than the pool holds (a
+        server that allows two connections keeps one for playback) — 1 means
+        one at a time, as before."""
+        try:
+            scan_budget = ftp_lane_budgets(self._host, self._port)[0]
+            pool_max = int(self._pool._max_size)
+        except Exception:                               # noqa: BLE001
+            return 1
+        return max(1, min(_FTP_WALK_WIDTH, scan_budget, pool_max - 1))
+
+    def probe_rtt(self, n: int = 3) -> float | None:
+        """Median of ``n`` ``NOOP`` round trips on a pooled connection — how
+        fast this share's link is (``core/link_speed``).  The connection's
+        own setup / login is not part of the timing: it is borrowed first.
+        Waits at most 10 s for a connection (a busy pool must not hold a
+        probe — it is retried later)."""
+        from soniqboom.core.link_speed import median_rtt
+        prev = getattr(_BORROW_WAIT, "s", None)
+        _BORROW_WAIT.s = 10.0
+        samples: list[float] = []
+        try:
+            with self._pool.borrow(lane="browse") as handle:
+                for _ in range(max(1, n)):
+                    t0 = time.perf_counter()
+                    handle.conn.voidcmd("NOOP")
+                    samples.append(time.perf_counter() - t0)
+        finally:
+            _BORROW_WAIT.s = prev
+        return median_rtt(samples)
 
     def list_dir(self, path: str) -> list[DirEntry]:
         # Interactive file-browser listing → "browse" lane, NOT "scan" or "stream".
@@ -3654,8 +3952,8 @@ class FTPFileSource(FileSource):
         try:
             abs_path = self._abs(path)
             # ``scan`` lane by default — SIZE/CWD probes are scan-grade work;
-            # playback passes ``lane="stream"``.
-            with self._pool.borrow(lane=lane) as handle:
+            # playback passes ``lane="stream"``.  (``verify``: no retry here.)
+            with self._pool.borrow(lane=lane, verify=True) as handle:
                 ftp = handle.conn
                 try:
                     # Binary mode first: vsftpd / ProFTPD answer SIZE in ASCII
@@ -3690,7 +3988,7 @@ class FTPFileSource(FileSource):
                 return self._probe_on_own_connection(path)
             # ``browse`` lane: a reachability check (the health monitor, the
             # share's Test button) goes ahead of queued scan downloads.
-            with self._pool.borrow(lane="browse") as handle:
+            with self._pool.borrow(lane="browse", verify=True) as handle:
                 handle.conn.cwd(self._abs(path))
             return True
         except Exception as exc:

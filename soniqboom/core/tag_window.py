@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 MP4_EXTS = frozenset({".m4a", ".mp4", ".m4b", ".m4p"})
 MP4_FRONT = 256 * 1024           # ftyp + a fast-start moov header walk
 MOOV_CAP = 32 * 1024 * 1024      # refuse a moov larger than this (covers long m4b)
+MP4_TAIL = 8 * 1024 * 1024       # past the front read: an end of the file this short is read whole
 MAX_HDR_READS = 16               # cap header range reads (corrupt-file guard)
 
 _ID3_FRONT = 64 * 1024           # the ID3v2 header, and most whole tags
@@ -206,13 +207,36 @@ def mp4_window(source, path: str, file_size: int = 0, *, lane: str = "scan") -> 
             file_size = len(front)
 
     hdr_reads = [0]
+    # The end of the file, read whole once the walk passes the front read
+    # and what is left is at most ``MP4_TAIL``: the usual layout without
+    # "fast start" ends in ``mdat`` + ``moov``, so the atom header past the
+    # audio and the ``moov`` itself come in ONE read that runs to the end of
+    # the file (no early stop / ``ABOR``) instead of a 16-byte header read
+    # and a second read for the ``moov``.
+    tail: "list[tuple[int, bytes]]" = []
+
+    def from_tail(off: int, n: int) -> "bytes | None":
+        if tail:
+            t_off, t = tail[0]
+            if t_off <= off and off + n <= t_off + len(t):
+                return t[off - t_off:off - t_off + n]
+        return None
 
     def read_hdr(off: int) -> bytes:
         if off + 16 <= len(front):
             return front[off:off + 16]
+        got = from_tail(off, 16)
+        if got is not None:
+            return got
         hdr_reads[0] += 1
         if hdr_reads[0] > MAX_HDR_READS:      # corrupt / pathological layout
             return b""
+        if not tail and 16 < file_size - off <= MP4_TAIL:
+            # (one byte more than is left: the read runs into the end of the
+            # file — FTP then sees EOF and needs no ABOR to stop early)
+            data = source.read_at(path, off, file_size - off + 1, lane=lane)
+            tail.append((off, data))
+            return data[:16]
         return source.read_at(path, off, 16, lane=lane)
 
     loc = locate_moov(read_hdr, file_size)
@@ -229,8 +253,14 @@ def mp4_window(source, path: str, file_size: int = 0, *, lane: str = "scan") -> 
 
     if moov_off + moov_size <= len(front):
         moov_bytes = front[moov_off:moov_off + moov_size]
+    elif moov_off < len(front):
+        # A "fast start" moov larger than the front read (a big cover): only
+        # the part past the front is fetched.
+        rest = source.read_at(path, len(front), moov_off + moov_size - len(front), lane=lane)
+        moov_bytes = front[moov_off:] + rest if rest else b""
     else:
-        moov_bytes = source.read_at(path, moov_off, moov_size, lane=lane)
+        moov_bytes = (from_tail(moov_off, moov_size)
+                      or source.read_at(path, moov_off, moov_size, lane=lane))
     if not moov_bytes or len(moov_bytes) < 8:
         return None
 

@@ -15,6 +15,7 @@
 import { Player } from '../../player.js';
 import { attachRowGestures, attachListGestures, attachDragReorder } from '../gestures.js';
 import { fmtDur, esc, trackActions, playlistEntry, countNoun, freshArt } from './_common.js';
+import { askCoverWhenUseful, noteCoverShown, noteCoverGone } from '../../cover_status.js';
 import { artPlaceholderEmoji, probeAdlibDurations, staticArtUrl, compoLabel } from '../../utils.js';
 import { createVirtualList } from '../../vlist.js';
 import { offlineKind, offlineBadge, Offline } from '../../offline.js';
@@ -109,8 +110,10 @@ export function mountLibrary(root, ctx) {
       </div>`;
     // No cover (204) / not decoded: the img stays transparent over the glyph.
     const img = row.querySelector('img');
-    img.onload  = () => img.classList.add('loaded');
-    img.onerror = () => img.classList.remove('loaded');
+    // (``img.__seenId``: the track of a row without an embedded cover —
+    // remembered once it shows one, cover_status.js)
+    img.onload  = () => { img.classList.add('loaded'); if (img.__seenId) noteCoverShown(img.__seenId); };
+    img.onerror = () => { img.classList.remove('loaded'); if (img.__seenId) noteCoverGone(img.__seenId); };
     return row;
   }
 
@@ -126,14 +129,24 @@ export function mountLibrary(root, ctx) {
     emptyEl.classList.remove('hidden');
   }
 
-  function setArt(row, glyph, src) {
+  // ``id``: the row's track carries no embedded cover — its image is asked
+  // only when the batched status request (cover_status.js) does not know it
+  // to have none.  ``row.__artSrc`` is set either way, so an ``art_ready``
+  // for it asks the image (``reaskArt``, _common.js).
+  function setArt(row, glyph, src, id = null) {
     const art = row.querySelector('.m-row-art');
     art.firstElementChild.textContent = glyph;
     const img = art.lastElementChild;
     if (row.__artSrc === src) return;
     row.__artSrc = src;
+    img.__seenId = id || null;
     img.classList.remove('loaded');
-    if (src) img.src = src; else img.removeAttribute('src');
+    if (!src) { img.removeAttribute('src'); return; }
+    if (!id) { img.src = src; return; }
+    img.removeAttribute('src');
+    askCoverWhenUseful(id, () => {
+      if (row.__artSrc === src && !img.getAttribute('src')) img.src = src;
+    });
   }
 
   function setTitle(row, text, health = null, offline = '') {
@@ -187,7 +200,8 @@ export function mountLibrary(root, ctx) {
     row.__item = t;
     if (t.id) row.dataset.trackId = t.id; else delete row.dataset.trackId;
     // Art: the emoji placeholder always paints; the cover fades in over it.
-    setArt(row, artPlaceholderEmoji(t), freshArt(staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : '')));
+    setArt(row, artPlaceholderEmoji(t), freshArt(staticArtUrl(t.cover_art) || (t.id ? `/api/art/${t.id}/sm.jpg?fallback=none` : '')),
+           t.cover_art ? null : t.id);
     setTitle(row, t.title || '—', healthBadge(t), offlineKind(t));
     // (a party's list: the compo and place beside the artist)
     const compo = crumb && crumb.field === 'party' ? compoLabel(t, { party: false }) : '';

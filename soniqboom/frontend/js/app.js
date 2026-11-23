@@ -38,6 +38,7 @@ import { sidWasmPlaybackEnabled } from './sid-wasm-player.js';
 window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
 import { Library }    from './library.js';
+import { forgetCover, forgetAllCovers } from './cover_status.js';
 import { LibSync, snapshotPlan, watchBootLoads } from './lib_sync.js';
 import { Search }     from './search.js';
 import { FolderTree } from './foldertree.js';
@@ -3482,7 +3483,26 @@ function _disarmStuckBadgeWatchdog() {
 // ── WebSocket — scan progress ─────────────────────────────────────────────────
 // Cache-bust every in-DOM <img> for one track so it refetches the now-cached
 // cover (defeats a cached placeholder/no-art 204 by giving the URL a fresh _t).
+// A list row told "no cover" (cover_status.js) holds its URL in ``data-src``
+// and no ``src``: it asks now — ``id`` given, only that track's rows.
+function _askSkippedArt(trackId, token) {
+  try {
+    const sel = trackId
+      ? `img.row-cover-img[data-tid="${(window.CSS && CSS.escape) ? CSS.escape(trackId) : trackId}"]`
+      : 'img.row-cover-img[data-src]';
+    document.querySelectorAll(sel).forEach((img) => {
+      if (img.getAttribute('src') || !img.dataset.src) return;
+      let u;
+      try { u = new URL(img.dataset.src, location.href); } catch (_) { return; }
+      u.searchParams.set('_t', token || Date.now());
+      img.src = u.pathname + u.search;
+    });
+  } catch (_) { /* ignore */ }
+}
+
 function _bustArtImg(trackId) {
+  forgetCover(trackId);
+  _askSkippedArt(trackId);
   try {
     const want = `/api/art/${trackId}`;
     document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
@@ -3500,6 +3520,8 @@ function _bustArtImg(trackId) {
 // rule immediately: folder art appears when it's turned on, and already-shown
 // folder art disappears when it's turned off.
 function _bustAllArt() {
+  forgetAllCovers();
+  _askSkippedArt(null, window.__sbArtEpoch || Date.now());
   try {
     // Reuse the library-wide epoch so an on-screen bust and a later recycle-time
     // re-fill (library.js _fillTrackRow) share ONE cache key — no double-fetch.
@@ -3520,6 +3542,8 @@ function _bustAllArt() {
 // images that aren't already showing real art (no ``.loaded``), to avoid
 // re-fetching/flickering covers that are fine.
 function _rebustMissingArt() {
+  forgetAllCovers();                 // (an art_ready may have been missed)
+  _askSkippedArt(null);
   try {
     document.querySelectorAll('img[src*="/api/art/"]').forEach((img) => {
       if (img.classList.contains('loaded')) return;

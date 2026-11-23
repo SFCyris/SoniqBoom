@@ -73,7 +73,8 @@ async def test_folder_art_already_cached_is_copied_in_the_background(remote, mon
     t.cover_art = None
 
     async def _folder(key, size):
-        return b"\xff\xd8jpeg" if key == A._folder_art_cache_key("d1") else None
+        # (a share folder's shared cover is keyed with the share root: 2.1.2)
+        return b"\xff\xd8jpeg" if key == A._folder_cache_key(t.path, "d1") else None
     monkeypatch.setattr(A.art_cache, "get_art", _folder)
     first = await A.cover_art("r1", _Req(), size="sm", fallback="none")
     calls["resolve"].clear()

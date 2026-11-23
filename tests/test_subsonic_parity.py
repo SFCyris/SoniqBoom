@@ -150,7 +150,7 @@ def env(monkeypatch, tmp_path):
     async def _no_thumb(tid, bucket):
         return None
 
-    async def _full(tid):
+    async def _full(tid, **_kw):          # (wait_folder)
         e.art_requests.append(tid)
         return (b"\xff\xd8JPEG" + tid.encode(), "image/jpeg") if tid == "q2" else (None, None)
 
@@ -1187,7 +1187,7 @@ def test_star_versions_strictly_increase(env):
 def test_cover_art_pipeline_error_degrades_to_short_placeholder(env, monkeypatch):
     import soniqboom.api.art as art_mod
 
-    async def _boom(tid):
+    async def _boom(tid, **_kw):
         raise OSError("transient")
 
     monkeypatch.setattr(art_mod, "_resolve_full_art", _boom)

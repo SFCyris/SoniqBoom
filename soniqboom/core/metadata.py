@@ -1245,15 +1245,30 @@ def _replaygain_from_id3(tags) -> dict:
     return out
 
 
+# How far ``thumbnail`` may let the JPEG decoder shrink first (Pillow's
+# ``reducing_gap``).  A JPEG is decoded at 1/2, 1/4 or 1/8 scale straight from
+# its DCT data ("draft" decoding) as long as the result stays at least
+# ``gap`` × the target size; LANCZOS does the rest.  Pillow's default, 2.0,
+# already drafts.  1.0 was tried (2026-11-22) and REVERTED: up to 2.5× faster
+# on smooth photo-like covers at equal PSNR, but on detailed covers (text,
+# line art, pixel art — common here) 2–4 dB worse at 550 / 1024 px (3000 →
+# 1024 px: 34.3 → 31.8 dB) — visible.  Quality wins: kept at the default.
+_DRAFT_GAP = 2.0
+
+
 def resize_cover(data: bytes, max_size: int, quality: int = 85) -> bytes:
     """Resize cover art to fit within max_size x max_size, returned as JPEG bytes."""
     from io import BytesIO
     try:
         from PIL import Image
         img = Image.open(BytesIO(data))
-        img.thumbnail((max_size, max_size), Image.LANCZOS)
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
+        img.thumbnail((max_size, max_size), Image.LANCZOS, reducing_gap=_DRAFT_GAP)
+        if img.mode not in ("RGB", "L"):
+            # (a JPEG holds RGB or grey: LA / I;16 / PA failed to save and the
+            # FULL original came back as the "thumbnail"; CMYK was written as
+            # a CMYK JPEG some browsers show inverted)
+            img = img.convert("RGBA").convert("RGB") if "A" in img.mode or img.mode == "P" \
+                else img.convert("RGB")
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         return buf.getvalue()
@@ -2037,6 +2052,40 @@ def _mp4(path: Path, track_id: str) -> dict:
 
 # ── Vorbis comment (Ogg, Opus) ────────────────────────────────────────────────
 
+def vorbis_picture(tags) -> "tuple[bytes, str] | tuple[None, None]":
+    """The cover in a Vorbis comment block (Ogg Vorbis, Opus): a
+    ``METADATA_BLOCK_PICTURE`` (a base64 FLAC picture block — the front cover,
+    type 3, first, else the first with data), else the old ``COVERART``
+    (base64 image bytes, ``COVERARTMIME``).  ``(bytes, mime)`` or
+    ``(None, None)``.  Shared by the scan (``_vorbis``) and the cover
+    endpoint (``api/art._extract_cover``) — until 2.1.2 only the endpoint
+    read these pictures, so the scan stored no cover for such a file."""
+    import base64 as _b64
+    from mutagen.flac import Picture
+    if not tags:
+        return None, None
+    pics = []
+    for b64 in tags.get("metadata_block_picture", []) or []:
+        try:
+            pic = Picture(_b64.b64decode(b64))
+        except Exception:                               # noqa: BLE001 — one bad block never hides another
+            continue
+        if pic.data and pic.mime != "-->":          # ("-->": a URL link, not an image)
+            pics.append(pic)
+    pic = next((p for p in pics if p.type == 3), pics[0] if pics else None)
+    if pic is not None:
+        return pic.data, (pic.mime or "image/jpeg")
+    for b64 in tags.get("coverart", []) or []:
+        try:
+            data = _b64.b64decode(b64)
+        except Exception:                               # noqa: BLE001
+            continue
+        if data:
+            mime = (tags.get("coverartmime", []) or ["image/jpeg"])[0] or "image/jpeg"
+            return data, mime
+    return None, None
+
+
 def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
     tags = audio.tags or {}
 
@@ -2081,6 +2130,9 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
         "total_discs": _vorbis_total(g, tpos, "disctotal", "totaldiscs"),
     }
     out.update(_replaygain_from_vorbis(tags))
+    img, mime = vorbis_picture(tags)
+    if img:
+        out["cover_art"] = _cover_b64(img, mime)
     return out
 
 

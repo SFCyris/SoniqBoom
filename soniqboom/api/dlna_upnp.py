@@ -453,10 +453,10 @@ def _art_uri(track: dict, base_url: str) -> str:
         return ""
     known = bool(track.get("cover_art"))
     if not known and not catalogue.is_catalogue_path(track.get("path") or ""):
-        from soniqboom.api.art import _folder_art_cache_key
-        dh = track.get("dir_hash")
+        from soniqboom.api.art import _folder_cache_key
+        fk = _folder_cache_key(track.get("path") or "", track.get("dir_hash"))
         known = (art_cache.art_exists(tid, "lg") or art_cache.art_exists(tid, "full")
-                 or bool(dh and art_cache.art_exists(_folder_art_cache_key(dh), "full")))
+                 or bool(fk and art_cache.art_exists(fk, "full")))
     if not known:
         return ""
     url = f"{base_url.rstrip('/')}/dlna/art/{urllib.parse.quote(tid, safe='')}.jpg"
@@ -570,8 +570,10 @@ async def dlna_art(track_id: str):
     track = _dlna_store().get_track(track_id)
     if not track:
         raise HTTPException(404, "No such track.")
+    from soniqboom.api.art import FOLDER_WAIT_S
     data = await cover_thumb(
-        track_id, "lg", resolve=not catalogue.is_catalogue_path(track.get("path") or ""))
+        track_id, "lg", resolve=not catalogue.is_catalogue_path(track.get("path") or ""),
+        wait_folder=FOLDER_WAIT_S)
     if not data:
         raise HTTPException(404, "No cover.")
     return FResponse(content=data, media_type="image/jpeg",

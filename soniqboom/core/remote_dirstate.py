@@ -45,21 +45,50 @@ switch between MLSD seconds and LIST minutes, LIST dates ageing into the
 year-only form, a server clock change) gives no evidence either way.  After ``_PROPAGATION_MIN_YES`` such observations and none against
 (a folder whose subfolder changed while its own mtime stayed put), folders
 with subfolders are pruned by mtime as well.  One observation against turns
-it off for good (for this process).
+it off until the server restarts (the verdict is not kept across restarts).
 
-State lives in memory: after a restart the first fast poll of a share is a
-full walk, which records it again.  Only completed listings are recorded; a
-folder whose listing failed is forgotten, so the next walk lists it.  The
-scanner commits a walk's listings only once its changes are stored, and
-forgets the folders of files it could not store (``finish(forget=…)``).
+Only completed listings are recorded; a folder whose listing failed is
+forgotten, so the next walk lists it.  The scanner commits a walk's listings
+only once its changes are stored, and forgets the folders of files it could
+not store (``finish(forget=…)``).
+
+Kept across restarts (2.1.2)
+----------------------------
+Until 2.1.2 the state lived in memory only, so the first poll of every share
+after each restart was a full walk — at the measured cost of one listing
+(8.8 ms on a 1 ms LAN, 287 ms at 60 ms, suite FTP server behind a delay
+proxy) that is ~9 s per 1,000 folders on a LAN and ~5 min per 1,000 over the
+internet, repeated at every start.  The server's start (``preload``) now
+switches on persistence: the state is written to ``<data>/remote-folders-v1.json`` a little
+after each walk is committed (``_SAVE_DELAY_S``) and at the stop (``flush``),
+and read back at the next start.
+
+The state is only true together with the library it was committed with: a
+fast walk prunes a folder the state calls unchanged, so if the library lost
+tracks under it (an older library restored, a library replaced) they would
+stay missing until the next full walk.  So each share is saved with its
+number of stored tracks, and a share whose number differs when it is first
+used again is dropped (that share's first walk is full, as before).  A state
+older than the library is harmless — it only makes the fast walk list more.
+Entry names are kept as a short digest (``_Dir.sig``) and a count: all the
+state ever asks of them is "the same names as last time?" and "were there
+any?".  The propagation verdict (``prop_yes`` / ``prop_no``) is not saved:
+each start learns it again from its own walks, so fast polls list every
+folder with subfolders until ``_PROPAGATION_MIN_YES`` observations allow
+pruning them.  Tests and tools that don't call ``preload`` keep the state in
+memory only.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Iterable
 
 log = logging.getLogger(__name__)
@@ -101,14 +130,25 @@ def _parent(key: str) -> str:
     return head or "/"
 
 
-class _Dir:
-    __slots__ = ("mtime", "subdirs", "names", "listed", "fast")
+def names_sig(names: "Iterable[str]") -> str:
+    """A short digest of a folder's entry names (order-free) — what the
+    state keeps of them (``_Dir.sig``)."""
+    h = hashlib.blake2b(digest_size=10)
+    for n in sorted(names):
+        h.update(n.encode("utf-8", "surrogatepass"))
+        h.update(b"\0")
+    return h.hexdigest()
 
-    def __init__(self, mtime: float, subdirs: tuple, names: frozenset, listed: int,
+
+class _Dir:
+    __slots__ = ("mtime", "subdirs", "sig", "n", "listed", "fast")
+
+    def __init__(self, mtime: float, subdirs: tuple, sig: str, n: int, listed: int,
                  fast: int = 0):
         self.mtime = mtime          # as the parent listed it when this folder was listed
         self.subdirs = subdirs      # child folder keys
-        self.names = names          # every entry name (files and folders)
+        self.sig = sig              # ``names_sig`` of every entry name (files and folders)
+        self.n = n                  # how many entries
         self.listed = listed        # walk sequence of the last listing
         self.fast = fast            # walk sequence of the last FAST walk that listed it
                                     # (the round-robin's order: a full walk lists all)
@@ -126,6 +166,7 @@ class ShareDirs:
         # in the last walk: not believed until a later walk lists them empty
         # again (``WalkPlan.unconfirmed_empty``).
         self.suspect_empty: set[str] = set()
+        self.used_at = time.time()      # last walk committed (saved shares unused long are dropped)
         self.lock = threading.Lock()
 
     @property
@@ -143,8 +184,14 @@ _states_lock = threading.Lock()
 def _get(scan_root: str) -> ShareDirs:
     with _states_lock:
         st = _states.get(scan_root)
+        if st is not None:
+            _states.move_to_end(scan_root)
+            return st
+    saved = _adopt(scan_root)           # (outside the lock: asks the library)
+    with _states_lock:
+        st = _states.get(scan_root)
         if st is None:
-            st = _states[scan_root] = ShareDirs()
+            st = _states[scan_root] = saved or ShareDirs()
             while len(_states) > _MAX_SHARES:
                 _states.popitem(last=False)
         else:
@@ -155,6 +202,9 @@ def _get(scan_root: str) -> ShareDirs:
 def has_state(scan_root: str) -> bool:
     with _states_lock:
         st = _states.get(scan_root)
+        if st is None and _saved:
+            entry = _saved.get(scan_root)
+            return entry is not None and "/" in entry[1].dirs
     return st is not None and "/" in st.dirs
 
 
@@ -162,6 +212,187 @@ def forget(scan_root: str) -> None:
     """Drop a scan root's state (the share was removed)."""
     with _states_lock:
         _states.pop(scan_root, None)
+        gone = _saved.pop(scan_root, None) is not None
+    if _persist or gone:
+        _save_soon()
+
+
+# ── kept across restarts ─────────────────────────────────────────────────────
+_FILE = "remote-folders-v1.json"
+_SAVE_DELAY_S = 30.0         # after a walk's commit: one write for a burst of walks
+_persist = False             # switched on by ``preload`` (the server's start)
+# Shares read from the file and not used yet: scan root → (tracks stored when
+# saved, state).  Checked against the library when first used (``_adopt``).
+_saved: "dict[str, tuple[int, ShareDirs]]" = {}
+_io_lock = threading.Lock()
+_write_lock = threading.Lock()  # held across a whole save
+_UNUSED_DROP_S = 60 * 86400.0   # a saved share not used for this long is not saved again
+_saver: "threading.Timer | None" = None
+_dirty = False
+
+
+def _path() -> Path:
+    from soniqboom.config import get_data_dir
+    return Path(get_data_dir()) / _FILE
+
+
+def _tracks_stored(scan_root: str) -> "int | None":
+    """How many tracks the library holds under ``scan_root`` (its
+    ``scan_root_hash`` tag, as the scanner keys them) — None when the
+    library can't say."""
+    try:
+        from soniqboom.core.store import get_store
+        h = hashlib.sha256(scan_root.encode()).hexdigest()[:16]
+        return len(get_store().get_track_ids_for_scan_root(h) or ())
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _adopt(scan_root: str) -> "ShareDirs | None":
+    """The saved state of ``scan_root`` if it still belongs to the library:
+    the same number of stored tracks as when it was saved (see the module
+    docstring).  Taken out of ``_saved`` either way."""
+    with _states_lock:
+        entry = _saved.pop(scan_root, None)
+    if entry is None:
+        return None
+    count, st = entry
+    now = _tracks_stored(scan_root)
+    if now is None or now != count:
+        log.info("Remote folders of %s: the saved folder state is dropped (%s tracks "
+                 "stored then, %s now) — the next walk lists every folder",
+                 scan_root, count, now)
+        return None
+    log.info("Remote folders of %s: %d folders known from the last run", scan_root,
+             len(st.dirs))
+    return st
+
+
+def _row(key: str, d: _Dir) -> list:
+    return [key, d.mtime, [c.rpartition("/")[2] for c in d.subdirs], d.sig, d.n,
+            d.listed, d.fast]
+
+
+def _share_out(st: ShareDirs, count: int) -> dict:
+    with st.lock:                       # (a quick copy: ``finish`` replaces _Dirs, never edits them)
+        items = list(st.dirs.items())
+        head = {"tracks": count, "seq": st.seq,       # (not prop_yes/prop_no: docstring)
+                "suspect": sorted(st.suspect_empty), "at": st.used_at}
+    head["dirs"] = [_row(k, d) for k, d in items]
+    return head
+
+
+def _share_in(raw: dict) -> "tuple[int, ShareDirs] | None":
+    st = ShareDirs()
+    st.seq = int(raw["seq"])
+    st.suspect_empty = {str(k) for k in raw.get("suspect") or ()}
+    st.used_at = float(raw.get("at") or time.time())
+    for key, mtime, subs, sig, n, listed, fast in raw["dirs"]:
+        key = norm(str(key))
+        base = "" if key == "/" else key
+        st.dirs[key] = _Dir(float(mtime), tuple(f"{base}/{c}" for c in subs),
+                            str(sig), int(n), int(listed), int(fast))
+    if "/" not in st.dirs:
+        return None
+    return int(raw["tracks"]), st
+
+
+def preload() -> None:
+    """Switch persistence on and read the saved state (the server's start,
+    in a worker thread)."""
+    global _persist
+    _persist = True
+    for stale in _path().parent.glob(f"{_FILE}.*.tmp"):     # (a save cut short)
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    try:
+        raw = json.loads(_path().read_text(encoding="utf-8"))
+        if raw.get("v") != 1:
+            return
+        loaded: "dict[str, tuple[int, ShareDirs]]" = {}
+        for root, share in (raw.get("shares") or {}).items():
+            try:
+                got = _share_in(share)
+            except (KeyError, TypeError, ValueError) as exc:
+                log.debug("saved folder state of %s unreadable (%s)", root, exc)
+                continue
+            if got is not None:
+                loaded[str(root)] = got
+    except FileNotFoundError:
+        return
+    except Exception as exc:                           # noqa: BLE001 — rebuilt by the next walks
+        log.debug("saved remote folder state unreadable (%s) — starting without it", exc)
+        return
+    with _states_lock:
+        for root, got in loaded.items():
+            if root not in _states:
+                _saved[root] = got
+    log.info("Remote folder state of %d share(s) read", len(loaded))
+
+
+def _save_soon() -> None:
+    global _dirty, _saver
+    if not _persist:
+        return
+    with _io_lock:
+        _dirty = True
+        if _saver is not None:
+            return
+        _saver = threading.Timer(_SAVE_DELAY_S, _save)
+        _saver.daemon = True
+        _saver.start()
+
+
+def _save() -> None:
+    with _write_lock:                   # one save at a time; ``flush`` waits for a running one
+        _save_locked()
+
+
+def _save_locked() -> None:
+    global _dirty, _saver
+    with _io_lock:
+        _saver = None
+        if not _dirty:
+            return
+        _dirty = False
+    with _states_lock:
+        live = list(_states.items())
+        waiting = dict(_saved)
+    shares: dict = {}
+    for root, st in live:
+        if "/" not in st.dirs:
+            continue
+        count = _tracks_stored(root)
+        if count is None:
+            continue
+        shares[root] = _share_out(st, count)
+    old = time.time() - _UNUSED_DROP_S
+    for root, (count, st) in waiting.items():      # not used this run: as read …
+        if st.used_at >= old:                       # … unless unused for long (a removed share)
+            shares.setdefault(root, _share_out(st, count))
+    p = _path()
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({"v": 1, "shares": shares}, separators=(",", ":")),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError as exc:
+        log.warning("Remote folder state not saved: %s", exc)
+        tmp.unlink(missing_ok=True)
+
+
+def flush() -> None:
+    """Write a pending change now (the server's stop — ``main.shutdown``'s
+    "remote-folders" step — and tests)."""
+    global _saver
+    with _io_lock:
+        t, _saver = _saver, None
+    if t is not None:
+        t.cancel()
+    _save()
 
 
 def snapshot(scan_root: str) -> dict:
@@ -201,6 +432,7 @@ class WalkPlan:
                 self.force = self._rotation()
                 self.deep = self._deep_set()
         self.listed: dict[str, tuple[frozenset, dict[str, float]]] = {}
+        self.sigs: dict[str, str] = {}          # ``names_sig`` per listed folder (walk thread)
         self.seen_mtime: dict[str, float] = {}
         self.failed: set[str] = set()
         self._suspects: "set[str] | None" = None     # unconfirmed_empty's verdict
@@ -283,6 +515,7 @@ class WalkPlan:
             subs[ck] = e.mtime
             self.seen_mtime.setdefault(ck, e.mtime)
         self.listed[key] = (names, subs)
+        self.sigs[key] = names_sig(names)       # (here, on the walk's thread — not in finish)
 
     def unconfirmed_empty(self, holds) -> set[str]:
         """Folders this walk listed EMPTY, without an error, although they
@@ -304,7 +537,7 @@ class WalkPlan:
                 if names or key == "/" or key in self.failed:
                     continue
                 old = dirs.get(key)
-                if not ((old is not None and old.names) or holds(key)):
+                if not ((old is not None and old.n) or holds(key)):
                     continue                    # empty before too, or holds nothing
                 if key in suspects:
                     continue                    # empty twice in a row: believed
@@ -318,6 +551,7 @@ class WalkPlan:
         folders (keys or paths) to leave unknown — their listing showed files
         the scan could not store, so the next walk must list them again."""
         sh = self.share
+        sigs = self.sigs
         with sh.lock:
             dirs = sh.dirs
             yes = no = 0
@@ -337,7 +571,7 @@ class WalkPlan:
             if known and moved <= known * _MASS_SHIFT_FRAC:
                 for key, (names, subs) in self.listed.items():
                     old = dirs.get(key)
-                    if old is None or key == "/" or old.names != names or old.mtime <= 0:
+                    if old is None or key == "/" or old.sig != sigs[key] or old.mtime <= 0:
                         continue
                     cur = self.seen_mtime.get(key, 0.0)
                     if cur <= 0:
@@ -358,7 +592,7 @@ class WalkPlan:
                 if old is not None:
                     removed.update(set(old.subdirs) - set(subs))
                 dirs[key] = _Dir(self.seen_mtime.get(key, 0.0) if key != "/" else 0.0,
-                                 tuple(subs), names, self.seq,
+                                 tuple(subs), sigs[key], len(names), self.seq,
                                  self.seq if self.fast else (old.fast if old is not None else 0))
             for key in self.failed:
                 dirs.pop(key, None)             # unknown now: listed next time
@@ -374,6 +608,7 @@ class WalkPlan:
                 pre = tuple(k.rstrip("/") + "/" for k in removed)
                 for k in [k for k in dirs if k in removed or (pre and k.startswith(pre))]:
                     dirs.pop(k, None)
+            sh.used_at = time.time()
             was = sh.propagates
             sh.prop_yes += yes
             sh.prop_no += no
@@ -383,6 +618,7 @@ class WalkPlan:
                          else "don't propagate changes to parent folders",
                          "fast polls prune unchanged folders with subfolders"
                          if sh.propagates else "fast polls list every folder with subfolders")
+        _save_soon()                    # (kept across restarts — module docstring)
 
     # ── deletions seen by a fast walk ─────────────────────────────────────
     def confirmed_absent(self, rel: str) -> bool:

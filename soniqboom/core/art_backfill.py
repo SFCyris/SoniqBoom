@@ -27,7 +27,10 @@ Where the cover lives is format-deterministic:
 
 Orchestration: coalesced (one in-flight task per track), bounded concurrency,
 and a short cooldown on failure so a genuinely-unreadable file isn't retried in
-a storm.
+a storm.  Waiting recoveries are served NEWEST FIRST (``_pending``, as the
+folder covers in ``core/folder_covers``): a fast scroll through a list asks
+hundreds of covers, and the rows on screen now are the ones asked last — with
+the old first-come order they waited behind every row scrolled past.
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ import logging
 import os
 import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -43,7 +47,7 @@ log = logging.getLogger(__name__)
 _MP4_EXTS = {".m4a", ".mp4", ".aac", ".m4b", ".m4p"}
 _DEFAULT_FRONT = 1024 * 1024      # fallback front budget for non-MP4 formats
 
-_MAX_CONCURRENCY = 4
+_MAX_CONCURRENCY = 4              # a share whose link is fast or not measured
 # The share's lane for the range reads: a cover is asked for by what is on
 # screen (a list row, the player, Track Info), so they go before the
 # background passes' reads ("scan": length fill-in, enrichment) and after
@@ -52,10 +56,26 @@ _LANE = "browse"
 _NEG_COOLDOWN_S = 300.0           # don't retry a failed backfill for 5 minutes
 _NEG_MAX = 1024                   # prune the failure map past this many entries
 
-_inflight: set[str] = set()
+_inflight: set[str] = set()       # queued or running
 _neg: dict[str, float] = {}       # track_id -> monotonic time of last failure
 _tasks: set[asyncio.Task] = set()
-_sem: asyncio.Semaphore | None = None
+# Waiting recoveries, newest last (served from the end); each running one's
+# share.  How many covers a share recovers at once follows its measured link
+# (``core/link_speed.limits().backfill``): each recovery is a few small ranged
+# reads, so on a slow link it is mostly waiting — 8 at once there, the old 4
+# on a fast or unmeasured link.  All shares together stay within
+# ``_TOTAL_MAX`` (several shares no longer multiply the old global 4 freely).
+_pending: "OrderedDict[str, object]" = OrderedDict()
+# The same requests by share, each newest last, and when each share was last
+# asked — ``_pump`` (on the event loop, at every request and every end)
+# looks at a few shares, never at every waiting request: with 4000 waiting
+# it walked all of them each time (22 s of loop time for 4000 requests).
+_by_root: "dict[str, OrderedDict[str, object]]" = {}
+_asked_at: "dict[str, float]" = {}
+_running: "dict[str, str]" = {}   # track_id -> share root
+_running_by_root: "dict[str, int]" = {}
+_TOTAL_MAX = 12
+_MAX_PENDING = 4000               # the oldest waiting request drops out past this
 
 
 def _is_remote(path_str: str) -> bool:
@@ -63,13 +83,78 @@ def _is_remote(path_str: str) -> bool:
     return is_remote_path(path_str)
 
 
-def _get_sem() -> asyncio.Semaphore:
-    # Created lazily, inside the running loop, so it always binds to the right
-    # event loop (bullet-proofing beyond the 3.11+ lazy-binding behaviour).
-    global _sem
-    if _sem is None:
-        _sem = asyncio.Semaphore(_MAX_CONCURRENCY)
-    return _sem
+def _root_of(path_str: str) -> str:
+    try:
+        from soniqboom.core.filesource import parse_remote_path
+        return parse_remote_path(path_str)[0] or ""
+    except Exception:                               # noqa: BLE001
+        return ""
+
+
+def _width(scan_root: str) -> int:
+    """How many covers share ``scan_root`` recovers at once (its link)."""
+    if not scan_root:
+        return _MAX_CONCURRENCY
+    from soniqboom.core import link_speed
+    from soniqboom.core.filesource import get_source
+    return link_speed.limits(get_source(scan_root)).backfill
+
+
+def _pump() -> None:
+    """Start the newest waiting recoveries the shares have room for — the
+    share asked most recently first, within it the newest request first."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if not _pending or len(_running) >= _TOTAL_MAX:
+        return
+    for root in sorted(_by_root, key=lambda r: _asked_at.get(r, 0.0), reverse=True):
+        q = _by_root.get(root)
+        if not q:
+            _by_root.pop(root, None)
+            continue
+        width = _width(root)
+        while q and _running_by_root.get(root, 0) < width and len(_running) < _TOTAL_MAX:
+            tid, track = q.popitem(last=True)
+            _pending.pop(tid, None)
+            _running[tid] = root
+            _running_by_root[root] = _running_by_root.get(root, 0) + 1
+            try:
+                t = loop.create_task(_run(track))
+            except Exception:                       # noqa: BLE001 — never leave it stuck
+                _done_running(tid)
+                _inflight.discard(tid)
+                continue
+            _tasks.add(t)
+            t.add_done_callback(_tasks.discard)
+        if not q:
+            _by_root.pop(root, None)
+        if len(_running) >= _TOTAL_MAX:
+            break
+
+
+def _done_running(tid: str) -> None:
+    root = _running.pop(tid, None)
+    if root is None:
+        return
+    n = _running_by_root.get(root, 1) - 1
+    if n > 0:
+        _running_by_root[root] = n
+    else:
+        _running_by_root.pop(root, None)
+
+
+def pending(tid: str) -> bool:
+    """Is the embedded cover of ``tid`` waiting or being recovered?"""
+    return tid in _inflight
+
+
+def failed_recently(tid: str) -> bool:
+    """Did recovering ``tid``'s embedded cover find none (or fail) within
+    the cooldown?  (``api/art`` then lets the folder image stand in.)"""
+    last = _neg.get(tid)
+    return last is not None and (time.monotonic() - last) < _NEG_COOLDOWN_S
 
 
 def _record_failure(tid: str) -> None:
@@ -107,23 +192,31 @@ def request_backfill(track) -> None:
         if not getattr(track, "cover_art", None):     # scan saw no embedded cover
             return
         if tid in _inflight:
+            if tid in _pending:
+                _pending.move_to_end(tid)             # asked again: on screen now
+                q = _by_root.get(_root_of(path))
+                if q is not None and tid in q:
+                    q.move_to_end(tid)
+                _asked_at[_root_of(path)] = time.monotonic()
             return
         last = _neg.get(tid)
         if last is not None and (time.monotonic() - last) < _NEG_COOLDOWN_S:
             return
-        loop = asyncio.get_running_loop()             # RuntimeError off-loop
+        asyncio.get_running_loop()                    # RuntimeError off-loop
     except RuntimeError:
         return
-    # Mark in-flight only after we know we can schedule, and back it out if the
-    # task can't be created — so a track can never get permanently stuck.
+    root = _root_of(path)
     _inflight.add(tid)
-    try:
-        t = loop.create_task(_run(track))
-    except Exception:
-        _inflight.discard(tid)
-        return
-    _tasks.add(t)
-    t.add_done_callback(_tasks.discard)
+    _pending[tid] = track
+    _by_root.setdefault(root, OrderedDict())[tid] = track
+    _asked_at[root] = time.monotonic()
+    while len(_pending) > _MAX_PENDING:
+        old, old_track = _pending.popitem(last=False)  # the oldest waiting request
+        _inflight.discard(old)
+        q = _by_root.get(_root_of(getattr(old_track, "path", "") or ""))
+        if q is not None:
+            q.pop(old, None)
+    _pump()
 
 
 async def _run(track) -> None:
@@ -131,10 +224,9 @@ async def _run(track) -> None:
     try:
         ext = os.path.splitext(track.path)[1].lower()
         file_size = int(getattr(track, "file_size", 0) or 0)
-        async with _get_sem():
-            data, mime = await asyncio.to_thread(
-                _fetch_remote_cover, track.path, file_size, ext,
-            )
+        data, mime = await asyncio.to_thread(
+            _fetch_remote_cover, track.path, file_size, ext,
+        )
         if data:
             from soniqboom.core import art_cache
             from soniqboom.core.metadata import cap_full_cover
@@ -143,6 +235,8 @@ async def _run(track) -> None:
             loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, cap_full_cover, data)
             await art_cache.store_art(tid, data, "full")
+            # (the file's own picture: not a copy of its folder's image)
+            await asyncio.to_thread(art_cache.unmark_from_folder, tid)
             # Generate thumbs now so the first grid view is instant.
             try:
                 from soniqboom.api.art import _generate_and_cache_thumbs
@@ -168,6 +262,14 @@ async def _run(track) -> None:
                       tid, len(data))
         else:
             _record_failure(tid)
+            # (no picture found in the file: its row asks again and gets the
+            # folder's image, which ``api/art`` holds back while an embedded
+            # cover is being recovered)
+            try:
+                from soniqboom.api.library import _broadcast
+                await _broadcast({"event": "art_ready", "track_id": tid})
+            except Exception:                       # noqa: BLE001
+                pass
     except (TimeoutError, ConnectionError, OSError) as exc:
         # Transient network / FTP-pool-contention failure — do NOT poison the
         # 5-minute cooldown, or a single slow moment locks a track's art out
@@ -180,6 +282,8 @@ async def _run(track) -> None:
         log.debug("art-backfill failed for %s", tid, exc_info=True)
     finally:
         _inflight.discard(tid)
+        _done_running(tid)
+        _pump()
 
 
 # ── Format-aware fetch (runs in a worker thread) ────────────────────────────

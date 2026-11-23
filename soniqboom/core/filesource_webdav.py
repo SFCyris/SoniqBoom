@@ -275,6 +275,21 @@ class WebDAVFileSource(FileSource):
         item = items[0]
         return FileStat(size=item["size"], mtime=item["mtime"], is_dir=item["is_dir"])
 
+    def probe_rtt(self, n: int = 3) -> "float | None":
+        """Median of ``n`` ``OPTIONS`` requests on the share's base URL — how
+        fast this share's link is (``core/link_speed``).  Any answer counts
+        (a plain web server answering 405 / 501 is a round trip all the
+        same); the first request may also open the connection, which the
+        median of three leaves out."""
+        import time as _time
+        from soniqboom.core.link_speed import median_rtt
+        samples: list[float] = []
+        for _ in range(max(1, n)):
+            t0 = _time.perf_counter()
+            self._client.request("OPTIONS", self._base)
+            samples.append(_time.perf_counter() - t0)
+        return median_rtt(samples)
+
     def list_dir(self, path: str) -> list[DirEntry]:
         rel_dir = self._rel(path).strip("/")
         url = self._url(rel_dir, collection=True)

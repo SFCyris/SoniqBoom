@@ -13,6 +13,7 @@ import { listTuneCount, tunesBadge } from './tunes.js';
 import { healthBadge, canReport, mark as healthMark, isUnplayable } from './health.js';
 import { onUiStyleChange } from './ui_style.js';
 import { FolderTree } from './foldertree.js';
+import { askCoverWhenUseful, knownNoCover, noteCoverShown, noteCoverGone } from './cover_status.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
 // data (a windowed chunk stored it and its rows stayed on the shimmer for good).
@@ -1122,9 +1123,24 @@ function _fillTrackRow(tr, t, i) {
       coverImg.removeAttribute('src');
       coverImg.classList.remove('loaded');
       if (src) {
-        coverImg.onload  = () => coverImg.classList.add('loaded');
-        coverImg.onerror = () => coverImg.classList.remove('loaded');
-        coverImg.src = src;
+        // (a track WITHOUT an embedded cover that shows one is remembered, so
+        // its row asks its image at once next time — cover_status.js)
+        const seenId = t.cover_art ? null : t.id;
+        coverImg.onload  = () => { coverImg.classList.add('loaded'); if (seenId) noteCoverShown(seenId); };
+        coverImg.onerror = () => { coverImg.classList.remove('loaded'); if (seenId) noteCoverGone(seenId); };
+        if (pendingBust || t.cover_art) {
+          coverImg.src = src;              // an embedded cover (or one just found): ask now
+        } else {
+          // No embedded cover: one batched "which of these have any cover?"
+          // request for the paint (cover_status.js); a track known to have
+          // none never asks its image.  The row may have been recycled to
+          // another track by the time the answer is in — then it does not ask.
+          const id = t.id;
+          askCoverWhenUseful(id, () => {
+            if (coverImg.dataset.tid === id && coverImg.dataset.src === src
+                && !coverImg.getAttribute('src')) coverImg.src = src;
+          });
+        }
       }
     }
   }
@@ -2576,7 +2592,8 @@ tbody.addEventListener('mouseover', (e) => {
   if (!tr) return;
   const i = parseInt(tr.dataset.idx, 10);
   const t = currentTracks[i];
-  if (!t || !t.id || _hoverWarmed(t.id)) return;
+  // (a track known to have no cover — cover_status.js — has none to warm)
+  if (!t || !t.id || _hoverWarmed(t.id) || knownNoCover(t.id)) return;
   clearTimeout(_hoverPrefetchTimer);
   _hoverPrefetchTimer = setTimeout(() => {
     if (_hoverWarmed(t.id)) return;
