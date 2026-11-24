@@ -425,3 +425,13 @@ test('every scripted change of the search text tells its listeners (Save search)
   assert.match(app, /_searchInputEl\.addEventListener\('input', _syncSaveSmart\);/);
   assert.match(app, /_searchInputEl\.addEventListener\('sb:search-set', _syncSaveSmart\);/);
 });
+
+test('a view that failed names the server\'s error: every status library.js throws reads "HTTP <status>"', () => {
+  // _viewErrorText finds the status only in that form — a bare "500" (History,
+  // the other smart views and Duplicates did that) said "The server didn't answer."
+  const src = read('soniqboom/frontend/js/library.js');
+  assert.ok(src.includes('/\\bHTTP (\\d{3})\\b/.exec('), "_viewErrorText's HTTP <status> pattern not found");
+  const thrown = [...src.matchAll(/throw new Error\(([^;\n]*\.status[^;\n]*)\)/g)].map((m) => m[1]);
+  assert.ok(thrown.length >= 3, 'the status errors were not found');
+  for (const arg of thrown) assert.match(arg, /^`HTTP \$\{\w+\.status\}`$/, `library.js throws ${arg}`);
+});

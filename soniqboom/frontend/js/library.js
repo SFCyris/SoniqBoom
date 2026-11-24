@@ -5796,7 +5796,7 @@ async function showSmart(view, label) {
   try {
     const url = `/api/smart/${view}`;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`${res.status}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
 
@@ -5822,7 +5822,7 @@ async function showSmart(view, label) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: unique }),
       });
-      if (!r.ok) throw new Error(`${r.status}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const allTracks = await r.json();
       if (_gen !== _browseNavGen) return;   // superseded during the history hydrate
       const trackMap = Object.fromEntries(allTracks.map(t => [t.id, t]));
@@ -5931,7 +5931,7 @@ async function showDuplicates() {
 
   try {
     const res = await fetch('/api/smart/duplicates?limit=200');
-    if (!res.ok) throw new Error(`${res.status}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const groups = await res.json();
     if (_gen !== _browseNavGen) return;   // superseded by a newer view while fetching
 
