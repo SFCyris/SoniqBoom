@@ -45,9 +45,9 @@ const emptyEl          = document.getElementById('track-empty');
 // Capture the default empty-state markup at module load.  Per-call
 // customisations (``_renderBranchEmpty`` for branch-folder clicks,
 // ``showDuplicates`` for the dedicated dupe view) overwrite
-// ``emptyEl.innerHTML``; ``renderTracks`` restores this snapshot
-// whenever it gets a fresh, non-empty result set so the customised
-// markup doesn't leak into unrelated views.
+// ``emptyEl.innerHTML``; the next view puts this snapshot back
+// (``_clearViewMessage``, and ``renderTracks`` for any non-empty result)
+// so the customised markup doesn't leak into unrelated views.
 const _EMPTY_DEFAULT_HTML = emptyEl.innerHTML;
 // Set by showAll() when the WHOLE library is empty (total === 0); consumed once
 // by renderTracks() to decide whether the empty state shows the "add a folder"
@@ -757,7 +757,7 @@ function _showSkeletonRows(count = 18) {
   // let go of their rows (the next render starts a fresh pool).
   _resetLists();
   tbody.innerHTML = '';
-  _clearViewError();
+  _clearViewMessage();
   emptyEl.hidden = true;
   loadingEl.hidden = true;
   for (let i = 0; i < count; i++) {
@@ -1887,21 +1887,17 @@ async function renderTracks(tracks, { keepScroll = false } = {}) {
   _lastClickIdx = -1;
   _focusedIdx   = -1;
 
-  // Reset the empty-state markup every time — both ``showDuplicates``
-  // ("No duplicate tracks found.") and ``_renderBranchEmpty`` (branch-
-  // folder copy + opt-in recursive button) replace the heading and
-  // body for their specific cases.  Restoring the default snapshot
-  // captured at module load keeps the empty state consistent across
-  // view switches.
-  if (emptyEl.innerHTML !== _EMPTY_DEFAULT_HTML
-      && (tracks.length > 0 || emptyEl.querySelector('[data-view-error], [data-view-empty]'))) {
-    // Only restore when we have real tracks to render — keeps the
-    // customised state visible while the empty case persists.  (A load error's
-    // message never outlives the view it was about.)
-    emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
-  } else if (tracks.length > 0) {
-    // No-op: default markup is already in place.
+  // The empty-state markup: ``_setViewEmpty`` (the smart views, and
+  // ``showDuplicates``'s "No duplicate tracks found.") and ``_showViewError``
+  // (a view that failed to load) replace the heading and body for their
+  // specific cases.  A list with tracks gets the default snapshot captured at
+  // module load back; an empty one first drops the last view's own message
+  // (``_clearViewMessage``), then always gets its heading and its CTA shown or
+  // hidden below.
+  if (tracks.length > 0) {
+    if (emptyEl.innerHTML !== _EMPTY_DEFAULT_HTML) emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
   } else {
+    _clearViewMessage();
     // Empty result.  Show the "add a folder" CTA + matching heading ONLY when
     // the whole library is empty (showAll set _showAddFolderCta); a merely
     // filtered/searched-empty view gets neutral copy and no misdirected CTA.
@@ -1966,9 +1962,12 @@ async function renderTracks(tracks, { keepScroll = false } = {}) {
   _updateAzRail();
 }
 
-// The load-error message of a view that is gone (see _showViewError).
-function _clearViewError() {
-  if (emptyEl.querySelector('[data-view-error]')) emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
+// A view's own message (_showViewError's "Couldn't load this view",
+// _setViewEmpty's empty smart / duplicates view) never outlives that view:
+// the next one (its loading skeleton, an empty track list, a group list)
+// starts from the default markup.
+function _clearViewMessage() {
+  if (emptyEl.querySelector('[data-view-error], [data-view-empty]')) emptyEl.innerHTML = _EMPTY_DEFAULT_HTML;
 }
 
 // [view-error:begin] — tests/js/list_place.test.mjs runs this region as is
@@ -4444,7 +4443,7 @@ function _renderAlbumGrid(items, nameKey, countKey, countLabel, onClick, keepScr
   _albumGridMeta = { nameKey, countKey, countLabel };
   // The empty-list message lives in #track-list-wrap: keep it shown for an
   // empty grid.
-  _clearViewError();
+  _clearViewMessage();
   emptyEl.hidden = items.length > 0;
   _listWrap.style.display = items.length ? 'none' : '';
   _gridHidList = true;
@@ -4586,7 +4585,7 @@ const _groupVL = createVirtualList({
 // ``keepScroll``: the group list on screen shows a new item list (the filter)
 // at the same scroll position — its rows are repainted in place.
 function _renderGroupRows(items, nameKey, countKey, countLabel, onClick, keepScroll = false) {
-  _clearViewError();
+  _clearViewMessage();
   emptyEl.hidden = items.length > 0;
   if (!(keepScroll && _groupRows && _groupVL.active)) {
     // Group rows replace the tbody — the track rows (or a previous group list)
@@ -5765,7 +5764,7 @@ const _SMART_EMPTY = {
 };
 
 // An empty smart / duplicates view: its own heading and line.  Marked so the
-// next render with tracks (or another empty view) puts the default text back.
+// next view puts the default text back (_clearViewMessage).
 function _setViewEmpty(heading, line, { hidesOffline = false } = {}) {
   // ("Tracks on unavailable drives: Hide" may be why the view is empty.)
   if (hidesOffline && Offline.mode === 'hide') line = `${line} Tracks on unavailable drives are not shown.`.trim();
