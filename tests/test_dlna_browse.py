@@ -27,11 +27,12 @@ NS = {"d": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/",
 ROOT = "/music/lib"
 
 
-def _row(tid, rel, fmt, **kw):
-    t = {"id": tid, "path": f"{ROOT}/{rel}", "title": tid, "artist": "A",
+def _row(tid, rel, fmt, root=ROOT, **kw):
+    path = f"{root}:/{rel}" if "://" in root else f"{root}/{rel}"   # (a share's rows: root:/rel)
+    t = {"id": tid, "path": path, "title": tid, "artist": "A",
          "album": "", "format": fmt, "duration": 120.0,
-         "scan_root_hash": path_hash(ROOT),
-         "dir_hash": path_hash(f"{ROOT}/{rel}".rsplit("/", 1)[0])}
+         "scan_root_hash": path_hash(root),
+         "dir_hash": path_hash(path.rsplit("/", 1)[0])}
     t.update(kw)
     return t
 
@@ -39,8 +40,12 @@ def _row(tid, rel, fmt, **kw):
 @pytest.fixture
 def store(monkeypatch, tmp_data_dir):
     from soniqboom.config import settings
+    from soniqboom.core import store as store_mod
     s = TrackStore()
-    monkeypatch.setattr("soniqboom.core.store.get_store", lambda: s)
+    # The store ``get_store()`` returns, not ``get_store`` itself: a module
+    # first imported during a test (``api.playlist``, ``api.art`` …) binds
+    # ``get_store`` by name and would keep a stand-in after the test.
+    monkeypatch.setattr(store_mod, "_store", s)
     monkeypatch.setattr(settings, "folder_aliases", {ROOT: "My music"})
     s.upsert_scan_dir(ROOT)
     s.upsert_tracks_batch([
@@ -361,3 +366,334 @@ def test_mp4_and_wav_are_offered_as_the_stream_endpoint_serves_them(browse, stor
     items = {r["id"]: r for r in browse("music/all")[0]}
     assert [m for m, _, _ in items["m4a1"]["res"]] == ["audio/flac", "audio/mpeg"]
     assert [m for m, _, _ in items["wav1"]["res"]] == ["audio/wav"]
+
+
+# ── folder order (2026-11-24) ──────────────────────────────────────────────
+# A folder lists its subfolders in the folder tree's order
+# (``fstree._folder_sort_key``: CD2 before CD10, case-insensitive, the name
+# breaking a tie), then its own tracks in path order, as its web listing does.
+
+# Each disc holds a different number of tracks, so a count that went with
+# another disc's name would show.
+BOX_DISCS = {"CD10": 6, "CD2": 4, "Bonus": 1, "cd3": 5, "CD11": 7, "CD1": 3, "CD01": 2}
+BOX_ORDER = ["Bonus", "CD01", "CD1", "CD2", "cd3", "CD10", "CD11"]
+BOX_TRACKS = ["t10", "t2", "t1"]       # Track 10, Track 2, track 1: path order
+
+
+def _box_rows(root):
+    # (the folder's own tracks stored in neither path nor name order: only a
+    # listing in path order lists them as BOX_TRACKS)
+    own = [("t2", "Track 2"), ("t1", "track 1"), ("t10", "Track 10")]
+    return ([_row(t, f"Box Set/{name}.flac", "FLAC", root=root) for t, name in own]
+            + [_row(f"{d}-{n}", f"Box Set/{d}/{n:02d}.flac", "FLAC", root=root)
+               for d, k in BOX_DISCS.items() for n in range(1, k + 1)])
+
+
+@pytest.fixture
+def box(store, tmp_path_factory):
+    """A second library folder that holds a box set: its discs, and three
+    tracks of its own.  A real folder, as the folder's web listing looks
+    it up on disk."""
+    lib_dir = tmp_path_factory.mktemp("boxlib")
+    (lib_dir / "Box Set").mkdir()
+    lib = str(lib_dir)
+    store.upsert_scan_dir(lib)
+    store.upsert_tracks_batch(_box_rows(lib))
+    return lib
+
+
+def _shown(rows):
+    return [(r["kind"], r["title"] if r["kind"] == "container" else r["id"], r["count"])
+            for r in rows]
+
+
+def _box_folder(browse, root):
+    rows, _ = browse("fo:" + path_hash(root))
+    assert _shown(rows) == [("container", "Box Set", str(len(BOX_DISCS) + len(BOX_TRACKS)))]
+    return rows[0]["id"]
+
+
+def test_a_folder_lists_subfolders_as_the_folder_tree_does_then_tracks_in_path_order(
+        browse, box):
+    from soniqboom.api import fstree
+    folder = _box_folder(browse, box)
+    rows, total = browse(folder)
+    assert total == len(BOX_ORDER) + len(BOX_TRACKS)
+    assert _shown(rows) == ([("container", d, str(BOX_DISCS[d])) for d in BOX_ORDER]
+                            + [("item", t, None) for t in BOX_TRACKS])
+    assert all(r["parent"] == folder for r in rows)
+    # the folder tree and the folder's own web listing, for the same folder
+    app = FastAPI()
+    app.include_router(fstree.router, prefix="/api")
+    c = TestClient(app)
+    path = f"{box}/Box Set"
+    tree = c.get("/api/fstree/children", params={"path": path, "root": box})
+    assert tree.status_code == 200, tree.text
+    assert [k["name"] for k in tree.json()["children"]] == BOX_ORDER
+    own = c.get("/api/fstree/tracks-with-meta", params={"path": path})
+    assert own.status_code == 200, own.text
+    assert [t["id"] for t in own.json()] == BOX_TRACKS
+
+
+def test_paging_a_folder_follows_that_order_and_its_counts(browse, box):
+    folder = _box_folder(browse, box)
+    full, total = browse(folder)
+    for size in range(1, total + 2):              # a controller paging by NumberReturned
+        seen, start = [], 0
+        while True:
+            page, t = browse(folder, start=start, count=size)
+            assert t == total
+            if not page:
+                break
+            assert len(page) <= size
+            seen += page
+            start += len(page)
+        assert _shown(seen) == _shown(full)
+    # a page from the last discs into the tracks
+    assert [s for _, s, _ in _shown(browse(folder, start=5, count=4)[0])] == [
+        "CD10", "CD11", "t10", "t2"]
+    assert browse(folder, flag="BrowseMetadata")[0][0]["count"] == str(total)
+    cd10 = full[BOX_ORDER.index("CD10")]["id"]
+    meta = browse(cd10, flag="BrowseMetadata")[0][0]
+    assert (meta["title"], meta["parent"], meta["count"]) == ("CD10", folder, "6")
+    assert [r["id"] for r in browse(cd10)[0]] == [f"CD10-{n}" for n in range(1, 7)]
+
+
+def test_a_share_folder_lists_subfolders_as_the_folder_tree_does(browse, store):
+    from soniqboom.api import fstree
+    share = "smb://nas/dlna-box"          # (a share no other test registers)
+    store.upsert_scan_dir(share)
+    store.upsert_tracks_batch(_box_rows(share))
+    folder = _box_folder(browse, share)
+    rows, total = browse(folder)
+    assert total == len(BOX_ORDER) + len(BOX_TRACKS)
+    assert _shown(rows) == ([("container", d, str(BOX_DISCS[d])) for d in BOX_ORDER]
+                            + [("item", t, None) for t in BOX_TRACKS])
+    tree = fstree._remote_children_from_store(store, share, "/Box Set")
+    assert [k["name"] for k in tree] == BOX_ORDER
+
+
+# ── nested library folders (2026-11-24) ────────────────────────────────────
+# Two library folders, one inside the other (``lib`` and ``lib/Box Set/CD2``,
+# or ``lib/Box Set``).  Each track carries ONE root's tag (``scan_root_hash``):
+# which one depends on the scans that read it, and a folder can hold tracks of
+# both.  Whichever tag its tracks carry, a folder lists all it holds, under
+# either library folder, as the web folder tree does
+# (``fstree._local_root_hashes``: the roots that hold the folder and the roots
+# below it).
+
+NESTED = [(inner, tag) for inner in ("Box Set/CD2", "Box Set")
+          for tag in ("inner", "outer", "mixed")]
+
+
+def _tag_nested(rows, lib, inner, tag):
+    """``rows`` with the tracks under ``inner`` tagged as ``tag`` says: all of
+    them with the inner root, all with the outer one, or every other one with
+    each."""
+    k = 0
+    for t in rows:
+        if t["path"].startswith(inner + "/"):
+            own = tag == "inner" or (tag == "mixed" and k % 2 == 0)
+            t["scan_root_hash"] = path_hash(inner if own else lib)
+            k += 1
+    return rows
+
+
+@pytest.fixture(params=NESTED, ids=[f"{i.replace(' ', '')}-{t}" for i, t in NESTED])
+def nested(store, tmp_path_factory, request):
+    """A library folder holding the box set, and a second one inside it, with
+    the tracks under the inner one tagged as ``request.param`` says.  Real
+    folders, as the web listings look them up on disk."""
+    inner_rel, tag = request.param
+    lib_dir = tmp_path_factory.mktemp("nestedlib")
+    for d in BOX_DISCS:
+        (lib_dir / "Box Set" / d).mkdir(parents=True)
+    lib, inner = str(lib_dir), f"{lib_dir}/{inner_rel}"
+    store.upsert_scan_dir(lib)
+    store.upsert_scan_dir(inner)
+    store.upsert_tracks_batch(_tag_nested(_box_rows(lib), lib, inner, tag))
+    return lib, inner, tag
+
+
+def _box_tree(box):
+    """``(folder, subfolders, tracks)`` of the box set at ``box`` and of its
+    discs, as a single library folder lists them."""
+    return ([(box, BOX_ORDER, BOX_TRACKS)]
+            + [(f"{box}/{d}", [], [f"{d}-{n}" for n in range(1, BOX_DISCS[d] + 1)])
+               for d in BOX_ORDER])
+
+
+def _nested_want(lib, inner):
+    """What the outer and the inner library folder list, folder by folder."""
+    outer = [(lib, ["Box Set"], [])] + _box_tree(f"{lib}/Box Set")
+    if inner == f"{lib}/Box Set":
+        return outer, _box_tree(inner)
+    return outer, [(inner, [], [f"CD2-{n}" for n in range(1, BOX_DISCS["CD2"] + 1)])]
+
+
+def _walk(browse, obj, path, count):
+    """``(folder, subfolders, tracks)`` of folder ``obj`` (at ``path``) and of
+    every folder below it, depth first.  A folder's count in its parent's
+    listing, in its metadata and its TotalMatches must be one number."""
+    rows, total = browse(obj)
+    assert total == len(rows) == count, path
+    assert browse(obj, flag="BrowseMetadata")[0][0]["count"] == str(total), path
+    assert all(r["parent"] == obj for r in rows), path
+    subs = [r for r in rows if r["kind"] == "container"]
+    assert rows[:len(subs)] == subs, path                 # subfolders, then tracks
+    out = [(path, [r["title"] for r in subs], [r["id"] for r in rows if r["kind"] == "item"])]
+    for r in subs:
+        out += _walk(browse, r["id"], f"{path}/{r['title']}", int(r["count"]))
+    return out
+
+
+def _walk_both(browse, lib, inner):
+    tops = {r["id"]: int(r["count"]) for r in browse("music/folders")[0]}
+    return [_walk(browse, "fo:" + path_hash(top), top, tops["fo:" + path_hash(top)])
+            for top in (lib, inner)]
+
+
+def _web(c, path, root):
+    """The folder tree's subfolders and the folder's own web listing."""
+    kids = c.get("/api/fstree/children", params={"path": path, "root": root})
+    assert kids.status_code == 200, kids.text
+    own = c.get("/api/fstree/tracks-with-meta", params={"path": path})
+    assert own.status_code == 200, own.text
+    return [k["name"] for k in kids.json()["children"]], [t["id"] for t in own.json()]
+
+
+def _web_client():
+    from soniqboom.api import fstree
+    app = FastAPI()
+    app.include_router(fstree.router, prefix="/api")
+    return TestClient(app)
+
+
+def test_nested_library_folders_list_every_track_whichever_root_it_is_tagged_with(
+        browse, nested):
+    lib, inner, _tag = nested
+    assert _walk_both(browse, lib, inner) == list(_nested_want(lib, inner))
+
+
+def test_nested_folders_list_what_the_web_folder_tree_and_listing_show(browse, nested):
+    lib, inner, _tag = nested
+    c = _web_client()
+    for top, walked in zip((lib, inner), _walk_both(browse, lib, inner)):
+        for path, subs, tracks in walked:
+            assert (subs, tracks) == _web(c, path, top), path
+
+
+def test_paging_nested_folders_follows_their_order_and_counts(browse, nested):
+    lib, inner, _tag = nested
+    want_outer, want_inner = _nested_want(lib, inner)
+    for folder, (_path, subs, tracks) in ((_box_folder(browse, lib), want_outer[1]),
+                                          ("fo:" + path_hash(inner), want_inner[0])):
+        full, total = browse(folder)
+        assert [s for _, s, _ in _shown(full)] == subs + tracks
+        for size in range(1, total + 2):          # a controller paging by NumberReturned
+            seen, start = [], 0
+            while True:
+                page, t = browse(folder, start=start, count=size)
+                assert t == total
+                if not page:
+                    break
+                assert len(page) <= size
+                seen += page
+                start += len(page)
+            assert _shown(seen) == _shown(full)
+
+
+def test_nested_folders_follow_their_tracks_tags_as_they_change(browse, store, nested):
+    lib, inner, tag = nested
+    want = list(_nested_want(lib, inner))
+    assert _walk_both(browse, lib, inner) == want            # (the indexes built)
+    for now in ("outer", "inner", "mixed", tag):              # (as scans can re-tag them)
+        store.upsert_tracks_batch(_tag_nested(_box_rows(lib), lib, inner, now))
+        assert _walk_both(browse, lib, inner) == want, now
+
+
+def test_a_track_two_roots_indexes_hold_is_listed_once(browse, store, tmp_path_factory):
+    from soniqboom.api import fstree
+    lib_dir = tmp_path_factory.mktemp("nestedlib")
+    for d in BOX_DISCS:
+        (lib_dir / "Box Set" / d).mkdir(parents=True)
+    lib, inner = str(lib_dir), f"{lib_dir}/Box Set/CD2"
+    store.upsert_scan_dir(lib)
+    store.upsert_scan_dir(inner)
+    store.upsert_tracks_batch(_tag_nested(_box_rows(lib), lib, inner, "outer"))
+    want = list(_nested_want(lib, inner))
+    assert _walk_both(browse, lib, inner) == want
+    # While the outer root commits, its index serves the rows from before the
+    # commit — CD2's tracks among them — and the inner root's index, built
+    # again, holds them too.
+    with fstree.root_commit({path_hash(lib)}):
+        store.upsert_tracks_batch(_tag_nested(_box_rows(lib), lib, inner, "inner"))
+        cd2 = [r for r in fstree._get_or_build_scan_root_sorted(store, path_hash(lib))[0]
+               if r.startswith(inner + "/")]
+        assert len(cd2) == BOX_DISCS["CD2"]                  # (the outer root's copy)
+        assert _walk_both(browse, lib, inner) == want
+    assert _walk_both(browse, lib, inner) == want
+
+
+def _box_lib(tmp_path_factory):
+    """A real folder holding the box set's folders (the web listings look
+    them up on disk)."""
+    lib_dir = tmp_path_factory.mktemp("nestedlib")
+    for d in BOX_DISCS:
+        (lib_dir / "Box Set" / d).mkdir(parents=True)
+    return str(lib_dir)
+
+
+@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("inner_first", [False, True], ids=["outer-first", "inner-first"])
+def test_three_nested_library_folders_with_any_tags(browse, store, tmp_path_factory,
+                                                    seed, inner_first):
+    import random
+    lib = _box_lib(tmp_path_factory)
+    tops = [lib, f"{lib}/Box Set", f"{lib}/Box Set/CD2"]
+    for top in (tops[::-1] if inner_first else tops):
+        store.upsert_scan_dir(top)
+    rnd = random.Random(seed)
+    rows = _box_rows(lib)
+    for t in rows:                     # each tagged with one of the roots that hold it
+        t["scan_root_hash"] = path_hash(rnd.choice([r for r in tops if t["path"].startswith(r + "/")]))
+    assert len({t["scan_root_hash"] for t in rows if "/CD2/" in t["path"]}) > 1
+    store.upsert_tracks_batch(rows)
+    cd2 = [(tops[2], [], [f"CD2-{n}" for n in range(1, BOX_DISCS["CD2"] + 1)])]
+    want = [[(lib, ["Box Set"], [])] + _box_tree(tops[1]), _box_tree(tops[1]), cd2]
+    folders = {r["id"]: int(r["count"]) for r in browse("music/folders")[0]}
+    c = _web_client()
+    for top, w in zip(tops, want):
+        obj = "fo:" + path_hash(top)
+        walked = _walk(browse, obj, top, folders[obj])
+        assert walked == w, top
+        for path, subs, tracks in walked:
+            assert (subs, tracks) == _web(c, path, top), path
+
+
+def test_a_track_the_store_dropped_is_not_listed_while_an_index_still_holds_it(
+        browse, store, tmp_path_factory):
+    from soniqboom.api import fstree
+    lib = _box_lib(tmp_path_factory)
+    inner = f"{lib}/Box Set/CD2"
+    store.upsert_scan_dir(lib)
+    store.upsert_scan_dir(inner)
+    store.upsert_tracks_batch(_tag_nested(_box_rows(lib), lib, inner, "mixed"))
+    assert _walk_both(browse, lib, inner) == list(_nested_want(lib, inner))   # (indexes built)
+    box = _box_folder(browse, lib)
+    cd2 = next(r["id"] for r in browse(box)[0] if r["title"] == "CD2")
+    # While both roots commit, their indexes keep the rows from before it: the
+    # two dropped tracks (one tagged with each root) are still in them.
+    with fstree.root_commit({path_hash(lib), path_hash(inner)}):
+        store.delete_track_ids(["CD2-1", "CD2-2"])
+        held = [p for h in (lib, inner)
+                for p in fstree._get_or_build_scan_root_sorted(store, path_hash(h))[0]
+                if p.startswith(inner + "/")]
+        assert len(held) == BOX_DISCS["CD2"]
+        for folder in (cd2, "fo:" + path_hash(inner)):
+            rows, total = browse(folder)
+            assert ([r["id"] for r in rows], total) == (["CD2-3", "CD2-4"], 2)
+            assert browse(folder, flag="BrowseMetadata")[0][0]["count"] == "2"
+    for folder in (cd2, "fo:" + path_hash(inner)):
+        assert [r["id"] for r in browse(folder)[0]] == ["CD2-3", "CD2-4"]
+    assert next(r["count"] for r in browse(box)[0] if r["title"] == "CD2") == "2"

@@ -907,7 +907,10 @@ async def _browse_metadata(obj_id: str, base_url: str) -> dict[str, str]:
 #   fo:<root path hash>                  a library folder (scan root)
 #   fo:<root path hash>:<b64(rel path)>  a folder inside it
 # A folder lists its subfolders, then its tracks (an archive's tunes in the
-# folder that holds the archive, as the web player lists them).
+# folder that holds the archive, as the web player lists them).  A local
+# folder is read from the index of every local library folder that holds it
+# or sits below it, as the web folder tree reads it: with nested library
+# folders each track is tagged with one of them (``_listing_sources``).
 
 def _folder_roots(store) -> "list[dict]":
     """The library folders the Media Server shows (hidden online
@@ -937,7 +940,9 @@ def _folder_of(store, obj_id: str) -> "tuple[dict, str] | None":
     """``(root, rel)`` of a folder ObjectID, or None (not a shown root)."""
     h, _, b_rel = obj_id[3:].partition(":")
     roots = _folder_roots(store)
-    for gone in [k for k in _ROOT_IDS if k not in {r["hash"] for r in roots}]:
+    shown = {r["hash"] for r in roots}
+    # (A snapshot of the keys: another worker thread can add one meanwhile.)
+    for gone in [k for k in list(_ROOT_IDS) if k not in shown]:
         _ROOT_IDS.pop(gone, None)
     root = next((r for r in roots if r["hash"] == h), None)
     if root is None:
@@ -953,78 +958,164 @@ _ROOT_IDS: dict[str, tuple] = {}
 
 
 def _root_rows(root: dict) -> "tuple[list[str], list[str]]":
-    """``(paths, ids)`` of a library folder's tracks in path order (blocking)."""
+    """``(paths, ids)`` of the tracks tagged with a library folder (its own
+    index — a folder's listing can read more: ``_listing_sources``), in path
+    order (blocking)."""
     from soniqboom.api import fstree
     from soniqboom.core import catalogue
     from soniqboom.core.store import get_store
     store = get_store()                      # the caches are the folder tree's own
     if catalogue.is_catalogue_root(root["path"]):
         return fstree._catalogue_sorted(store, root["hash"])
-    paths, dicts = fstree._get_or_build_scan_root_sorted(store, root["hash"])
-    memo = _ROOT_IDS.get(root["hash"])
+    return _index_rows(store, root["hash"])
+
+
+def _index_rows(store, scan_root_hash: str) -> "tuple[list[str], list[str]]":
+    """``(paths, ids)`` of the tracks tagged with scan root ``scan_root_hash``,
+    in path order (blocking): its shaped path index, the folder tree's own
+    (``fstree._get_or_build_scan_root_sorted``)."""
+    from soniqboom.api import fstree
+    paths, dicts = fstree._get_or_build_scan_root_sorted(store, scan_root_hash)
+    memo = _ROOT_IDS.get(scan_root_hash)
     if memo is None or memo[0] is not dicts:
-        memo = _ROOT_IDS[root["hash"]] = (dicts, [d.get("id") for d in dicts])
+        memo = _ROOT_IDS[scan_root_hash] = (dicts, [d.get("id") for d in dicts])
     return paths, memo[1]
 
 
+def _listing_sources(store, root: dict, rel: str) -> "list[tuple[list[str], list[str]]]":
+    """The ``(paths, ids)`` indexes a folder's listing reads (blocking): its
+    library folder's own, then, for a local folder, those of every other local
+    library folder that holds it or sits below it — the roots the web folder
+    tree reads too (``fstree._local_root_hashes``).
+
+    Nested library folders (``/M`` and ``/M/Box/CD2``) both cover the inner
+    folder, and each of its tracks is tagged with ONE of them
+    (``scan_root_hash``): which one depends on the scans that read it, and one
+    folder can hold tracks of both.  So a folder's tracks can sit in any of
+    these indexes, whichever library folder it is browsed under, and a folder
+    above the inner one can be in the inner one's index alone.  (A share's
+    rows are ``root:/rel``: nested shares hold separate rows, each listed
+    under its own share.)"""
+    from soniqboom.api import fstree
+    from soniqboom.core.filesource import is_remote_path
+    from soniqboom.core.store import get_store
+    own = _root_rows(root)
+    if is_remote_path(root["path"]):
+        return [own]
+    folder = root["path"].rstrip("/") + ("/" + rel if rel else "")
+    holding, below = fstree._local_root_hashes(store, folder)
+    real = get_store()                       # (the caches are the folder tree's own)
+    return [own] + [_index_rows(real, h) for h in holding + below if h != root["hash"]]
+
+
 class _Listing:
-    """A folder's ``subs`` (``(name, lo, hi)``: its path rows ``paths[lo:hi]``)
-    and ``files`` (the ids of the tracks directly in it that the store shows)."""
-    __slots__ = ("paths", "prefix", "subs", "files")
+    """A folder's ``subs`` (``(name, runs)``: the subfolder's path rows in each
+    index that holds some, ``runs`` = ``[(paths, ids, lo, hi), …]``) and
+    ``files`` (the ids of the tracks directly in it that the store shows)."""
+    __slots__ = ("prefix", "subs", "files")
 
-    def __init__(self, paths, prefix, subs, files) -> None:
-        self.paths, self.prefix, self.subs, self.files = paths, prefix, subs, files
+    def __init__(self, prefix, subs, files) -> None:
+        self.prefix, self.subs, self.files = prefix, subs, files
 
-    def direct_count(self, lo: int, hi: int, name: str) -> int:
-        """How many entries (subfolders + tracks) subfolder ``name`` lists."""
+    def direct_count(self, name: str, runs) -> int:
+        """How many entries (subfolders + tracks) subfolder ``name`` lists,
+        counted from the indexes' rows: a track the store dropped while its
+        index still holds it (a commit in flight) is counted, though the
+        subfolder's own listing leaves it out (``_folder_listing``)."""
         from bisect import bisect_left
-        paths, prefix = self.paths, f"{self.prefix}{name}/"
-        plen, n, i = len(prefix), 0, lo
-        while i < hi:
-            head = paths[i][plen:].split("::", 1)[0]
-            slash = head.find("/")
-            if slash > 0:
-                nxt = bisect_left(paths, f"{prefix}{head[:slash]}/\U0010FFFF", i, hi)
-                i = nxt if nxt > i else i + 1
-            else:
-                i += 1
-            n += 1
-        return n
+        prefix = f"{self.prefix}{name}/"
+        plen = len(prefix)
+        if len(runs) == 1:
+            # One index holds it (the usual case): an entry is one run of rows.
+            paths, _ids, lo, hi = runs[0]
+            n, i = 0, lo
+            while i < hi:
+                head = paths[i][plen:].split("::", 1)[0]
+                slash = head.find("/")
+                if slash > 0:
+                    nxt = bisect_left(paths, f"{prefix}{head[:slash]}/\U0010FFFF", i, hi)
+                    i = nxt if nxt > i else i + 1
+                else:
+                    i += 1
+                n += 1
+            return n
+        # Nested library folders: an entry can be in several indexes, counted once.
+        subs: set = set()
+        tracks: set = set()
+        for paths, ids, lo, hi in runs:
+            i = lo
+            while i < hi:
+                head = paths[i][plen:].split("::", 1)[0]
+                slash = head.find("/")
+                if slash > 0:
+                    sub = head[:slash]
+                    subs.add(sub)
+                    nxt = bisect_left(paths, f"{prefix}{sub}/\U0010FFFF", i, hi)
+                    i = nxt if nxt > i else i + 1
+                else:
+                    tracks.add(ids[i])
+                    i += 1
+        return len(subs) + len(tracks)
 
 
 def _folder_listing(store, root: dict, rel: str) -> _Listing:
-    """A folder's subfolders and tracks (blocking).  Bisect-skips each
-    subfolder's subtree, so a big tree costs O(subfolders · log n) plus its
-    own tracks."""
+    """A folder's subfolders and tracks (blocking), from every index that can
+    hold them (``_listing_sources``).  Bisect-skips each subfolder's subtree,
+    so a big tree costs O(subfolders · log n) per index plus its own tracks.
+    The subfolders come in the folder tree's order (``fstree._folder_sort_key``:
+    CD2 before CD10), the tracks in path order; each of them once."""
     from bisect import bisect_left
+    from operator import itemgetter
+    from soniqboom.api.fstree import _folder_sort_key
     from soniqboom.core.filesource import is_remote_path
-    paths, ids = _root_rows(root)
     base = (f"{root['path']}:/" if is_remote_path(root["path"])
             else root["path"].rstrip("/") + "/")
     prefix = base + (rel + "/" if rel else "")
-    plen, n = len(prefix), len(paths)
-    i = bisect_left(paths, prefix)
-    subs: list[tuple[str, int, int]] = []
-    files: list[str] = []
-    while i < n and paths[i].startswith(prefix):
-        head = paths[i][plen:].split("::", 1)[0]
-        slash = head.find("/")
-        if slash > 0:
-            child = head[:slash]
-            # Past the whole subtree (U+10FFFF sorts after any name; ``i + 1``
-            # guarantees progress) — see fstree._local_children_from_store.
-            nxt = bisect_left(paths, f"{prefix}{child}/\U0010FFFF", i)
-            nxt = nxt if nxt > i else i + 1
-            subs.append((child, i, nxt))
-            i = nxt
-        else:
-            files.append(ids[i])
-            i += 1
-    subs.sort(key=lambda s: s[0].lower())
+    plen = len(prefix)
+    runs: dict[str, list[tuple]] = {}       # subfolder name -> its rows in each index
+    own: list[tuple] = []                   # (paths, ids, positions) of its tracks, per index
+    for paths, ids in _listing_sources(store, root, rel):
+        n, at = len(paths), []
+        i = bisect_left(paths, prefix)
+        while i < n and paths[i].startswith(prefix):
+            head = paths[i][plen:].split("::", 1)[0]
+            slash = head.find("/")
+            if slash > 0:
+                child = head[:slash]
+                # Past the whole subtree (U+10FFFF sorts after any name; ``i + 1``
+                # guarantees progress) — see fstree._local_children_from_store.
+                nxt = bisect_left(paths, f"{prefix}{child}/\U0010FFFF", i)
+                nxt = nxt if nxt > i else i + 1
+                got = runs.get(child)
+                if got is None:
+                    runs[child] = [(paths, ids, i, nxt)]
+                else:
+                    got.append((paths, ids, i, nxt))
+                i = nxt
+            else:
+                at.append(i)
+                i += 1
+        if at:
+            own.append((paths, ids, at))
+    if len(own) > 1:
+        # Nested library folders: path order across the indexes (stable), each
+        # track once (a commit can leave one in two indexes for a moment).
+        tids: list[str] = []
+        seen: set = set()
+        for _p, tid in sorted(((p[i], d[i]) for p, d, at in own for i in at),
+                              key=itemgetter(0)):
+            if tid not in seen:
+                seen.add(tid)
+                tids.append(tid)
+    else:
+        tids = [d[i] for _p, d, at in own for i in at]
+    # (Each name keeps its rows' ranges; Browse pages and the counts read this
+    # one list, so they follow its order.)
+    subs = sorted(runs.items(), key=lambda s: _folder_sort_key(s[0]))
     # Only tracks the store still has and shows (the path cache may hold
     # one removed since), so paging and the totals agree.
-    files = [f for f, t in zip(files, store.get_tracks_batch(files)) if t]
-    return _Listing(paths, prefix, subs, files)
+    tids = [f for f, t in zip(tids, store.get_tracks_batch(tids)) if t]
+    return _Listing(prefix, subs, tids)
 
 
 # ── Playlists ──────────────────────────────────────────────────────────────
@@ -1270,8 +1361,8 @@ async def _browse_children(
             listing = _folder_listing(store, root, rel)
             subs, files = listing.subs, listing.files
             out = [_container(_folder_id(root["hash"], f"{rel}/{name}" if rel else name),
-                              obj_id, name, listing.direct_count(lo, hi, name), _FOLDER_CLS)
-                   for name, lo, hi in subs[start:start + count]]
+                              obj_id, name, listing.direct_count(name, runs), _FOLDER_CLS)
+                   for name, runs in subs[start:start + count]]
             ids = files[max(0, start - len(subs)):max(0, start + count - len(subs))]
             out += [_track_to_didl_item(t, base_url, obj_id)
                     for t in store.get_tracks_batch(ids) if t]
