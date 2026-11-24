@@ -16,10 +16,15 @@ import io
 import logging
 import os
 import pickle
+import re
 import threading
 import time
 import uuid
 import zipfile
+from bisect import bisect_left
+from collections import OrderedDict
+from itertools import compress
+from operator import itemgetter, methodcaller, ne
 from pathlib import Path
 
 import asyncio
@@ -67,6 +72,145 @@ def _is_remote(path: str) -> bool:
     return is_remote_path(path)
 
 
+_DIGIT_RUN = re.compile(r"(\d+)")
+
+
+def _folder_sort_key(name: str) -> tuple:
+    """Order of folder names in every listing (the desktop tree and the phone's
+    folder lists): case-insensitive, a run of digits read as a number — "CD2"
+    before "CD10", "Disc 9" before "Disc 10".  The name itself breaks a tie
+    ("CD01" / "CD1"), so the order is the same every time."""
+    parts = _DIGIT_RUN.split(name.casefold())
+    # (``split`` with one group alternates text, digits, text …: the digit
+    # runs sit at the odd positions of every name, so numbers meet numbers)
+    return tuple(int(x) if i % 2 else x for i, x in enumerate(parts)), name
+
+
+# ── Folder order of a recursive listing ──────────────────────────────────────
+# A recursive listing (``tracks-with-meta?recursive=true``: a branch folder's
+# flat view and its play queue on the desktop, Play all / Shuffle all on the
+# phone) lists its rows folder by folder in the order the folder lists show:
+# every folder of a row's path compared by ``_folder_sort_key`` (CD2 before
+# CD10), a folder's own tracks before its subfolders', each subfolder whole.
+# The tracks of ONE folder keep their path order — the order the folder's own
+# listing shows (a local, network-share or catalogue folder's), so Play all
+# plays each album as opening it would (a folder not indexed yet is walked on
+# disk, by lower-cased path, which both of its listings keep).  Paths are
+# split at "/" only, as the folder tree splits them: an archive's top-level
+# members are tracks of the folder that holds it, a folder inside an archive
+# (``pack.zip::inner``) is a subfolder.  The scan roots' sorted path indexes
+# stay in plain path order (every subtree lookup bisects them); a listing is
+# put in this order once, when it is built, and cached with it
+# (``_STORE_RECURSIVE_CACHE``, ``_NAT_LISTINGS``).
+
+_GET_ID = methodcaller("get", "id")
+
+
+def _folder_order(dirs: list[str], base: int = 0) -> list[int]:
+    """Positions ``base … base + len(dirs) - 1`` in folder order, where
+    ``dirs[i]`` is row ``i``'s folder ("/"-separated; "" = the listed folder
+    itself).  Stable: the rows of one folder keep their order."""
+    k = len(dirs)
+    if k < 2:
+        return list(range(base, base + k))
+    # Runs of consecutive rows of one folder (path order can put a subfolder
+    # between two of a folder's files: two runs of it).
+    cuts = list(compress(range(1, k), map(ne, dirs[1:], dirs[:-1])))
+    starts = [0, *cuts]
+    ends = [*cuts, k]
+    # The folders as a tree, walked depth first: a folder's own runs, then its
+    # subfolders by ``_folder_sort_key`` of their NAMES.  It allocates a list
+    # per parent folder and a key per distinct name, not a key per folder
+    # (300K rows, five orderings: 24 young garbage collections, against 407
+    # with a key tuple per folder sorted flat — the same order).
+    first: dict[str, int] = {}       # folder -> its first run
+    last: dict[str, int] = {}        # folder -> its last run so far
+    nxt = [-1] * len(starts)         # run -> the next run of the same folder
+    kids: dict[str, list[str]] = {}  # folder -> its subfolders
+    linked = {""}                    # ("" = the listed folder itself)
+    for r, s in enumerate(starts):
+        d = dirs[s]
+        prev = last.get(d)
+        last[d] = r
+        if prev is not None:
+            nxt[prev] = r
+            continue
+        first[d] = r
+        while d not in linked:       # it and its ancestors not in the tree yet
+            linked.add(d)
+            i = d.rfind("/")
+            parent = d[:i] if i >= 0 else ""
+            lst = kids.get(parent)
+            if lst is None:
+                kids[parent] = [d]
+            else:
+                lst.append(d)
+            d = parent
+    seg_keys: dict[str, tuple] = {}
+
+    def _name_key(folder: str) -> tuple:
+        name = folder[folder.rfind("/") + 1:]
+        sk = seg_keys.get(name)
+        if sk is None:
+            sk = seg_keys[name] = _folder_sort_key(name)
+        return sk
+
+    order: list[int] = []
+    add = order.extend
+    stack = [""]
+    while stack:
+        d = stack.pop()
+        r = first.get(d, -1)
+        while r >= 0:                # its own rows, run by run (stable)
+            add(range(base + starts[r], base + ends[r]))
+            r = nxt[r]
+        sub = kids.get(d)
+        if sub:
+            sub.sort(key=_name_key, reverse=True)     # (the stack pops the first one first)
+            stack.extend(sub)
+    return order
+
+
+def _subtree_order(paths: list[str], lo: int, hi: int, plen: int) -> list[int]:
+    """Indices ``lo … hi - 1`` of path-sorted ``paths`` — the rows under one
+    folder, whose prefix (with its trailing "/") is ``plen`` long — in folder
+    order (``_folder_order``)."""
+    return _folder_order([p[plen:p.rfind("/")] for p in paths[lo:hi]], lo)
+
+
+def _prefix_end(paths: list[str], prefix: str, lo: int) -> int:
+    """End of the run of path-sorted ``paths`` that start with ``prefix``,
+    which begins at ``lo`` (``bisect_left(paths, prefix)``)."""
+    hi = bisect_left(paths, prefix + "\U0010FFFF", lo)
+    n = len(paths)
+    while hi < n and paths[hi].startswith(prefix):   # (a name starting with U+10FFFF)
+        hi += 1
+    return hi
+
+
+def _in_folder_order(rows: list[dict]) -> list[dict]:
+    """``rows`` (any listing, e.g. a file-system walk's) in folder order by each
+    row's ``path``; rows of one folder keep their order."""
+    if len(rows) < 2:
+        return rows
+    order = _folder_order([str(r.get("path") or "").rpartition("/")[0] for r in rows])
+    return list(map(rows.__getitem__, order))
+
+
+def _first_of_each_id(rows: list[dict]) -> list[dict]:
+    """``rows`` with each track id once (its first row)."""
+    ids = list(map(_GET_ID, rows))
+    if len(set(ids)) == len(ids):
+        return rows
+    seen: set = set()
+    out: list[dict] = []
+    for r, tid in zip(rows, ids):
+        if tid not in seen:
+            seen.add(tid)
+            out.append(r)
+    return out
+
+
 # ── Scan-root confinement ────────────────────────────────────────────────────
 # Every browse endpoint that takes a folder path answers only for paths under a
 # registered scan root (the server's own list — never a root the caller names).
@@ -101,6 +245,41 @@ def _local_roots() -> list[str]:
     return [_norm_abs(str(sd["path"])) for sd in get_store().list_scan_dirs()
             if sd.get("path") and not _is_remote(sd["path"])
             and str(sd["path"]).startswith("/")]
+
+
+def _local_root_hashes(store, path: str) -> "tuple[list[str], list[str]]":
+    """``(holding, below)``: the path hashes of the registered LOCAL scan roots
+    whose indexes can hold tracks under folder ``path`` — the roots that hold
+    it (it, or a folder above it) and the roots below it.
+
+    Nested roots (``/M`` and ``/M/Box/CD2`` both registered) both cover the
+    inner folder, and each of its tracks is tagged with ONE of them: the root
+    whose scan read it last.  That tag moves.  A scan of a root counts only the
+    tracks tagged with that root as indexed (``scanner._run_scan_body``,
+    ``refresh_subtree_under_root``), so it reads the files under it that the
+    other root holds again and tags them with itself — a scan of both roots
+    swaps the inner folder's tags.  A folder's tracks can sit in any of these
+    indexes: listing only the roots above it misses what the roots below hold."""
+    from soniqboom.core.data import path_hash
+    p = path.rstrip("/")
+    pre = p + "/"
+    holding: list[str] = []
+    below: list[str] = []
+    for sd in store.list_scan_dirs():
+        root_path = sd.get("path", "")
+        if not root_path or _is_remote(root_path):
+            continue
+        r = root_path.rstrip("/")
+        if p == r or p.startswith(r + "/"):
+            into = holding
+        elif r.startswith(pre):
+            into = below
+        else:
+            continue
+        h = sd.get("path_hash") or path_hash(root_path)
+        if h and h not in holding and h not in below:
+            into.append(h)
+    return holding, below
 
 
 def _lexical_local(path: str) -> str:
@@ -236,10 +415,12 @@ def _subtree_has_indexed_audio(store, path: Path) -> bool:
     in the sidebar tree that contain no playable audio anywhere in their
     subtree (only images, videos, text files, or empty subdirectories).
 
-    Walks every LOCAL scan root that contains ``path``, then bisects each
-    root's warm sorted-by-path cache for the first entry ``>=`` ``path/``.
-    If that entry still has ``path/`` as a prefix, there's at least one
-    indexed track somewhere under ``path``.
+    Walks every LOCAL scan root that contains ``path`` and every root below
+    it (nested roots: a track is tagged with one of them —
+    ``_local_root_hashes``), then bisects each root's warm sorted-by-path
+    cache for the first entry ``>=`` ``path/``.  If that entry still has
+    ``path/`` as a prefix, there's at least one indexed track somewhere
+    under ``path``.
 
     Returns True (don't hide) when the path is outside every local scan
     root — we can't be sure what's there, and silently swallowing
@@ -249,32 +430,21 @@ def _subtree_has_indexed_audio(store, path: Path) -> bool:
     same shape; the remote check would need a separate code path.
     """
     from bisect import bisect_left
-    from soniqboom.core.data import path_hash
 
     p_str = str(path)
     if _is_remote(p_str):
         # No store-side index in the same shape for remote shares.
         return True
 
-    ancestor_hashes: list[str] = []
-    for sd in store.list_scan_dirs():
-        root_path = sd.get("path", "")
-        if not root_path or _is_remote(root_path):
-            continue
-        root_clean = root_path.rstrip("/")
-        if p_str == root_clean or p_str.startswith(root_clean + "/"):
-            h = sd.get("path_hash") or path_hash(root_path)
-            if h:
-                ancestor_hashes.append(h)
-
-    if not ancestor_hashes:
+    holding, below = _local_root_hashes(store, p_str)
+    if not holding:
         # Path isn't under any registered local scan root — treat as
         # "no idea, show it".  Hiding it would silently amputate parts
         # of the tree the user can still navigate to via folder aliases.
         return True
 
     prefix = p_str.rstrip("/") + "/"
-    for h in ancestor_hashes:
+    for h in holding + below:
         sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, h)
         if not sorted_paths:
             continue
@@ -335,7 +505,7 @@ def _dir_node(path: Path, root: Path) -> dict:
 
 
 def _children(path: Path, root: Path) -> list[dict]:
-    """Return immediate subdirectories of path, sorted alphabetically.
+    """Return immediate subdirectories of path, in ``_folder_sort_key`` order.
 
     ``has_audio`` comes from the in-RAM index (one bisect per child) instead
     of reading every child directory off disk.  The old per-child ``scandir``
@@ -365,7 +535,7 @@ def _children(path: Path, root: Path) -> list[dict]:
                 found.append(Path(e.path))
     except (PermissionError, FileNotFoundError, NotADirectoryError):
         return []
-    dirs = sorted(found, key=lambda p: p.name.lower())
+    dirs = sorted(found, key=lambda p: _folder_sort_key(p.name))
     from soniqboom.core.store import get_store
     store = get_store()
     return [
@@ -384,8 +554,10 @@ def _local_children_from_store(store, path: str, root: str) -> list[dict] | None
     """Immediate subdirectories of a LOCAL path, derived from the in-RAM index.
 
     The local counterpart of :func:`_remote_children_from_store`.  Bisect-skips
-    the scan root's sorted-path cache to list child folders that contain indexed
-    audio anywhere underneath — with ZERO filesystem I/O.  That matters because
+    the sorted-path caches of the scan roots that can hold tracks under ``path``
+    (``root``, and with nested roots every root above or below ``path`` —
+    ``_local_root_hashes``) to list child folders that contain indexed audio
+    anywhere underneath — with ZERO filesystem I/O.  That matters because
     an SMB/NFS share mounted as a local path (``/Volumes/...``) otherwise costs a
     network ``os.scandir`` (plus a ``stat`` for ``exists``/``is_dir``) on every
     chevron click, which is the random "folder browsing is slow" stall.
@@ -400,39 +572,43 @@ def _local_children_from_store(store, path: str, root: str) -> list[dict] | None
 
     if _is_remote(path) or _is_remote(root):
         return None
-    sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, path_hash(root))
-    if not sorted_paths:
-        return None
     p_clean = path.rstrip("/")
     root_clean = root.rstrip("/")
     if not (p_clean == root_clean or p_clean.startswith(root_clean + "/")):
         return None
     prefix = p_clean + "/"
-    i = bisect_left(sorted_paths, prefix)
-    if not (i < len(sorted_paths) and sorted_paths[i].startswith(prefix)):
-        return None                       # nothing indexed here → caller goes live
+    plen = len(prefix)
     names: list[str] = []
     seen: set[str] = set()
-    plen = len(prefix)
-    n = len(sorted_paths)
-    while i < n and sorted_paths[i].startswith(prefix):
-        rest = sorted_paths[i][plen:]
-        slash = rest.find("/")
-        if slash > 0:
-            child = rest[:slash]
-            if child not in seen:
-                seen.add(child)
-                names.append(child)
-            # Skip the whole child subtree in one bisect.  Sentinel is the
-            # MAX code point (U+10FFFF): a plain U+FFFF would sort *before* a
-            # grandchild dir whose name starts in the astral plane (emoji,
-            # CJK-Ext), leaving the bisect pinned at ``i`` → infinite loop.
-            # The ``max(i+1, …)`` guard makes progress unconditional regardless.
-            nxt = bisect_left(sorted_paths, f"{prefix}{child}/\U0010FFFF", i)
-            i = nxt if nxt > i else i + 1
-        else:
-            i += 1                        # a file directly inside this folder
-    names.sort(key=str.lower)
+    indexed = False
+    holding, below = _local_root_hashes(store, p_clean)
+    # ``root``'s own index, then every other root that can hold tracks here.
+    for h in dict.fromkeys([path_hash(root), *holding, *below]):
+        sorted_paths, _dicts = _get_or_build_scan_root_sorted(store, h)
+        n = len(sorted_paths)
+        i = bisect_left(sorted_paths, prefix)
+        if i < n and sorted_paths[i].startswith(prefix):
+            indexed = True
+        while i < n and sorted_paths[i].startswith(prefix):
+            rest = sorted_paths[i][plen:]
+            slash = rest.find("/")
+            if slash > 0:
+                child = rest[:slash]
+                if child not in seen:
+                    seen.add(child)
+                    names.append(child)
+                # Skip the whole child subtree in one bisect.  Sentinel is the
+                # MAX code point (U+10FFFF): a plain U+FFFF would sort *before* a
+                # grandchild dir whose name starts in the astral plane (emoji,
+                # CJK-Ext), leaving the bisect pinned at ``i`` → infinite loop.
+                # The ``max(i+1, …)`` guard makes progress unconditional regardless.
+                nxt = bisect_left(sorted_paths, f"{prefix}{child}/\U0010FFFF", i)
+                i = nxt if nxt > i else i + 1
+            else:
+                i += 1                        # a file directly inside this folder
+    if not indexed:
+        return None                           # nothing indexed here → caller goes live
+    names.sort(key=_folder_sort_key)
     rel_base = "" if p_clean == root_clean else p_clean[len(root_clean) + 1:] + "/"
     return [
         {
@@ -485,7 +661,7 @@ def _remote_children_from_store(store, scan_root: str, remote_path: str) -> list
             i = nxt if nxt > i else i + 1
         else:
             i += 1                        # a file directly inside this folder
-    names.sort(key=str.lower)
+    names.sort(key=_folder_sort_key)
     base = scan_root.rstrip("/") + ("" if remote_path == "/" else remote_path)
     rel_base = f"{rel}/" if rel else ""
     return [
@@ -514,7 +690,7 @@ def _remote_list_children(scan_root: str, remote_path: str, source) -> list[dict
         return []
     dirs = sorted(
         [e for e in entries if e.is_dir and not e.name.startswith(".")],
-        key=lambda e: e.name.lower(),
+        key=lambda e: _folder_sort_key(e.name),
     )
     base = scan_root.rstrip("/") + ("" if remote_path == "/" else remote_path)
     return [
@@ -944,17 +1120,20 @@ _TRACKS_META_CACHE: dict[tuple[str, bool], dict] = {}
 # ── store-fast-path result cache ──────────────────────────────────────────
 #
 # ``_store_recursive_tracks_under`` is fast in absolute terms (~1.1 s for
-# C64Music's 56K SID tracks, ~2.6 s for modarchive's 111K tracks) but the
-# user clicks "Show all tracks recursively" once per visit, and revisiting
-# the same root would otherwise pay that cost again.  Caching here turns
-# revisits into sub-millisecond responses.
+# C64Music's 56K SID tracks, ~2.6 s for modarchive's 111K tracks) but every
+# local folder listing calls it, once per page — a branch folder opens
+# flattened, and a single folder takes its direct tracks from it — so each
+# page and each revisit of the same root would otherwise pay that cost again.
+# Caching here turns them into sub-millisecond responses.
 #
 # Invalidation policy: the cached entry is keyed by ``(absolute path)`` for
-# ``recursive=True`` and validated against the *sizes* of every ancestor
-# scan-root bucket the helper visited.  When a scanner walk adds or removes
+# ``recursive=True`` and validated against the hash, the *size* and the
+# generation of every scan-root bucket the helper visited (the roots holding
+# the folder and the roots below it).  When a scanner walk adds or removes
 # tracks under one of those roots, the bucket size changes and we
-# recompute.  Rating bumps / play-count increments / sibling-folder writes
-# do NOT change bucket sizes, so they correctly don't invalidate.  This
+# recompute; another set of roots is another fingerprint.  Rating bumps /
+# play-count increments / sibling-folder writes do NOT change bucket sizes,
+# so they correctly don't invalidate.  This
 # avoids both the tail-wag of ``_mutation_seq`` (VU-D19) and the
 # false-positives of pure directory mtime (which doesn't bump when the
 # scanner upserts an existing path).
@@ -964,6 +1143,63 @@ _STORE_RECURSIVE_CACHE: dict[str, dict] = {}
 # COUNT changing (a move = one delete + one add), which the bucket-size
 # fingerprint can't see.
 _ROOT_GEN: dict[str, int] = {}
+
+# Who may install a root's sorted index (``_SCAN_ROOT_FULL_CACHE``).  It is also
+# built in worker threads — the folder tree (``get_children`` →
+# ``_remote_children_from_store``, the local ``_children`` fallback) and the
+# Media Server (``dlna_upnp._root_rows``) call ``_get_or_build_scan_root_sorted``
+# off the loop — while the loop commits.  The events that refresh or drop the
+# index move the root's change count (``_ROOT_CHANGES``) or the browse epoch: a
+# commit's patch (``patch_scan_root_rows``, also one that finds no index to
+# patch), rows re-shaped in place (``note_rows_reshaped``), a drop
+# (``invalidate_scan_root``, ``invalidate_browse_cache``).  A build installs
+# only when neither moved and the slot holds what it held when the build began
+# (``_install_index``); else its rows answer its own call and the next call
+# builds again.  The checks and the moves hold ``_INDEX_LOCK`` (never across an
+# await), so neither slips between the other's steps.  (Not part of any
+# listing's fingerprint: re-shaping rows in place must not rebuild listings.)
+# Writes that refresh nothing reach no index, built on the loop or not: an
+# mtime / size touch is never re-shaped.  (Every scan patches: a local scan's
+# commit, a folder click's refresh, a share scan's flushes and ghost purge —
+# ``scanner._refresh_browse_after_commit``.)
+_INDEX_LOCK = threading.Lock()
+_ROOT_CHANGES: dict[str, int] = {}
+_BROWSE_EPOCH = 0
+
+
+def _index_stamp(scan_root_hash: str) -> tuple:
+    """What a build of the root's index began under — taken before it reads
+    the store (``_install_index``)."""
+    with _INDEX_LOCK:
+        return (_ROOT_CHANGES.get(scan_root_hash, 0), _BROWSE_EPOCH,
+                _SCAN_ROOT_FULL_CACHE.get(scan_root_hash))
+
+
+def _install_index(scan_root_hash: str, stamp: tuple, entry: dict) -> bool:
+    """Install ``entry`` as the root's index unless something outdated the rows
+    it was built from since ``stamp`` (``_index_stamp``) was taken."""
+    changes, epoch, slot = stamp
+    with _INDEX_LOCK:
+        if (_ROOT_CHANGES.get(scan_root_hash, 0) != changes or _BROWSE_EPOCH != epoch
+                or _SCAN_ROOT_FULL_CACHE.get(scan_root_hash) is not slot):
+            return False
+        _SCAN_ROOT_FULL_CACHE[scan_root_hash] = entry
+    return True
+
+
+def _note_change(scan_root_hash: str) -> None:
+    # (the caller holds ``_INDEX_LOCK``)
+    _ROOT_CHANGES[scan_root_hash] = _ROOT_CHANGES.get(scan_root_hash, 0) + 1
+
+
+def note_rows_reshaped(scan_root_hashes) -> None:
+    """Rows of these roots are re-shaped in place after a field write
+    (``folder_album.refresh_album_caches``): an index of them being built now
+    may hold the values from before the write, so it is not installed."""
+    with _INDEX_LOCK:
+        for h in scan_root_hashes:
+            if h:
+                _note_change(h)
 
 
 _PATCH_MAX = 20_000     # rows IN beyond this → drop and rebuild instead (rows out are cheap)
@@ -1016,9 +1252,14 @@ async def patch_scan_root_rows(scan_root_hash: str, removed_paths: "set[str]",
     assignment (a reader never sees half an update).  Only an entry that was
     in step with the store before the commit is patched (else a write that
     bypassed this refresh would survive as ghost rows).  No cached entry →
-    nothing to do.  Returns False when the caller should drop the root."""
+    nothing to patch.  Either way the root's change count moves first, so an
+    index a worker thread is building from the store as it was before this
+    commit is not installed (``_install_index``).  Returns False when the
+    caller should drop the root."""
     import asyncio
-    entry = _SCAN_ROOT_FULL_CACHE.get(scan_root_hash)
+    with _INDEX_LOCK:
+        entry = _SCAN_ROOT_FULL_CACHE.get(scan_root_hash)
+        _note_change(scan_root_hash)
     if entry is None:
         return True
     if len(added) > _PATCH_MAX:
@@ -1077,15 +1318,22 @@ async def patch_scan_root_rows(scan_root_hash: str, removed_paths: "set[str]",
         new_paths.extend(paths[pos:])
         new_dicts.extend(dicts[pos:])
         paths, dicts = new_paths, new_dicts
-    _SCAN_ROOT_FULL_CACHE[scan_root_hash] = {"size": new_size, "paths": paths, "dicts": dicts}
+    with _INDEX_LOCK:
+        if _SCAN_ROOT_FULL_CACHE.get(scan_root_hash) is not entry:
+            return False                      # (replaced while it merged)
+        _SCAN_ROOT_FULL_CACHE[scan_root_hash] = {"size": new_size, "paths": paths,
+                                                 "dicts": dicts}
     _bump_root_gen(scan_root_hash)
     return True
 
 
 def _bump_root_gen(scan_root_hash: str) -> None:
     # (The listing memos hold their source list and check identity: listings
-    # rebuilt under the new generation are new lists — nothing to clear.)
+    # rebuilt under the new generation are new lists — nothing to clear.  The
+    # root's kept recursive listings would never be served again either; they
+    # are dropped so they don't hold the old rows.)
     _ROOT_GEN[scan_root_hash] = _ROOT_GEN.get(scan_root_hash, 0) + 1
+    _nat_drop(scan_root_hash)
 
 
 def cached_ids_under(store, scan_root_hash: str, prefix: str) -> "list[str] | None":
@@ -1108,8 +1356,11 @@ def cached_ids_under(store, scan_root_hash: str, prefix: str) -> "list[str] | No
 
 def invalidate_scan_root(scan_root_hash: str) -> None:
     """Drop one scan root's sorted cache and every per-folder listing / memo
-    built from it (they hold its row dicts); other roots keep theirs."""
-    _SCAN_ROOT_FULL_CACHE.pop(scan_root_hash, None)
+    built from it (they hold its row dicts); other roots keep theirs.  An index
+    of the root being built meanwhile is not installed (``_install_index``)."""
+    with _INDEX_LOCK:
+        _SCAN_ROOT_FULL_CACHE.pop(scan_root_hash, None)
+        _note_change(scan_root_hash)
     _bump_root_gen(scan_root_hash)
     with _MEMO_LOCK:                          # frees the dropped rows' memos
         for memo in (_DEDUP_MEMO, _DIRECT_MEMO, _BYID_MEMO):
@@ -1139,6 +1390,53 @@ def invalidate_scan_root(scan_root_hash: str) -> None:
 _SCAN_ROOT_FULL_CACHE: dict[str, dict] = {}
 
 
+# Recursive listings of share and catalogue folders, in folder order (local
+# folders keep theirs in ``_STORE_RECURSIVE_CACHE``), so a folder is put in
+# order once, not on every page.  Keyed ``(kind, root hash, prefix)``; an entry
+# holds the root index's path list it was cut from and is served only while
+# the index still is that list (an index rebuilt or patched is a new list).
+# Small listings are cheap to order again and are not kept, which leaves the
+# slots to the big ones (a root's whole listing, counted by the phone with
+# ``limit=1``).
+_NAT_LISTINGS: "OrderedDict[tuple, tuple[list, list]]" = OrderedDict()
+_NAT_LISTINGS_MAX = 16
+_NAT_MIN_ROWS = 2000
+_NAT_LOCK = threading.Lock()        # (catalogue listings are built in worker threads)
+
+
+def _nat_listing(key: tuple, index_paths: list) -> "list | None":
+    """The kept listing ``key`` when it was cut from ``index_paths``, else None."""
+    with _NAT_LOCK:
+        hit = _NAT_LISTINGS.get(key)
+        if hit is None:
+            return None
+        if hit[0] is not index_paths:
+            del _NAT_LISTINGS[key]
+            return None
+        _NAT_LISTINGS.move_to_end(key)
+        return hit[1]
+
+
+def _nat_keep(key: tuple, index_paths: list, listing: list) -> None:
+    if len(listing) < _NAT_MIN_ROWS:
+        return
+    with _NAT_LOCK:
+        _NAT_LISTINGS[key] = (index_paths, listing)
+        _NAT_LISTINGS.move_to_end(key)
+        while len(_NAT_LISTINGS) > _NAT_LISTINGS_MAX:
+            _NAT_LISTINGS.popitem(last=False)
+
+
+def _nat_drop(scan_root_hash: "str | None" = None) -> None:
+    """Forget the kept listings of one root (all of them: None)."""
+    with _NAT_LOCK:
+        if scan_root_hash is None:
+            _NAT_LISTINGS.clear()
+        else:
+            for k in [k for k in _NAT_LISTINGS if k[1] == scan_root_hash]:
+                del _NAT_LISTINGS[k]
+
+
 def invalidate_browse_cache(*, drop_disk: bool = True) -> None:
     """Clear the folder-browse caches so the next request re-reads track
     metadata from the store.
@@ -1150,10 +1448,16 @@ def invalidate_browse_cache(*, drop_disk: bool = True) -> None:
     count (e.g. applying HVSC song lengths to existing SID tracks) leaves them
     serving stale values.  Callers doing such an update must invalidate here,
     and drop the on-disk pickle so a restart doesn't reload the stale copy
-    (its validity check is bucket-size only, which is unchanged)."""
+    (its validity check is bucket-size only, which is unchanged).  A root index
+    being built meanwhile is not installed (the browse epoch moves:
+    ``_install_index``)."""
+    global _BROWSE_EPOCH
     _TRACKS_META_CACHE.clear()
     _STORE_RECURSIVE_CACHE.clear()
-    _SCAN_ROOT_FULL_CACHE.clear()
+    with _INDEX_LOCK:
+        _SCAN_ROOT_FULL_CACHE.clear()
+        _BROWSE_EPOCH += 1
+    _nat_drop()
     if drop_disk:
         try:
             from soniqboom.config import get_data_dir
@@ -1189,23 +1493,22 @@ def _store_recursive_tracks_under(store, p: Path) -> list[dict] | None:
 
     Steps:
 
-    1. Find every local scan root that contains ``p``.  We union the
-       buckets of ALL ancestors rather than picking one because nested
-       scan roots are allowed (e.g. ``/.../C64Music`` and
-       ``/.../C64Music/DEMOS`` may both be registered): a track gets
-       tagged with whichever root last upserted it (see scanner
-       ``build_track``), so picking only the deepest or only the
-       shallowest can miss tracks that were tagged with the other.
-    2. ``get_track_ids_for_scan_root`` returns the scan-root's tid set
-       in O(1) (straight from ``_tag_scan_root_hash``); ``get_tracks_batch``
-       then does direct dict lookups.  We deliberately avoid
-       ``filter_tracks`` here because its sorted-index walk would
-       traverse the entire library to filter back down to one scan
-       root, costing ~270K iterations to find ~60K tracks.
-    3. Filter by string-prefix on the track's stored ``path`` so only
-       descendants of ``p`` come back.
-    4. Shape each row through ``TrackMeta`` so the response matches what
-       ``tracks_with_meta`` returns for scanned tracks.
+    1. Find every local scan root whose index can hold tracks under ``p``:
+       every root that contains ``p`` AND every root below it
+       (``_local_root_hashes``).  We union their buckets rather than
+       picking one because nested scan roots are allowed (e.g.
+       ``/.../C64Music`` and ``/.../C64Music/DEMOS`` may both be
+       registered): a track is tagged with whichever root's scan read it
+       last, so picking only the deepest, only the shallowest, or only the
+       roots above ``p`` can miss tracks that were tagged with another.
+    2. Bisect each root's sorted path index (``_get_or_build_scan_root_sorted``:
+       every track of the root, TrackMeta-shaped once) for the run of
+       paths under ``p/`` — O(log N), not a walk of the root's bucket.
+    3. Put the rows in folder order (``_subtree_order``; the rows of nested
+       roots merged in path order first), each track id once.  A track
+       stored at ``p``'s own path (rare) lists first.
+    4. Cache the list per path, validated by the roots' hashes, bucket
+       sizes and generations (``_STORE_RECURSIVE_CACHE``).
 
     Returns
     -------
@@ -1213,44 +1516,87 @@ def _store_recursive_tracks_under(store, p: Path) -> list[dict] | None:
         ``p`` is not under any local scan root — caller should fall back
         to ``_discover_audio``.
     list[dict]
-        TrackMeta-shaped dicts with ``_scanned: True``.  May be empty
-        when at least one scan root matches but no indexed tracks live
-        under ``p`` — caller treats empty as "fall through to FS walk
-        for correctness".
-    """
-    from soniqboom.core.data import path_hash
+        TrackMeta-shaped dicts with ``_scanned: True``, in folder order
+        (the folder's own tracks first, in path order: what its
+        non-recursive listing keeps).  May be empty when at least one scan
+        root matches but no indexed tracks live under ``p`` — caller
+        treats empty as "fall through to FS walk for correctness".  The
+        list is the cached one: callers must not modify it.
 
+    ``_store_recursive_tracks_under_async`` is the same for the endpoint,
+    with a big folder's ordering done in a worker thread.
+    """
+    plan = _recursive_plan(store, p)
+    if not isinstance(plan, _RecursivePlan):
+        return plan                     # None (under no local root) or the cached list
+    return _recursive_keep(plan, _recursive_rows(plan))
+
+
+# A listing of at least this many rows is put in folder order in a worker
+# thread, not on the event loop (``_store_recursive_tracks_under_async``,
+# ``_remote_tracks_with_meta``): ~5-15 ms of ordering at this size, up to a
+# few hundred ms for a whole big root.
+_ORDER_IN_THREAD_ROWS = 10_000
+
+
+async def _store_recursive_tracks_under_async(store, p: Path) -> list[dict] | None:
+    """``_store_recursive_tracks_under`` for the endpoint: the index lookups run
+    here on the loop; ordering ``_ORDER_IN_THREAD_ROWS`` rows or more runs in a
+    worker thread (``_recursive_rows`` only reads the index lists, which nothing
+    modifies: a patch or a rebuild installs new ones).  What the thread built
+    is kept only while those indexes are still the roots' (``_recursive_keep``)."""
+    plan = _recursive_plan(store, p)
+    if not isinstance(plan, _RecursivePlan):
+        return plan
+    if plan.size >= _ORDER_IN_THREAD_ROWS:
+        rows = await asyncio.to_thread(_recursive_rows, plan)
+    else:
+        rows = _recursive_rows(plan)
+    return _recursive_keep(plan, rows)
+
+
+class _RecursivePlan:
+    """The index runs a recursive listing is built from (``_recursive_plan``),
+    and the roots' index path lists they were read from (``indexes``)."""
+
+    __slots__ = ("p_str", "fingerprint", "plen", "runs", "head", "size", "indexes")
+
+    def __init__(self, p_str: str, fingerprint: tuple, plen: int,
+                 runs: "list[tuple[list[str], list[dict], int, int]]",
+                 head: "list[dict]", indexes: "list[tuple[str, list[str]]]") -> None:
+        self.p_str, self.fingerprint, self.plen = p_str, fingerprint, plen
+        self.runs, self.head, self.indexes = runs, head, indexes
+        self.size = sum(hi - lo for _sp, _sd, lo, hi in runs)
+
+
+def _recursive_plan(store, p: Path):
+    """``p``'s cached recursive listing (a list), None when ``p`` is under no
+    local scan root, else the ``_RecursivePlan`` to build it from."""
     p_str = str(p)
 
-    # Collect every local scan root that contains ``p``.  Skip remote
-    # roots (smb://, ftp://, WebDAV) — their tracks have a different path
+    # Every local scan root whose index can hold tracks under ``p``: the
+    # roots that contain it and the roots below it (``_local_root_hashes`` —
+    # nested roots tag a track with one of them).  Remote roots (smb://,
+    # ftp://, WebDAV) are left out: their tracks have a different path
     # encoding and are handled by ``_remote_tracks_with_meta``.
-    ancestor_hashes: list[str] = []
-    for sd in store.list_scan_dirs():
-        root_path = sd.get("path", "")
-        if not root_path or _is_remote(root_path):
-            continue
-        root_clean = root_path.rstrip("/")
-        if p_str == root_clean or p_str.startswith(root_clean + "/"):
-            h = sd.get("path_hash") or path_hash(root_path)
-            if h:
-                ancestor_hashes.append(h)
-
-    if not ancestor_hashes:
+    holding, below = _local_root_hashes(store, p_str)
+    if not holding:
         return None
+    root_hashes = holding + below
 
     # ── Cache check ──────────────────────────────────────────────────
-    # Use each ancestor scan-root's bucket size as the validity
-    # fingerprint.  Adding/removing tracks under one of these roots
-    # bumps the count; rating bumps / play-count writes / unrelated
-    # scans do not.
+    # Each of these roots' hash, bucket size and generation is the
+    # validity fingerprint.  Adding/removing tracks under one of these
+    # roots bumps the count, and another set of roots is another
+    # fingerprint; rating bumps / play-count writes / unrelated scans
+    # change none of it.
     def _served_size(h: str) -> int:
         if h in _ROOTS_COMMITTING:
             e = _SCAN_ROOT_FULL_CACHE.get(h)
             if e is not None:
                 return e.get("size", -1)       # the rows a commit-window click is served
         return len(store._tag_scan_root_hash.get(h, ()))
-    bucket_sizes = tuple((_served_size(h), _ROOT_GEN.get(h, 0)) for h in ancestor_hashes)
+    bucket_sizes = tuple((h, _served_size(h), _ROOT_GEN.get(h, 0)) for h in root_hashes)
     cached = _STORE_RECURSIVE_CACHE.get(p_str)
     if cached is not None and cached.get("bucket_sizes") == bucket_sizes:
         cache_stats.hit("per_path")
@@ -1262,47 +1608,73 @@ def _store_recursive_tracks_under(store, p: Path) -> list[dict] | None:
     # (``/foo/bar`` should not match ``/foo/bar2/...``).
     p_norm = p_str.rstrip("/")
     prefix = p_norm + "/"
-    seen_ids: set[str] = set()
-    results: list[dict] = []
+    plen = len(prefix)
+    runs: list[tuple[list[str], list[dict], int, int]] = []
+    head: list[dict] = []
+    indexes: list[tuple[str, list[str]]] = []
 
-    from bisect import bisect_left
-
-    for h in ancestor_hashes:
+    for h in root_hashes:
         # Per-scan-root sorted cache: build once, reuse for every path
         # under the same root.  Without this, every NEW subfolder click
         # paid the O(bucket-size) iterate + shape cost again (1.1 s for
         # SID's 56K bucket, even when the result was a 95-track composer
         # subfolder).  With it, the first click warms the sorted list,
         # and every subsequent click — for any other subfolder — does an
-        # O(log N) bisect + O(matches) walk.
+        # O(log N) bisect, then orders just the matches (``_recursive_rows``).
         sorted_paths, sorted_dicts = _get_or_build_scan_root_sorted(store, h)
         if not sorted_paths:
             continue
+        indexes.append((h, sorted_paths))
         start = bisect_left(sorted_paths, prefix)
-        n = len(sorted_paths)
-        # Walk forward while paths share the prefix.
-        i = start
-        while i < n and sorted_paths[i].startswith(prefix):
-            d = sorted_dicts[i]
-            tid = d.get("id")
-            if tid not in seen_ids:
-                seen_ids.add(tid)
-                results.append(d)
-            i += 1
+        end = _prefix_end(sorted_paths, prefix, start)
+        if end > start:
+            runs.append((sorted_paths, sorted_dicts, start, end))
         # Edge case: a track whose stored path equals ``p_norm`` itself
         # (rare — a directory-shaped track path) would sit just BEFORE
         # ``start`` because ``prefix`` adds a trailing slash.
         if start > 0 and sorted_paths[start - 1] == p_norm:
-            d = sorted_dicts[start - 1]
-            tid = d.get("id")
-            if tid not in seen_ids:
-                seen_ids.add(tid)
-                results.append(d)
-    # Cache for revisits — invalidation is via the recorded bucket sizes,
-    # so a subsequent scanner walk that adds/removes tracks under any of
-    # the ancestor roots flips one of the sizes and forces a recompute.
-    _STORE_RECURSIVE_CACHE[p_str] = {
-        "bucket_sizes": bucket_sizes,
+            head.append(sorted_dicts[start - 1])
+    return _RecursivePlan(p_str, bucket_sizes, plen, runs, head, indexes)
+
+
+def _recursive_rows(plan: _RecursivePlan) -> list[dict]:
+    """``plan``'s rows in folder order, each track id once.  Only reads the
+    index lists (safe in a worker thread)."""
+    runs, plen = plan.runs, plan.plen
+    if len(runs) == 1:
+        # One scan root (the usual case): its rows under the folder are one
+        # run of its index.
+        sp, sd, lo, hi = runs[0]
+        body = list(map(sd.__getitem__, _subtree_order(sp, lo, hi, plen)))
+    elif runs:
+        # Nested scan roots (above or below the folder) holding tracks under
+        # it: their rows in path order together first (stable: the first
+        # root's copy of a path leads), so the rows of one folder keep that order.
+        merged = sorted(((sp[i], sd[i]) for sp, sd, lo, hi in runs for i in range(lo, hi)),
+                        key=itemgetter(0))
+        mpaths = [m[0] for m in merged]
+        body = [merged[j][1] for j in _subtree_order(mpaths, 0, len(mpaths), plen)]
+    else:
+        body = []
+    # (Each track once: nested roots can both hold one.)
+    return _first_of_each_id(plan.head + body if plan.head else body)
+
+
+def _recursive_keep(plan: _RecursivePlan, results: list[dict]) -> list[dict]:
+    # Cache for revisits — invalidation is via the recorded fingerprint, so
+    # a subsequent scanner walk that adds/removes tracks under any of the
+    # roots it read (holding the folder or below it) flips one of the sizes
+    # and forces a recompute.
+    # Kept only while every root index it was read from is still that root's:
+    # a listing ordered in a thread may come back after the index was dropped
+    # (``invalidate_browse_cache`` moves no fingerprint), patched or rebuilt —
+    # the request still gets it (as of when it started), the cache doesn't.
+    for h, paths in plan.indexes:
+        e = _SCAN_ROOT_FULL_CACHE.get(h)
+        if e is None or e.get("paths") is not paths:
+            return results
+    _STORE_RECURSIVE_CACHE[plan.p_str] = {
+        "bucket_sizes": plan.fingerprint,
         "results": results,
     }
     return results
@@ -1327,10 +1699,9 @@ def warmup_scan_root_caches(data_dir: Path | None = None) -> dict[str, int]:
     files were added) are rebuilt fresh and the disk file is rewritten
     so the next boot picks them up.
 
-    Skips remote scan roots: ``_remote_tracks_with_meta`` is the path
-    for those (uses ``store.filter_tracks`` directly, no per-scan-root
-    sorted index needed), and we'd be paying the shape cost without any
-    reuse benefit.
+    Skips remote scan roots: a share's index is built when the share is
+    first browsed (``_remote_children_from_store``,
+    ``_remote_tracks_with_meta``), not here.
 
     Returns ``{scan_root_path: track_count}`` for logging.  Phase
     progress is surfaced through ``startup_status.set_phase`` so the
@@ -1383,8 +1754,10 @@ def warmup_scan_root_caches(data_dir: Path | None = None) -> dict[str, int]:
         counts[path] = len(paths)
         if not was_cached:
             any_built = True
-        # 2. Seed the per-path recursive cache for the scan root itself.
-        #    Always cheap once the scan-root sorted cache is hot.
+        # 2. Seed the per-path recursive cache for the scan root itself: one
+        #    ordering of the root's rows (``_subtree_order``: ~20 ms per 60K
+        #    rows of album folders measured, a few times that when most
+        #    folders hold one or two files).
         try:
             _store_recursive_tracks_under(store, Path(path))
         except Exception:
@@ -1545,6 +1918,11 @@ def _get_or_build_scan_root_sorted(
     the scan-root's bucket size; ``store.get_track_ids_for_scan_root``
     is O(1), so the freshness check is essentially free.
 
+    Safe in a worker thread (the folder tree and the Media Server build it
+    there): each store row is copied before it is read, and what was built is
+    installed only if no commit's patch, in-place re-shape or drop came
+    meanwhile (``_install_index``) — else the rows answer this call alone.
+
     Returns ``([], [])`` when the bucket is empty.
     """
     from soniqboom.core import catalogue
@@ -1559,21 +1937,26 @@ def _get_or_build_scan_root_sorted(
         # (a commit in flight: serve the pre-commit rows until it patches them)
         cache_stats.hit("scan_root")
         return cached["paths"], cached["dicts"]
+    stamp = _index_stamp(scan_root_hash)      # (before the store is read)
     tids_set = store.get_track_ids_for_scan_root(scan_root_hash)
     cache_stats.miss("scan_root")
+    _nat_drop(scan_root_hash)                 # (listings cut from the old rows)
     if not tids_set:
-        _SCAN_ROOT_FULL_CACHE[scan_root_hash] = {
-            "size": 0, "paths": [], "dicts": [],
-        }
+        _install_index(scan_root_hash, stamp, {"size": 0, "paths": [], "dicts": []})
         return [], []
 
     raw_dicts = [d for d in store.get_tracks_batch(list(tids_set)) if d]
     shaped: list[tuple[str, dict]] = []
+    fields = TrackMeta.model_fields
     for d in raw_dicts:
         try:
+            # (A copy first: the store's dicts are live, and the loop may write
+            # one — a key added — while a worker thread iterates it, which
+            # raised and lost the row; ``dict.copy`` is one step for the
+            # other threads.)
             filtered = {
-                k: v for k, v in d.items()
-                if k in TrackMeta.model_fields and k != "embedding"
+                k: v for k, v in d.copy().items()
+                if k in fields and k != "embedding"
             }
             meta = TrackMeta(**filtered)
             out = meta.model_dump(exclude={"embedding"})
@@ -1584,9 +1967,9 @@ def _get_or_build_scan_root_sorted(
     shaped.sort(key=lambda x: x[0])
     paths = [s[0] for s in shaped]
     dicts = [s[1] for s in shaped]
-    _SCAN_ROOT_FULL_CACHE[scan_root_hash] = {
-        "size": current_size, "paths": paths, "dicts": dicts,
-    }
+    # (The size of the id snapshot these rows were built from.)
+    _install_index(scan_root_hash, stamp,
+                   {"size": len(tids_set), "paths": paths, "dicts": dicts})
     return paths, dicts
 
 
@@ -1628,6 +2011,7 @@ def _catalogue_sorted(store, scan_root_hash: str) -> tuple[list[str], list[str]]
         pairs.sort()
         e = {"size": size, "paths": [p for p, _ in pairs], "ids": [i for _, i in pairs]}
         _CAT_SORTED[scan_root_hash] = e
+        _nat_drop(scan_root_hash)             # (listings cut from the old rows)
         return e["paths"], e["ids"]
 
 
@@ -1653,18 +2037,24 @@ def invalidate_scan_root_cache(scan_root: str) -> None:
 
 def _catalogue_selection(store, scan_root: str, remote_path: str,
                          recursive: bool) -> list[str]:
-    """Ids of the catalogue tracks a folder listing shows, in path order.
-    Blocking."""
-    from bisect import bisect_left
+    """Ids of the catalogue tracks a folder listing shows, in its order: folder
+    order for a recursive listing (``_subtree_order``, kept per folder in
+    ``_NAT_LISTINGS`` — don't modify the list), path order for the folder's
+    own tracks.  Blocking."""
     from soniqboom.core.data import path_hash
     rh = path_hash(scan_root)
     if recursive:
         paths, ids = _catalogue_sorted(store, rh)
         rel = remote_path.strip("/")
         prefix = f"{scan_root}:/" + (f"{rel}/" if rel else "")
-        lo = bisect_left(paths, prefix)
-        hi = bisect_left(paths, prefix + "\U0010FFFF", lo)
-        return ids[lo:hi]
+        key = ("ids", rh, prefix)
+        sel = _nat_listing(key, paths)
+        if sel is None:
+            lo = bisect_left(paths, prefix)
+            hi = _prefix_end(paths, prefix, lo)
+            sel = list(map(ids.__getitem__, _subtree_order(paths, lo, hi, len(prefix))))
+            _nat_keep(key, paths, sel)
+        return sel
     # Direct files of the folder: its dir hash within this root.
     dh = path_hash("/" + remote_path.strip("/") if remote_path.strip("/") else "/")
     tids = store.filter_track_ids(dir_hash=dh, scan_root_hash=rh)
@@ -1756,17 +2146,33 @@ async def tracks_with_meta(
     For unscanned files, a minimal stub derived from the filename is returned
     with ``_scanned: false``.
 
-    Pagination (``recursive=true`` only): pass ``limit > 0`` to receive a
-    sliced response of shape ``{"total": N, "tracks": [...]}`` instead of a
-    plain array.  ``offset`` selects the start index.  This lets the frontend
-    flatten a 60K-track subtree progressively — first 500 land in <200 ms
-    perceived, the rest stream in as the windowed virtual scroll pulls
-    further chunks via ``offset``.  When ``limit == 0`` (default), the
-    response is the plain array for backward compatibility with callers
-    that aren't windowed.
+    Pagination (recursive or not): pass ``limit > 0`` to receive a sliced
+    response of shape ``{"total": N, "tracks": [...]}`` instead of a plain
+    array.  ``offset`` selects the start index.  This lets the frontend
+    flatten a 60K-track subtree progressively — the first chunk comes back in
+    one request, the rest stream in as the windowed virtual scroll pulls
+    further chunks via ``offset`` — and page a single folder that holds
+    thousands of tracks directly the same way: the desktop folder view asks
+    for every folder windowed.  When ``limit == 0`` (default), the response
+    is the plain array for backward compatibility with callers that aren't
+    windowed.  (``playable=1`` pages have their own shape — see below.)
 
-    ``filter_duplicates``: drop non-primary members of duplicate groups
-    (audio-fingerprint-clustered alternate encodings) server-side.  When
+    Order: a folder's own tracks (``recursive=false``) in path order — a local,
+    network-share or catalogue folder's alike, every one of them (a share's
+    from its root's path index: ``_remote_tracks_with_meta``); a folder listed
+    by a file-system walk by lower-cased path.  A recursive listing goes
+    folder by folder as the folder lists show them (every folder of a row's
+    path by ``_folder_sort_key``: CD2 before CD10), a folder's own tracks
+    before its subfolders'; the tracks of one folder in path order (a walk's:
+    by lower-cased path) — "Folder order of a recursive listing", above.
+    Pages, ``playable=1`` pages and their ``_pos`` read that one order; a
+    ``shuffle_seed`` permutation depends on the listing's track ids only
+    (``shuffle_order.seeded_order``).
+
+    ``filter_duplicates``: list one copy of a track that one folder holds in
+    several encodings (members of one duplicate group — audio-fingerprint-
+    clustered alternate encodings — side by side; ``_drop_duplicate_alternates``),
+    server-side.  A copy whose other copies are in other folders is listed.  When
     OMITTED (the default — ``None``) it is resolved from the
     ``dedup_folders`` config toggle (Settings → "Hide duplicates when
     browsing folders"; default ON — see ``data.folder_dedup_enabled``).  An
@@ -1840,7 +2246,9 @@ async def tracks_with_meta(
                                                      shuffle_seed, playable)
         result = await _remote_tracks_with_meta(path, recursive)
         if filter_duplicates:
-            result = _drop_duplicate_alternates(result)   # a fresh list per request: nothing to memoise on
+            from soniqboom.core import availability
+            result = _drop_duplicate_alternates(   # a fresh list per request: nothing to memoise on
+                result, availability.unplayable())
         return await _page(result, stable=False)
 
     p, _root = await _confine_local_async(path)
@@ -1863,7 +2271,7 @@ async def tracks_with_meta(
     # means the subtree genuinely hasn't been indexed yet (rare in
     # steady state; the watcher + initial scan cover the normal case).
     if recursive:
-        store_results = _store_recursive_tracks_under(store, p)
+        store_results = await _store_recursive_tracks_under_async(store, p)
         if store_results is not None and len(store_results) > 0:
             if filter_duplicates:
                 store_results = _deduped(store_results)
@@ -1877,14 +2285,16 @@ async def tracks_with_meta(
         # of direct files — an archive bucket flattens ~4K module tracks into
         # one directory — and the old path did a live ``_discover_audio`` FS
         # walk (slow on an SMB mount) and returned the whole lot unwindowed.
-        # ``_store_recursive_tracks_under`` returns everything under ``p``;
-        # keep only rows whose path has no further ``/`` after the directory
-        # prefix (``::`` archive separators are NOT subfolders, so an archive's
-        # tracks count as direct).  Only when there are genuinely no indexed
-        # direct tracks do we fall through to the FS walk (covers a pure
-        # branch folder — the frontend then auto-flattens — and unindexed
-        # corners with on-disk-only files).
-        store_results = _store_recursive_tracks_under(store, p)
+        # ``_store_recursive_tracks_under`` returns everything under ``p``
+        # (folder order: the folder's own tracks first, in path order) and
+        # caches it, so the recursive listing a branch folder asks for next
+        # is served from it; keep only rows whose path has no further ``/``
+        # after the directory prefix (``::`` archive separators are NOT
+        # subfolders, so an archive's tracks count as direct).  Only when
+        # there are genuinely no indexed direct tracks do we fall through to
+        # the FS walk (covers a pure branch folder — the frontend then
+        # auto-flattens — and unindexed corners with on-disk-only files).
+        store_results = await _store_recursive_tracks_under_async(store, p)
         if store_results is not None and len(store_results) > 0:
             prefix_len = len(str(p).rstrip("/")) + 1
             # Memoised on the (cached) recursive listing, so every page of a big
@@ -1989,6 +2399,10 @@ async def tracks_with_meta(
             for (i, _p), stub in zip(unscanned, stubs):
                 results[i] = stub
 
+        if recursive:
+            # Folder order, like the store-side listing; the walk listed by
+            # lower-cased path, which a folder's own listing keeps.
+            results = _in_folder_order(results)
         # Stash the fully-shaped result alongside files/id_map so the
         # next revisit can skip the metadata fetch + Pydantic dump too.
         _TRACKS_META_CACHE[cache_key]["results"] = results
@@ -2076,9 +2490,31 @@ def _marked(out):
 
 
 def _deduped(results: list[dict]) -> list[dict]:
-    """``_drop_duplicate_alternates`` memoised per listing object — and the memo
-    returns the same deduped LIST each time, which keeps ``_by_id`` warm too."""
-    return _memo(_DEDUP_MEMO, results, _drop_duplicate_alternates)
+    """``_drop_duplicate_alternates`` memoised per listing object: the listing's
+    contested copies (``_dedup_plan``) are worked out once, and the result is
+    kept while the ones among them that can't play (``availability.unplayable``,
+    compared by content) stay the same — the memo returns the same deduped LIST
+    each time, which keeps ``_by_id`` warm too."""
+    from soniqboom.core import availability
+    skip = availability.unplayable()
+
+    def _build(rows: list[dict]) -> dict:
+        plan = _dedup_plan(rows)
+        ids = frozenset(r.get("id") for same in plan for r in same)
+        rel = (ids & skip) if (skip and ids) else frozenset()
+        return {"plan": plan, "ids": ids, "rel": rel,
+                "out": _dedup_apply(rows, plan, rel)}
+
+    entry = _memo(_DEDUP_MEMO, results, _build)
+    rel = (entry["ids"] & skip) if (skip and entry["ids"]) else frozenset()
+    if rel == entry["rel"]:
+        return entry["out"]
+    out = _dedup_apply(results, entry["plan"], rel)       # (what can play changed)
+    with _MEMO_LOCK:
+        hit = _DEDUP_MEMO.get(id(results))
+        if hit is not None and hit[0] is results:
+            _DEDUP_MEMO[id(results)] = (results, {**entry, "rel": rel, "out": out})
+    return out
 
 
 def _by_id(results: list[dict]) -> dict:
@@ -2113,23 +2549,90 @@ def _shuffled_page(results: list[dict], path: str, recursive: bool, dedup: bool,
     return len(order), [by_id[i] for i in page if i in by_id]
 
 
-def _drop_duplicate_alternates(results: list[dict]) -> list[dict]:
-    """Drop non-primary members of audio-fingerprint duplicate groups.
+def _drop_duplicate_alternates(results: list[dict], skip=None) -> list[dict]:
+    """The listing with the lesser copies of a track left out that sit in the
+    SAME folder as a better one (one track in several encodings side by side:
+    ``x.flac`` and ``x.mp3``).  Of a duplicate group's members in one folder
+    the best is kept, in its place: a copy that can play (not in ``skip``,
+    ``availability.unplayable``) before one that can't, then the best by
+    ``duplicates.primary_sort_key`` (quality, bitrate — not the library-wide
+    primary: that may be a copy in another folder, or one picked by hand).
+    Another member there is left out when it can't play while the kept one
+    can, or is another format, or scores lower
+    (``duplicates.format_quality_score``) — two playable files of one format
+    and score (a track an album holds twice) are both listed.  A copy whose
+    other copies are all in other folders (another album, folder, archive or
+    share — also inside a recursive listing) is always listed.
 
-    Frontend's old library.js filter was
-    ``!t.duplicate_group_id || t.is_duplicate_primary !== false`` —
-    i.e. keep tracks that are not in a duplicate group OR are the
-    primary.  Replicating it server-side lets windowed clients trust
-    ``total`` to match what they'll actually receive across all chunks
-    (otherwise the count would over-report and the last chunk would
-    come back short of ``limit`` for confusing reasons).
+    Resolving it server-side lets windowed clients trust ``total`` to match
+    what they'll actually receive across all chunks.
     """
-    out: list[dict] = []
+    plan = _dedup_plan(results)
+    if not plan:
+        return list(results)
+    return _dedup_apply(results, plan, skip)
+
+
+def _row_folder(p: str) -> str:
+    """The folder a listing row sits in: up to its last ``/`` — or its archive
+    (``…/a.zip::tune.mod`` → ``…/a.zip``)."""
+    return p[:max(p.rfind("/"), p.rfind("::"), 0)]
+
+
+def _dedup_plan(results: list[dict]) -> list[list[dict]]:
+    """The listing's contested copies: each duplicate group's members that
+    share a folder, two or more of them (``_drop_duplicate_alternates``)."""
+    by_group: dict = {}
+    multi = False
     for d in results:
-        if d.get("duplicate_group_id") and d.get("is_duplicate_primary") is False:
+        g = d.get("duplicate_group_id")
+        if g:
+            rows = by_group.get(g)
+            if rows is None:
+                by_group[g] = d                 # (one member: the common case, no list)
+            else:
+                if type(rows) is dict:
+                    by_group[g] = rows = [rows]
+                rows.append(d)
+                multi = True
+    if not multi:
+        return []
+    plan: list[list[dict]] = []
+    for rows in by_group.values():
+        if type(rows) is dict:
             continue
-        out.append(d)
-    return out
+        by_dir: dict[str, list[dict]] = {}
+        for r in rows:
+            by_dir.setdefault(_row_folder(str(r.get("path") or "")), []).append(r)
+        plan.extend(same for same in by_dir.values() if len(same) > 1)
+    return plan
+
+
+def _dedup_apply(results: list[dict], plan: list[list[dict]], skip) -> list[dict]:
+    """``results`` without the members of ``plan``'s folders a better copy
+    beside them stands in for (``_drop_duplicate_alternates``)."""
+    from soniqboom.core.duplicates import format_quality_score, primary_sort_key
+
+    def _grade(d: dict) -> tuple:
+        return ((d.get("format") or "").upper(),
+                format_quality_score(d.get("format", ""), d.get("bitrate")))
+
+    drop: set[int] = set()
+    for same in plan:
+        best = min(same, key=lambda r: (bool(skip) and r.get("id") in skip,
+                                        primary_sort_key(r)))
+        best_off = bool(skip) and best.get("id") in skip
+        fmt, score = _grade(best)
+        for r in same:
+            if r is best:
+                continue
+            rf, rs = _grade(r)
+            off = bool(skip) and r.get("id") in skip
+            if (off and not best_off) or rf != fmt or rs < score:
+                drop.add(id(r))
+    if not drop:
+        return list(results)
+    return [d for d in results if id(d) not in drop]
 
 
 def _maybe_paginate(results: list[dict], offset: int, limit: int, recursive: bool):
@@ -2157,8 +2660,55 @@ def _maybe_paginate(results: list[dict], offset: int, limit: int, recursive: boo
     return {"total": total, "tracks": results[offset:end]}
 
 
+def _own_rows(paths: list[str], dicts: list[dict], prefix: str,
+              lo: int, hi: int) -> list[dict]:
+    """The folder's own rows among ``lo … hi - 1`` of path-sorted ``paths``
+    (``dicts`` alongside) — the run under the folder whose prefix, with its
+    trailing "/", is ``prefix`` — in path order: the rows ``_folder_order``
+    lists first, with nothing between the prefix and the row's last "/".  An
+    archive's top-level members (``pack.zip::c.mod``) are the folder's own, a
+    folder inside an archive (``pack.zip::inner``) is a subfolder, and a lone
+    "/" right after the prefix (``Box//x.mod``: an old build's SMB paths,
+    ``scanner._healed_smb_rel``) leaves a row in the folder its scan filed it
+    under — but such a path a level deeper (``Box//sub/x.mod``, filed under
+    ``Box/sub``) is no folder's own row.  Each subfolder's rows are skipped in
+    one bisect: a folder costs its own rows and a step per subfolder, not its
+    whole subtree."""
+    plen = len(prefix)
+    out: list[dict] = []
+    add = out.append
+    i = lo
+    while i < hi:
+        p = paths[i]
+        cut = p.find("/", plen)
+        if cut < 0 or (cut == plen and p.find("/", plen + 1) < 0):
+            add(dicts[i])
+            i += 1
+        elif cut > plen:
+            i = _prefix_end(paths, p[:cut + 1], i)    # past subfolder ``p[plen:cut]``
+        else:
+            i += 1                                    # (``Box//sub/x.mod``: not the folder's)
+    return out
+
+
 async def _remote_tracks_with_meta(path: str, recursive: bool) -> list[dict]:
-    """Return scanned tracks for a remote directory from the store."""
+    """The indexed tracks of a network-share folder (smb / ftp / WebDAV): every
+    track under it (``recursive``) or its own, both from the scan root's sorted
+    path index (``_get_or_build_scan_root_sorted``: the share's tracks, stored
+    as ``{scan_root}:/{rel}``, shaped once) by a bisect for the folder's
+    ``{scan_root}:/{rel}/`` prefix: unbounded, and independent of the root's
+    size.
+
+    * ``recursive``: every row under the prefix, in folder order
+      (``_subtree_order`` — "Folder order of a recursive listing"), kept per
+      folder and index version from ``_NAT_MIN_ROWS`` rows (``_NAT_LISTINGS``:
+      the caller must not modify the list).
+    * otherwise the folder's own rows, in path order (``_own_rows``): the rows
+      its recursive listing starts with — for every path a share scan writes,
+      the rows it filed under the folder (``dir_hash``: the parent folder of
+      the file's share path).  An old build's SMB path a level below a doubled
+      "/" (``Music//deep/x.mod``, ``scanner._healed_smb_rel``) is no folder's
+      own row, only in the recursive listings, until a walk heals it."""
     from soniqboom.core.data import path_hash
     from soniqboom.core.filesource import find_source_for_path
     from soniqboom.core.store import get_store
@@ -2182,34 +2732,37 @@ async def _remote_tracks_with_meta(path: str, recursive: bool) -> list[dict]:
         # outside that window (e.g. an artist deep in a full iTunes library >
         # 10 000 tracks) came back EMPTY — the parent folder showed "No tracks
         # found" while its leaf album folders, queried directly by dir_hash
-        # below, still worked.  The bisect is unbounded and scan-root-size
-        # independent, and returns tracks in stable path order.
-        from bisect import bisect_left
+        # then, still worked.  The bisect is unbounded and scan-root-size
+        # independent.  The rows (already model-dumped + ``_scanned``) are put
+        # in folder order (``_subtree_order``) once per folder and index
+        # version, kept in ``_NAT_LISTINGS`` — the caller must not modify it.
         sorted_paths, sorted_dicts = _get_or_build_scan_root_sorted(store, rh)
         rel = remote_path.strip("/")
         prefix = f"{scan_root}:/" + (f"{rel}/" if rel else "")
-        i = bisect_left(sorted_paths, prefix)
-        n = len(sorted_paths)
-        out: list[dict] = []
-        while i < n and sorted_paths[i].startswith(prefix):
-            out.append(sorted_dicts[i])       # already model-dumped + _scanned
-            i += 1
+        key = ("rows", rh, prefix)
+        out = _nat_listing(key, sorted_paths)
+        if out is None:
+            lo = bisect_left(sorted_paths, prefix)
+            hi = _prefix_end(sorted_paths, prefix, lo)
+
+            def _ordered() -> list[dict]:
+                # (only reads the index lists: safe in a worker thread)
+                return list(map(sorted_dicts.__getitem__,
+                                _subtree_order(sorted_paths, lo, hi, len(prefix))))
+            out = (await asyncio.to_thread(_ordered) if hi - lo >= _ORDER_IN_THREAD_ROWS
+                   else _ordered())
+            _nat_keep(key, sorted_paths, out)
         return out
 
-    # Non-recursive: the tracks DIRECTLY inside this folder, by dir hash.
-    dh = path_hash(remote_path)
-    dicts = store.filter_tracks(dir_hash=dh, scan_root_hash=rh, limit=5000)
-    results: list[dict] = []
-    for d in dicts:
-        try:
-            filtered = {
-                k: v for k, v in d.items()
-                if k in TrackMeta.model_fields and k != "embedding"
-            }
-            meta = TrackMeta(**filtered)
-            out = meta.model_dump(exclude={"embedding"})
-            out["_scanned"] = True
-            results.append(out)
-        except Exception:
-            continue
-    return results
+    # Non-recursive: the folder's own rows, from the same index (until
+    # 2026-11-24 ``filter_tracks(dir_hash, limit=5000)``: newest first, and cut
+    # at 5,000 rows).  Built per request, not kept: an append per own row and a
+    # bisect per subfolder (measured on a 106K-row index: 0.6 ms for 6,000 own
+    # rows, 1.6 ms for 2,000 subfolders) — the ``_NAT_LISTINGS`` slots stay
+    # with the recursive listings, which cost an ordering.
+    sorted_paths, sorted_dicts = _get_or_build_scan_root_sorted(store, rh)
+    rel = remote_path.strip("/")
+    prefix = f"{scan_root}:/" + (f"{rel}/" if rel else "")
+    lo = bisect_left(sorted_paths, prefix)
+    return _own_rows(sorted_paths, sorted_dicts, prefix, lo,
+                     _prefix_end(sorted_paths, prefix, lo))
