@@ -146,7 +146,8 @@ def _invalidate_agg_cache() -> None:
 _MISSING = object()
 # Row fields the folder listings' duplicate filter reads (its memos are keyed
 # on the listing, so a change to one of these must drop them).
-_DEDUP_FIELDS = frozenset(("is_duplicate_primary", "duplicate_group_id"))
+_DEDUP_FIELDS = frozenset(("is_duplicate_primary", "duplicate_group_id", "format",
+                           "bitrate", "added_at"))
 # True once this process deleted the on-disk browse cache because rows it
 # refreshed in memory made it stale (see ``refresh_album_caches``).
 _browse_disk_stale = False
@@ -212,6 +213,10 @@ async def refresh_album_caches(changed_ids) -> None:
         log.debug("browse row refresh unavailable", exc_info=True)
         return
     store = get_store()
+    # (A root index being built in a worker thread now may have read these
+    # tracks before the write: it is not installed — ``fstree.note_rows_reshaped``.)
+    fstree.note_rows_reshaped({(store.get_track(tid) or {}).get("scan_root_hash")
+                               for tid in ids})
     fields = TrackMeta.model_fields
     dedup_changed = False
     rows_changed = 0
