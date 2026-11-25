@@ -2159,3 +2159,73 @@ async def fill_tune_lengths(store=None) -> dict:
                  len(todo), updated, changed_total, secs)
     return {"checked": len(todo), "updated": updated, "rerender": changed_total,
             "seconds": secs}
+
+
+# ── window bitrates (network shares) ─────────────────────────────────────────
+# A network-share scan reads the front of a FLAC (and WMA Lossless, WavPack,
+# APE, TTA) file; their bitrate is the file's size over its length
+# (``metadata.SIZE_RATE_FORMATS``), and builds up to 2.1.2 took the size of
+# the fetched window, not the file's — a CD-quality FLAC stored at ~60 kbps,
+# which lost every duplicate pick to an ALAC copy.  The stored rows are
+# repaired once from their stored size (the listing's) and length — no file is
+# read; the duplicate groups follow the write (``bitrate`` is one of the store's
+# ``_DUP_FIELDS``).
+
+WINDOW_BITRATE_REPAIR_KEY = "window_bitrate_repair_version"
+WINDOW_BITRATE_REPAIR_VERSION = 1
+
+
+def _window_bitrate_fix(t: dict) -> "int | None":
+    """The bitrate a share's ``t`` should carry (its stored size over its
+    length) when the stored one is off by more than 1 %; None otherwise."""
+    from soniqboom.core.metadata import size_rate_format
+    if not size_rate_format(t.get("format")):
+        return None
+    size, length = t.get("file_size") or 0, t.get("duration") or 0
+    if size <= 0 or length <= 0:
+        return None
+    from soniqboom.core import catalogue
+    from soniqboom.core.filesource import is_remote_path
+    p = t.get("path") or ""
+    if not is_remote_path(p) or catalogue.is_catalogue_path(p):
+        return None
+    want = int(size * 8 / length)
+    have = t.get("bitrate") or 0
+    return want if abs(have - want) > want * 0.01 else None
+
+
+async def repair_window_bitrates_once(store=None, *, force: bool = False) -> dict:
+    """Repair every network-share track's bitrate a front window set
+    (``_window_bitrate_fix``) once per ``WINDOW_BITRATE_REPAIR_VERSION``
+    (config ``WINDOW_BITRATE_REPAIR_KEY``).  Scans the library on the loop in
+    ~20k-track steps (a yield between), writes in ``_MV_CHUNK`` batches.
+    Returns ``{"repaired": n, "seconds": s}`` or ``{"skipped": True}``."""
+    if store is None:
+        from soniqboom.core.store import get_store
+        store = get_store()
+    if not force and store.get_config(WINDOW_BITRATE_REPAIR_KEY) == WINDOW_BITRATE_REPAIR_VERSION:
+        return {"skipped": True}
+    t0 = time.perf_counter()
+    ids = list(store._tracks)
+    get = store._tracks.get
+    found: list[str] = []
+    for i in range(0, len(ids), 20_000):
+        found.extend(tid for tid in ids[i:i + 20_000]
+                     if (t := get(tid)) is not None and _window_bitrate_fix(t) is not None)
+        await asyncio.sleep(0)
+    repaired = 0
+    for i in range(0, len(found), _MV_CHUNK):
+        items = []
+        for tid in found[i:i + _MV_CHUNK]:
+            t = get(tid)                                # live, right before the write
+            if t is not None and (rate := _window_bitrate_fix(t)) is not None:
+                items.append((tid, {"bitrate": rate}))
+        if items:
+            repaired += store.update_track_fields_batch(items)
+        await asyncio.sleep(0)
+    store.set_config(WINDOW_BITRATE_REPAIR_KEY, WINDOW_BITRATE_REPAIR_VERSION)
+    secs = round(time.perf_counter() - t0, 3)
+    if repaired:
+        log.info("Network-share bitrates: repaired %d track(s) a scan's front window "
+                 "had set, in %.2fs", repaired, secs)
+    return {"repaired": repaired, "seconds": secs}

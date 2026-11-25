@@ -147,6 +147,18 @@ bash <span class="k">run.sh</span>            <span class="c"># starts the serve
       and a C++ compiler — the installer adds them. MIDI needs a SoundFont: under <b>gear → Renderers → Soundfonts</b>, use
       <b>↑ Upload .sf2/.sf3</b> or pick one from <b>Download Known Soundfonts</b>.
       Every other format in this guide plays out of the box.</div>
+    <div class="note"><b>Installer options.</b> <code>bash install.sh --rebuild</code> rebuilds the players SoniqBoom
+      compiles from source — run it if one stops working after a system update (the others come from your package
+      manager); <code>bash install.sh --clean</code> only removes them. <code>bash install.sh --slim</code> skips
+      <code>zxtune123</code> (a slow build on macOS, a download on Linux): the PSF family (PSF, PSF2, USF, GSF, 2SF,
+      NCSF, SSF; Dreamcast DSF plays through <code>dsfrender</code>), S98 and V2M files, MED&nbsp;2–4 modules and VGM
+      files that use a chip other than the Sega PSG / YM2612 don't play then, and running the installer again without
+      <code>--slim</code> adds them back. <code>bash install.sh --help</code> lists every option. On macOS
+      <code>sidplayfp</code>&nbsp;3.1.0 is built from source too, unless a working <code>sidplayfp</code> is already
+      installed; the Docker image ships the same version. On Arch, lhasa (<code>lha</code>) is in the AUR — optional,
+      SoniqBoom's own LHA reader reads every method. If a player fails to install, playing one of its formats names the
+      missing player and everything else keeps working. At startup SoniqBoom checks every player and logs a one-line
+      health summary; <b>gear → Renderers → Renderer Status</b> lists each player with the version it reports.</div>
     <p><code>run.sh</code> starts the server in the background and writes its log to <code>log/soniqboom.log</code> in
        SoniqBoom's data folder. <code>bash shutdown.sh</code> stops it and <code>bash restart.sh</code> restarts it; to
        use another port, start it with <code>bash run.sh --port 9090</code> and give <code>shutdown.sh</code> and
@@ -241,6 +253,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
       <figcaption>The <b>folder tree</b> mirrors every source — local disks and FTP / SMB / WebDAV shares alike.</figcaption>
     </figure>
     <p><strong>Folders.</strong> Each music folder and share is a root of the sidebar's folder tree (🌐 marks a share).
+       Folders list by name, numbers counted as numbers (<i>CD2</i> before <i>CD10</i>).
        Click a folder to list its tracks; a folder that holds only subfolders lists every track below it. With a
        folder focused, <span class="kbd">→</span> / <span class="kbd">←</span> open and close it,
        <span class="kbd">↑</span> / <span class="kbd">↓</span> move through the tree and <span class="kbd">Enter</span>
@@ -1451,7 +1464,7 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
     <p>Open SoniqBoom on a phone or an iPad (or another touch-screen tablet) and it starts on the dedicated
        <strong>touch-first page</strong> at <code>/m</code>, with Library, Search,
        <strong>Radio</strong>, Queue and Now&nbsp;Playing tabs plus a tap-to-expand mini-player and Settings behind the
-       gear. <em>Library</em> browses All, Artists, Album Artists, Albums, Genres, Years and Playlists;
+       gear. <em>Library</em> browses All, <a href="#mobile-folders">Folders</a>, Artists, Album Artists, Albums, Genres, Years and Playlists;
        <em>Radio</em> has ★&nbsp;Favorites, Scene and Browse; <em>Search</em> looks in the field you
        pick and narrows by filters (see below), shows how many tracks match and loads more of them as you scroll. Tap a track to play it, swipe it left to add it to the
        queue (in the queue and in a playlist, to remove it), and long-press it for <b>▶ Play Now</b>,
@@ -1469,6 +1482,20 @@ docker compose -p soniqboom -f deploy/docker-compose.https.yml <span class="k">u
        trackpad starts on the desktop interface, also with a touch screen. Opening <code>/m</code> shows the phone
        page without changing which interface <code>/</code> opens. <a href="#cast">Casting</a> is reachable from the
        mobile mini-player too, and from Now&nbsp;Playing's <b>Cast</b> key where the mini-player steps aside (<span class="badge beta">Beta</span>).</p>
+    <p id="mobile-folders"><b>Folders</b> on the phone lists your music folders and shares by their names, the
+       online collections in a band of their own; one that can't be reached right now is greyed, with a red lamp
+       and the note that its tracks are kept. Tap one to open it: a folder shows its subfolders, then its own tracks,
+       and one bar stays at the top — Back, the folder's name under the folders above it (tap it to go straight up to
+       one of them) and the filter key. <b>Play</b> and <b>Shuffle</b> at the top of the list play the folder's own
+       tracks; in a folder that holds only subfolders they are <b>Play all</b> and <b>Shuffle all</b> and play
+       everything below it, and where a folder has both, <b>⋯</b> offers its subfolders too. Tap a track to play the
+       folder from there. Long-press a folder for <b>▶ Play</b>, <b>⇄ Shuffle</b> and <b>+ Add to Queue</b> (up to 500
+       tracks; Play or Shuffle plays a larger folder). The filter key finds a subfolder by the start of a word in its
+       name, or any part of a Japanese, Chinese or Korean name; a folder of more than 50 subfolders opens with the
+       field showing. In a folder and in an artist, album or playlist, the system Back button and Safari's back swipe
+       go up one level (an open action sheet closes first), and pressing the Library key again goes back to the top
+       of the list. The phone remembers the open folder, and <b>Continue</b> at the top of the music folders takes
+       you back to the last folder you opened — also after a look at another list.</p>
     <p id="mobile-search">Under the phone's search field, keys choose where the words you type are looked for:
        <b>All</b>, <b>Title</b>, <b>Artist</b>, <b>Album</b>, <b>Genre</b> or <b>Game</b> (the chosen key's lamp
        lights). With <b>Artist</b>, <code>vnv nation</code> finds the same tracks as typing
@@ -1971,8 +1998,10 @@ docker compose start</pre>
 
     <h3>User accounts &amp; roles</h3>
     <p>Manage people in the admin panel's <strong>Users</strong> tab — add a user, set their role, enable or disable
-       them, set a password, or remove them. You can't remove your own account, or demote or disable it while it is
-       the only enabled admin. Removing a user also removes their API keys, listening history and play counts, favourite
+       them, set a password, or remove them. A user name is 2–64 characters: letters, digits, <code>.</code>,
+       <code>_</code> and <code>-</code>. You can't remove your own account, or demote or disable it while it is
+       the only enabled admin. A lower role, a disabled account or a new password set there signs that user out
+       everywhere; a higher role doesn't. Removing a user also removes their API keys, listening history and play counts, favourite
        stations, playlists (a shared one disappears for everyone who imported it), and their Subsonic app favourites,
        album and artist ratings, saved play queue and bookmarks. Admins don't see other accounts' history, play counts,
        favourites or private playlists. Three roles decide what each person can do:</p>
@@ -1993,7 +2022,9 @@ docker compose start</pre>
        <strong>Read-only</strong> until an admin promotes them. Under gear → <strong>Users → Sign-up &amp; passwords</strong>:</p>
     <ul>
       <li><strong>Allow self-registration</strong> (on by default) — turn it off and the login screen no longer
-          offers <strong>Create account</strong>.</li>
+          offers <strong>Create account</strong>. While it is on, at most 10 accounts an hour can be created from one
+          address, and 60 an hour in all; switch it off if anyone who can reach the server shouldn't be able to
+          listen.</li>
       <li><strong>Require strong passwords</strong> (off by default) — new passwords need at least 10 characters with
           an uppercase letter, a lowercase letter, a number and a symbol. It applies whenever a password is set — on
           the sign-in page, in the Users tab, with <code>setup-admin.sh</code> and from Subsonic apps; existing
@@ -2008,13 +2039,19 @@ bash setup-admin.sh -user alice -passwd 'a-new-password' -role admin   <span cla
 bash setup-admin.sh -user bob -disable                                 <span class="c"># block sign-in; -enable lets them back in</span></pre>
     <div class="note">The change applies immediately — <code>setup-admin.sh</code> tells a running server to reload (when the
        server listens on one particular network address instead, it says to restart the server).
-       <code>-display-name</code> sets the name shown in the app; spell each option out in full. On Docker, do the same with
+       A new account made this way is an admin unless you add <code>-role</code> (<code>admin</code>,
+       <code>edit</code> or <code>readonly</code>), and <code>-display-name</code> sets the name shown in the app (up to
+       100 characters); spell each option out in full. A change it makes while the server runs is never undone by the
+       server's own next save of the accounts file. On Docker, do the same with
        <code>docker compose exec soniqboom soniqboom-setadm …</code>.</div>
     <p>In the web app, admins change their own password with <strong>Change password…</strong> under
        <strong>gear → System → My Account</strong> and set anyone else's with the <strong>Password</strong> button in
        the <strong>Users</strong> tab. Edit and read-only accounts have no password setting in the web app: an admin
-       sets a new one for them, or they change it from a Subsonic app that offers a password change. A web app sign-in
-       lasts until the browser hasn't used SoniqBoom for seven days, and restarts don't end it.</p>
+       sets a new one for them, or they change it from a Subsonic app that offers a password change. Changing your own
+       password keeps you signed in on that browser and signs you out everywhere else. A web app sign-in
+       lasts until the browser hasn't used SoniqBoom for seven days, and restarts don't end it: each use moves its end
+       on, and the browser's sign-in cookie is renewed at most once an hour. An account keeps at most 50 browser
+       sign-ins; a new one beyond that ends the one unused longest.</p>
 
     <h3>System notes</h3>
     <div class="note"><b>RAM &amp; disk.</b> SoniqBoom keeps your entire library index in memory — plan for RAM that grows
@@ -2050,7 +2087,7 @@ bash setup-admin.sh -user bob -disable                                 <span cla
       <div class="card"><span class="ico">📁</span><h4>Retro albums</h4><p>In <strong>gear → Metadata → Retro albums</strong>, the opt-in <em>Album from folder name for retro formats</em> gives retro tracks with no album the name of their folder or archive; generic, artist and format folders are skipped, and a folder or archive named like a part of a game's music, such as “Level 1”, “Ingame” or “Game Over”, gets no album unless it sits in a folder such as “Games”, where it is taken as the game. It applies right away and after each scan, those albums show a “guessed from folder name” note in Track Info, and turning it off removes only the albums it added.</p></div>
       <div class="card"><span class="ico">⏩</span><h4>Playback preparation</h4><p>In <strong>gear → Renderers → Playback preparation</strong>: <em>Prepare upcoming tracks in advance</em> (on by default) renders the next retro or Amiga track while the current one plays, so it starts at once; it also renders Amiga, HVL, SC68 and PSF tracks in the background to show their length in lists. With it off, tracks are rendered when they start, and Amiga, HVL, SC68 and PSF tracks show their length once they have played; AdLib and console chiptune rows still learn their length in the background. <em>Per-voice VU meters for Amiga modules</em> (on by default) runs an extra background pass per new Amiga track for its channel meters; with it off, new Amiga tracks show the spectrum meter. Both save as soon as you change them.</p></div>
       <div class="card"><span class="ico">💾</span><h4>Conversion cache</h4><p>Rendered chiptune and transcoded audio are cached for instant replay. <strong>gear → Renderers → Transcode &amp; render cache</strong> shows how full it is and how much each kind of format takes. Set <em>Cache size (MB)</em> from 256&nbsp;MB to 100&nbsp;GB and press <strong>Apply</strong> — a lower size removes the least recently used entries at once. <strong>Clear transcoded only</strong> frees converted files (DSD, ALAC, AIFF …) and keeps the retro renders; <strong>Clear all conversion cache</strong> empties it.</p></div>
-      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found, with the version it reports, and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing. On the server (from inside the SoniqBoom folder), <code>.venv/bin/soniqboom fetch-ffmpeg</code> downloads that ffmpeg too (<code>--force</code> downloads it again even when it is current); restart SoniqBoom afterwards.</p><p>If a renderer is installed somewhere SoniqBoom doesn't look, give its full path under <strong>gear → Renderers → Renderer binaries</strong> (uade123, gme, adplay, psgplay, sc68, zxtune123, kssrender, dsfrender, milkyrender, mlrender, mdxrender, gt2reloc, sunvoxrender, furnace) and press <strong>Save paths</strong>; leave a field empty to find it automatically. The paths of sidplayfp, fluidsynth and openmpt123 go in <code>SoniqBoom.conf</code> under <code>renderers</code> (<code>sidplayfp_path</code>, <code>fluidsynth_path</code>, <code>openmpt123_path</code>).</p></div>
+      <div class="card"><span class="ico">🩺</span><h4>Renderer status</h4><p>The <strong>Renderers</strong> panel shows every decoder SoniqBoom found, with the version it reports, and flags anything to fix — for example an ffmpeg build without MP3 or DSD support — with a one-click re-download so every format keeps playing. On the server (from inside the SoniqBoom folder), <code>.venv/bin/soniqboom fetch-ffmpeg</code> downloads that ffmpeg too (<code>--force</code> downloads it again even when it is current); restart SoniqBoom afterwards.</p><p>If a renderer is installed somewhere SoniqBoom doesn't look, give its full path under <strong>gear → Renderers → Renderer binaries</strong> (uade123, gme, adplay, psgplay, sc68, zxtune123, kssrender, dsfrender, milkyrender, mlrender, mdxrender, gt2reloc, sunvoxrender, furnace, xmprender, sawteethrender) and press <strong>Save paths</strong>; leave a field empty to find it automatically. The paths of sidplayfp, fluidsynth and openmpt123 go in <code>SoniqBoom.conf</code> under <code>renderers</code> (<code>sidplayfp_path</code>, <code>fluidsynth_path</code>, <code>openmpt123_path</code>).</p></div>
       <div class="card"><span class="ico">🗃️</span><h4>Backup &amp; restore</h4><p>Download a single compressed <code>.sbz</code> snapshot of your library — tracks, playlists, ratings and play history — from the <strong>gear → Backup</strong> tab, and restore it later with <code>soniqboom import</code>. Back up the data folder too, for user accounts and Subsonic app state, and <code>SoniqBoom.conf</code> for your shares and admin settings (see <a href="#manage">Back up &amp; restore</a>).</p></div>
       <div class="card"><span class="ico">🎚️</span><h4>This browser's preferences</h4><p>Some settings are kept per browser: <em>Crossfade</em>, <em>Streaming quality</em> (below), <em>Preload buffer</em> (wait until this many seconds are buffered before a track starts), <em>“Converting…” notice delay</em> (how long a conversion may take before the notice shows), <em>Let shuffle repeat tracks you've heard</em>, <em>Sync the play queue across devices</em>, the visualization switches and <em>Theme</em>. Admins find them under <strong>gear → System → Settings</strong>; for other accounts the gear opens <strong>Preferences</strong> with the same choices, plus the account's Subsonic app password and API keys.</p></div>
       <div class="card"><span class="ico">✨</span><h4>Visualizations</h4><p>Under <strong>gear → System → Settings → Visualizations</strong>: <em>Enable visualizations</em> switches every animation on or off; <em>Now-playing</em> turns the player's VU meters, the signal chain and the full-width visualizer (its CRT scope included) on or off; <em>Admin diagnostics</em> the animated views in the admin panel; <em>VU meter style</em> picks <em>Bars</em> or <em>Circuit board</em> (the Retro hi-fi style shows LED columns and needle meters instead). <em>Play SID in browser</em> (experimental) also renders C64 tunes in this browser to drive their per-voice meter — playback still streams from the server. These choices apply at once to this device. Accounts without admin rights find them in <strong>gear → Preferences</strong> as <em>Visualizations</em>, <em>Now-playing visualizations</em>, <em>VU meter style</em> and <em>Play SID in browser (experimental)</em>, applied when you press <strong>Save</strong>. When your system asks for reduced motion, animations stay still.</p></div>

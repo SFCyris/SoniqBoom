@@ -809,3 +809,39 @@ def test_stat_and_is_dir_still_check_a_reused_connection(tmp_path):
         assert sh.srv.commands["NOOP"] == before
     finally:
         sh.stop()
+
+
+# ── FLAC through a front window: the whole file's bitrate ───────────────────
+
+@pytest.fixture(scope="module")
+def flac_big(tmp_path_factory) -> Path:
+    """A FLAC file well over twice the scan's front window (read partially)."""
+    if not shutil.which("ffmpeg"):
+        pytest.skip("needs ffmpeg")
+    d = tmp_path_factory.mktemp("flac")
+    out = d / "big.flac"
+    _ff("-f", "lavfi", "-i", "anoisesrc=d=60:c=white:a=0.5", "-ac", "2", "-ar", "44100",
+        "-c:a", "flac", "-metadata", "title=Window", str(out))
+    assert out.stat().st_size > 2 * metadata.HEADER_BUDGET[".flac"]
+    return out
+
+
+@needs_ffmpeg
+async def test_a_partly_read_flac_gets_the_whole_files_bitrate(blank, flac_big, tmp_path):
+    store = blank
+    lib = tmp_path / "lib"
+    (lib / "A").mkdir(parents=True)
+    shutil.copy(flac_big, lib / "A" / "big.flac")
+    _age(lib)
+    sh = _Ftp(lib)
+    try:
+        await scanner.start_remote_scan("", sh.root, sh.src)
+        sent = sh.srv.bytes_sent
+    finally:
+        sh.stop()
+    t = _by_name(store)["big.flac"]
+    size = flac_big.stat().st_size
+    assert sent < size / 2, (sent, size)                # (it was read through a window)
+    want = metadata.extract(flac_big, "x")              # the whole file, read locally
+    assert t["file_size"] == size
+    assert abs(t["bitrate"] - want.bitrate) <= 1, (t["bitrate"], want.bitrate)

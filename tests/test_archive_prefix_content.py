@@ -255,9 +255,9 @@ async def test_an_archive_listed_by_the_current_rules_is_not_listed_on_every_sca
     seen = []
     real = scanner._find_audio_files
 
-    def spy(dirs, scan_zips, scope, known, failed):
+    def spy(dirs, scan_zips, scope, known, failed, *rest):
         seen.append(set(known or ()))
-        return real(dirs, scan_zips, scope, known, failed)
+        return real(dirs, scan_zips, scope, known, failed, *rest)
     monkeypatch.setattr(scanner, "_find_audio_files", spy)
     await scanner._run_scan([str(root)], light=True)
     await scanner._run_scan([str(root)], light=True)

@@ -43,8 +43,8 @@ async function _viewData(gen, request, retry) {
 const tbody            = document.getElementById('track-tbody');
 const emptyEl          = document.getElementById('track-empty');
 // Capture the default empty-state markup at module load.  Per-call
-// customisations (``_renderBranchEmpty`` for branch-folder clicks,
-// ``showDuplicates`` for the dedicated dupe view) overwrite
+// customisations (``_setViewEmpty`` for the smart and duplicates views,
+// ``_showViewError`` for a view that failed to load) overwrite
 // ``emptyEl.innerHTML``; the next view puts this snapshot back
 // (``_clearViewMessage``, and ``renderTracks`` for any non-empty result)
 // so the customised markup doesn't leak into unrelated views.
@@ -2824,8 +2824,8 @@ async function _findInFolder(t) {
   const idx = typeof currentTracks?.findIndex === 'function'
     ? currentTracks.findIndex((x) => x && x.id === t.id) : -1;
   if (idx >= 0) _focusAndPulse(idx);
-  else if (t.is_duplicate_primary === false) {
-    window.Toast?.info?.('This copy isn’t listed in its folder because duplicate copies are hidden '
+  else if (t.duplicate_group_id) {
+    window.Toast?.info?.('This copy isn’t listed in its folder — a better copy of it may sit next to it '
                          + '(Settings → Hide duplicates when browsing folders).');
   } else window.Toast?.info?.('The track isn’t listed in its folder.');
 }
@@ -5694,51 +5694,6 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
     total,
     label: path.split('/').filter(Boolean).pop() || path,    // display only — the crumb shows the folder name too
   };
-}
-
-/**
- * Render the "branch folder" empty state in the main panel:
- * the clicked folder has no direct audio, only subfolders.  We tell
- * the user how to navigate (sidebar tree) AND give them an opt-in
- * "Show all tracks recursively" button.  Matches user mental model
- * (folder click = show what's in it = subfolders for branch nodes),
- * and avoids the 117 MB recursive-flatten that the old code did
- * silently on every branch-folder click.
- */
-function _renderBranchEmpty(path) {
-  // Tear down anything currently in the tbody (skeleton rows from
-  // _showSkeletonRows, or stale data).  renderTracks([]) does the
-  // tbody cleanup, sets emptyEl.hidden=false, and resets the heading
-  // to "No tracks found" — we then customise the empty state below.
-  renderTracks([]);
-
-  const folderName = path.split('/').filter(Boolean).pop() || path;
-  // Escaped for text AND the title attribute (a folder may be named with quotes).
-  const safeName   = String(folderName).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  emptyEl.innerHTML = `
-    <span class="empty-icon" aria-hidden="true">&#128193;</span>
-    <h4>${safeName} has no direct music files</h4>
-    <p>This folder only contains subfolders.  Pick one in the sidebar tree
-       on the left to drill in — that's where the music is.</p>
-    <p style="margin-top:18px">
-      <button id="show-recursively" class="btn-secondary"
-              title="Flatten every track under ${safeName} into one list (this may take several seconds for large libraries)">
-        Show all tracks recursively
-      </button>
-    </p>
-  `;
-  const btn = document.getElementById('show-recursively');
-  if (btn) {
-    btn.addEventListener('click', () => {
-      // User explicitly opted in to the heavy flatten — reset the
-      // empty state heading immediately so the recursive call's
-      // ``_showSkeletonRows`` shimmer reads as "loading" rather than
-      // "still on the branch-folder screen".
-      emptyEl.hidden = true;
-      showFolder(path, true);
-    });
-  }
 }
 
 function getSelectedTracks() {

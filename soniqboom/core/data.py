@@ -848,7 +848,152 @@ async def list_scan_dirs() -> list[dict]:
 
 
 async def delete_scan_dir(path: str) -> bool:
-    return get_store().delete_scan_dir(path)
+    """Drop ``path`` from the scan list.  Its tracks that another registered
+    root (not being removed) still covers — nested roots — are handed over to
+    that root (``hand_over_covered``, in a task of its own: this returns at
+    once, so a caller's teardown after it runs before the folder can be added
+    again); the others keep their tag, as before.  The hand-over stops if the
+    folder is listed again."""
+    store = get_store()
+    gone = store.delete_scan_dir(path)
+    from soniqboom.core.filesource import is_remote_path
+    if path.startswith("/") and not is_remote_path(path):
+        from soniqboom.core import removals
+
+        async def _hand_over() -> None:
+            try:
+                await hand_over_covered(store, path,
+                                        keep_going=lambda: path not in store._scan_dirs)
+            except Exception:                           # noqa: BLE001 — the dir is dropped
+                log.exception("Handing %s's covered tracks over failed", path)
+        removals.spawn_side(_hand_over(), f"hand-over[{path}]")
+    return gone
+
+
+# Tracks classified (and re-tagged) per step of ``hand_over_covered``; a slice
+# of the loop is ``modland_catalog._SLICE_S``, as for a purge.
+_HAND_OVER_STEP = 200
+
+
+async def hand_over_covered(store, root_path: str, exclude=(), *,
+                            moved: "dict[str, str] | None" = None,
+                            keep_going=None, only=None,
+                            owning: bool = False) -> "dict[str, str]":
+    """Re-tag the tracks of LOCAL scan root ``root_path`` that another
+    registered local root still covers with that root (the innermost one
+    holding the track's file), so a root leaving the library takes only the
+    tracks nothing else covers.  Nested roots (``/M`` and ``/M/Box/CD2`` both
+    registered) both cover the inner folder; each of its tracks carries one
+    tag — the innermost root's (a scan's owner rule), or another's that an
+    older scan or a removal gave it.  It is also how a scan hands a root's
+    tracks in a deeper root's folder over to that root
+    (``scanner._release_to_inner_roots``).  Roots in ``exclude`` cover
+    nothing, nor do roots no longer listed or past their undo window
+    (``removals.purging``: their purge would delete what they took) — read
+    again after every yield.  With ``owning`` (a scan's hand-over: the owner
+    rule) no root being removed takes anything either; a removal's own
+    hand-over gives to a root still in its undo window, which keeps it if
+    undone.
+
+    Works in slices of the loop, like a purge; a track whose tag changed
+    meanwhile (deleted, or tagged again by a scan) is left alone.  Stops early
+    once ``keep_going()`` turns false.  Returns ``{track id: the
+    scan_root_hash it was given}`` — ``moved``, filled as it goes, when
+    given.  ``only`` (track ids): just those of the root's tracks (the ones
+    under a scan's changed paths or a clicked folder).  A network share or
+    online collection hands nothing over: its track paths carry its own root,
+    which no other root covers."""
+    import asyncio
+    import time
+    from soniqboom.core.filesource import is_remote_path
+    from soniqboom.core.modland_catalog import _SLICE_S
+    moves: dict[str, str] = {} if moved is None else moved
+    if not root_path or not root_path.startswith("/") or is_remote_path(root_path):
+        return moves
+    skip = {p.rstrip("/") for p in exclude} | {root_path.rstrip("/")}
+    own = root_path.rstrip("/") + "/"
+
+    def _covering() -> "tuple[list[tuple[str, str]], list[tuple[str, str]]]":
+        """The roots that can take a track now, innermost first — listed and
+        not being removed — and those of them above or below this root (a
+        track of this root lies under it, where only those can hold it; a
+        track stored elsewhere is checked against every root)."""
+        try:
+            from soniqboom.core import removals
+            gone = {p.rstrip("/") for p in removals.purging()}
+            if owning:
+                gone |= {p.rstrip("/") for p in removals.registry(store)}
+        except Exception:                               # noqa: BLE001 — a stand-in store
+            gone = set()
+        roots: list[tuple[str, str]] = []
+        for sd in store.list_scan_dirs():
+            p = sd.get("path") or ""
+            q = p.rstrip("/")
+            if not p.startswith("/") or is_remote_path(p) or q in skip or q in gone:
+                continue
+            roots.append((q + "/", sd.get("path_hash") or path_hash(p)))
+        roots.sort(key=lambda r: len(r[0]), reverse=True)
+        return roots, [r for r in roots if own.startswith(r[0]) or r[0].startswith(own)]
+    roots, near = _covering()
+    if not roots:
+        return moves
+    h = path_hash(root_path)
+    ids = list(store.get_track_ids_for_scan_root(h) if only is None else only)
+    n0, i = len(moves), 0
+    while i < len(ids) and (keep_going is None or keep_going()):
+        t0 = time.perf_counter()
+        while i < len(ids):
+            batch: list[tuple[str, dict]] = []
+            tracks = store._tracks              # (each step: a backup import replaces it)
+            for tid in ids[i:i + _HAND_OVER_STEP]:
+                t = tracks.get(tid)
+                if t is None or t.get("scan_root_hash") != h:
+                    continue
+                tp = t.get("path") or ""
+                for prefix, to in (near if tp.startswith(own) else roots):
+                    if tp.startswith(prefix):
+                        batch.append((tid, {"scan_root_hash": to}))
+                        break
+            i += _HAND_OVER_STEP
+            if batch:
+                store.update_track_fields_batch(batch)
+                for tid, upd in batch:
+                    moves[tid] = upd["scan_root_hash"]
+            if time.perf_counter() - t0 >= _SLICE_S:
+                break
+        await asyncio.sleep(0)
+        roots, near = _covering()               # (a removal begun meanwhile takes nothing)
+        if not roots:
+            break
+    if len(moves) > n0:
+        _browse_roots_changed(store, {h, *moves.values()})
+        log.info("%s: %d track(s) handed over to the root(s) still covering them",
+                 root_path, len(moves) - n0)
+    return moves
+
+
+def _browse_roots_changed(store, hashes) -> None:
+    """Tracks moved between these roots: drop the roots' folder-browse caches
+    (a same-count swap would otherwise pass their size check), have the
+    Subsonic catalogue rebuilt (its music folders are the roots; the
+    ``scan_root_hash`` field alone doesn't move its sequence) and tell the
+    DLNA controllers (a container per root).  A scan that only handed tracks
+    over reports no change, so its post-scan passes don't tell them."""
+    try:
+        store._catalog_seq += 1
+    except Exception:                                   # noqa: BLE001 — a stand-in store
+        pass
+    try:
+        from soniqboom.api import fstree
+        for h in hashes:
+            fstree.invalidate_scan_root(h)
+    except Exception:                                   # noqa: BLE001 — cosmetic
+        log.debug("browse cache drop after a hand-over failed", exc_info=True)
+    try:
+        from soniqboom.api.dlna_upnp import notify_library_changed
+        notify_library_changed()
+    except Exception:                                   # noqa: BLE001 — cosmetic
+        log.debug("DLNA notify after a hand-over failed", exc_info=True)
 
 
 _SCAN_DIR_RESOLVE_S = 5.0
@@ -1107,38 +1252,66 @@ async def refresh_local_root_availability() -> int:
     return changed
 
 
-async def delete_tracks_by_scan_root(root_path: str, stop=None) -> int:
-    """Delete every track under a scan root, plus its cached art — in slices
-    (a root of tens of thousands of tracks would otherwise hold the loop for
-    seconds), with the sorted lists rebuilt when the batch section ends.  Stops
-    when the root is added again meanwhile — ``stop()`` says so (default: the
-    root is listed again): its new scan keeps what is left."""
+async def delete_tracks_by_scan_root(root_path: str, stop=None, moved=None) -> int:
+    """Delete every track of a scan root that no other registered root (not
+    being removed) covers, plus its cached art.  The tracks another root
+    covers (nested roots) are handed over to it first (``hand_over_covered``;
+    if that fails, nothing is deleted; ``moved`` collects what was handed
+    over), and again whenever a root comes or goes, or a removal ends or is
+    undone, during the purge; a track is deleted only while it is still
+    tagged with this root in the library as it is now (a scan meanwhile may
+    have tagged it with a root added since; a backup import replaces the
+    library).  Deletes in slices (a root of tens of thousands of tracks would
+    otherwise hold the loop for seconds), with the sorted lists rebuilt when
+    the batch section ends.  Stops — handing over too — when the root is added
+    again meanwhile — ``stop()`` says so (default: the root is listed again):
+    its new scan keeps what is left."""
     import asyncio
     import time
-    from soniqboom.core import scanner
+    from soniqboom.core import removals, scanner
     from soniqboom.core.modland_catalog import _DELETE_STEP, _SLICE_S
     h = path_hash(root_path)
     store = get_store()
+    if stop is None:
+        stop = lambda: root_path in store._scan_dirs            # noqa: E731
+
+    def _roots_now() -> tuple:
+        return frozenset(store._scan_dirs), frozenset(removals.registry(store))
+
+    async def _hand_over() -> None:
+        # (a root still in its undo window takes what it covers — undone, it
+        #  keeps it; a removal begun after this one's wait for its neighbours
+        #  must not lose those tracks — a root past its window takes nothing)
+        await hand_over_covered(store, root_path, moved=moved, keep_going=lambda: not stop())
+    listed = _roots_now()                       # (before the hand-over: a root added
+    await _hand_over()                          #  while it runs is caught below)
     ids = list(store.get_track_ids_for_scan_root(h))
     if not ids:
         return 0
+    gone: list[str] = []                        # (the ids deleted: their art goes too)
     deleted, i = 0, 0
     store.enter_batch_mode()
     try:
-        if stop is None:
-            stop = lambda: root_path in store._scan_dirs        # noqa: E731
         while i < len(ids) and not stop():
+            if _roots_now() != listed:
+                listed = _roots_now()           # (a root came or went, or a removal ended)
+                await _hand_over()
+                continue
             t0 = time.perf_counter()
             while True:                         # (at least one step a slice)
-                part = ids[i:i + _DELETE_STEP]
-                i += len(part)
-                deleted += store.delete_track_ids(part)
+                tracks = store._tracks          # (each step: a backup import replaces it)
+                part = [tid for tid in ids[i:i + _DELETE_STEP]
+                        if (tracks.get(tid) or {}).get("scan_root_hash") == h]
+                i += _DELETE_STEP
+                if part:
+                    deleted += store.delete_track_ids(part)
+                    gone.extend(part)
                 if i >= len(ids) or time.perf_counter() - t0 >= _SLICE_S:
                     break
             await asyncio.sleep(0)
     finally:
         await asyncio.shield(scanner._async_exit_batch_mode(store))
-        await _drop_art(ids[:i], deleted)
+        await _drop_art(gone, deleted)
     return deleted
 
 

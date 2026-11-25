@@ -106,7 +106,8 @@ async def test_fs_walk_listing_and_dedup_memos(env):
         "mtime": 1.0, "files": [], "id_map": {"t0": Path("x")}, "results": [{"id": "t0"}]}
     fstree._TRACKS_META_CACHE[(f"{root}/Other", False)] = {
         "mtime": 1.0, "files": [], "id_map": {"t2": Path("y")}, "results": [{"id": "t2"}]}
-    fstree._DEDUP_MEMO[id(listing)] = (listing, listing)
+    fstree._DEDUP_MEMO[id(listing)] = (listing, {"plan": [], "ids": frozenset(),
+                                                 "rel": frozenset(), "out": listing})
     s.update_track_fields("t0", {"album": "Gold"})
     await fa.refresh_album_caches(["t0"])
     # The FS listing holding t0 re-shapes its rows next time; the other keeps its own.

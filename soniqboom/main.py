@@ -1955,9 +1955,9 @@ async def startup():
     # NOW — while the splash is already displayed — so the first user
     # click on any subfolder under any local scan root lands warm
     # instead of paying ~1.2 s (SID, 56K) / ~3 s (modarchive, 111K) on
-    # interaction.  Remote (smb://, ftp://) roots are skipped — they
-    # use ``store.filter_tracks`` directly via ``_remote_tracks_with_meta``
-    # and don't benefit from this index.
+    # interaction.  Remote (smb://, ftp://, WebDAV) roots are skipped —
+    # a share's index is built when the share is first browsed (the
+    # folder tree, ``_remote_tracks_with_meta``), not at startup.
     _ss_phase("warmup_browse", "Pre-warming folder browse cache")
     t_warm = time.monotonic()
     try:

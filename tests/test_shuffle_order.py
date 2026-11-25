@@ -437,7 +437,8 @@ async def test_folder_endpoint_shuffles_the_indexed_store_listing(monkeypatch, t
     store.upsert_scan_dir(root)
     for i in range(64):
         store.upsert_track(_track(
-            i, path=f"{root}/sub/tune{i:02d}.mod", scan_root_hash=path_hash(root),
+            i, path=f"{root}/sub/tune{i:02d}.{'flac' if i % 2 == 0 else 'mp3'}",
+            format="FLAC" if i % 2 == 0 else "MP3", scan_root_hash=path_hash(root),
             duplicate_group_id=f"g{i // 2}", is_duplicate_primary=(i % 2 == 0)))
 
     async def ids(**kw):
@@ -645,7 +646,8 @@ async def test_folder_dedup_defaults_on_and_only_a_value_saved_by_a_working_ui_c
     store.upsert_scan_dir(root)
     for i in range(20):
         store.upsert_track(_track(
-            i, path=f"{root}/sub/tune{i:02d}.mod", scan_root_hash=path_hash(root),
+            i, path=f"{root}/sub/tune{i:02d}.{'flac' if i % 2 == 0 else 'mp3'}",
+            format="FLAC" if i % 2 == 0 else "MP3", scan_root_hash=path_hash(root),
             duplicate_group_id=f"g{i // 2}", is_duplicate_primary=(i % 2 == 0)))
 
     async def total():            # what the web UI sends: NO filter_duplicates param

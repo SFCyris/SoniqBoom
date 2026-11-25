@@ -92,10 +92,14 @@ const settingsBtn = document.getElementById('m-settings-btn');
 if (settingsBtn) settingsBtn.addEventListener('click', () => activate('settings'));
 
 const _mounted = {};
+let _current = null;
 
 function activate(viewName) {
   const v = VIEWS[viewName];
   if (!v) return;
+  // The shown view's key pressed again (the Library: back to the top of its list).
+  const again = _current === viewName && !!_mounted[viewName];
+  _current = viewName;
 
   views.forEach(el => el.classList.toggle('active', el === v.el));
   tabs.forEach(t => {
@@ -112,16 +116,20 @@ function activate(viewName) {
   }
 
   if (!_mounted[viewName]) {
-    v.mount(v.el, { showSheet, toast: showToast, navigate: activate });
+    v.mount(v.el, { showSheet, hideSheet, sheetOpen: () => !sheet.classList.contains('hidden'),
+                    toast: showToast, navigate: activate });
     _mounted[viewName] = true;
   } else {
     // Notify view it's been re-shown — useful for queue/nowplaying refresh
     v.el.dispatchEvent(new CustomEvent('viewactive'));
+    if (again) v.el.dispatchEvent(new CustomEvent('viewreselect'));
   }
 
-  // Sync URL hash for deep-linking / back button
+  // Sync URL hash for deep-linking / back button.  The entry's state stays:
+  // the Library keeps one there while a folder or a group is open (so the
+  // system Back goes up a level — views/library.js).
   if (location.hash !== `#${viewName}`) {
-    history.replaceState(null, '', `#${viewName}`);
+    history.replaceState(history.state, '', `#${viewName}`);
   }
 }
 
@@ -437,7 +445,44 @@ function showSheet({ title = 'Actions', actions = [] }) {
   sheet.classList.remove('hidden');
   sheetBg.classList.remove('hidden');
   (sheetList.firstElementChild || sheet.querySelector('#m-sheet-cancel'))?.focus?.();
+  // While it is open the sheet has a history entry of its own: the system Back
+  // (Android's, Safari's edge swipe) closes it instead of leaving the page.  (A
+  // sheet that opens from another one's action: its entry follows once the
+  // other's is out.)
+  if (!_sheetEntry) {
+    if (_sheetBack) _sheetWant = true;
+    else _pushSheetEntry();
+  }
 }
+// [m-sheet-history] ``_sheetEntry``: the open sheet's entry is the current one;
+// ``_sheetBack``: a Back this page started to take it out (the sheet closed by
+// a tap) — that popstate is no one's to act on; ``_sheetWant``: a sheet opened
+// meanwhile, its entry goes in after.  Every popstate the sheet answered
+// carries ``sbSheet`` ('closed' / 'consumed'), so the views' own handlers
+// (views/library.js) leave it alone.  Registered before any view mounts: it
+// runs first.
+let _sheetEntry = false, _sheetBack = false, _sheetPopping = false, _sheetWant = false;
+function _pushSheetEntry() {
+  try { history.pushState(Object.assign({}, history.state, { sbSheet: true }), ''); _sheetEntry = true; } catch (_) { /* no history */ }
+}
+window.addEventListener('popstate', (e) => {
+  if (_sheetBack) {
+    _sheetBack = false;
+    e.sbSheet = 'consumed';
+    if (_sheetWant) { _sheetWant = false; if (!sheet.classList.contains('hidden')) _pushSheetEntry(); }
+    return;
+  }
+  if (_sheetEntry) {
+    _sheetEntry = false;
+    _sheetPopping = true;
+    try { hideSheet(); } finally { _sheetPopping = false; }
+    e.sbSheet = 'closed';
+  }
+});
+// (a reload while a sheet was open: its entry is left over — taken out)
+try {
+  if (history.state && history.state.sbSheet) { _sheetBack = true; history.back(); }
+} catch (_) { _sheetBack = false; }
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !sheet.classList.contains('hidden')) hideSheet();
 });
@@ -448,6 +493,16 @@ function hideSheet() {
   if (was) { try { _sheetOpener?.focus?.({ preventScroll: true }); } catch (_) {} _sheetOpener = null; }
   sheet.classList.add('hidden');
   sheetBg.classList.add('hidden');
+  // Closed by a tap (Cancel, the backdrop, an action): its entry goes too.
+  if (was && !_sheetPopping) {
+    if (_sheetEntry) {
+      _sheetEntry = false;
+      _sheetBack = true;
+      try { history.back(); } catch (_) { _sheetBack = false; }
+    } else {
+      _sheetWant = false;                    // (its entry never went in)
+    }
+  }
 }
 
 sheetBg.addEventListener('click',     hideSheet);

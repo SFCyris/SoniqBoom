@@ -308,7 +308,11 @@ async def test_playlists_folders_and_the_duplicates_view_still_list_them_marked(
         assert len(sp["tracks"]) == 100                         # a smart playlist hides nothing
         d = f"{ulib.root_a}/d0"
         rows = (await c.get(f"/api/fstree/tracks-with-meta?path={d}&recursive=false")).json()
-        assert {r["id"] for r in rows} >= cant                  # the open folder lists them
+        got = {r["id"] for r in rows}
+        # The open folder lists them — but the broken copy of a track whose
+        # playable copy sits beside it gives way to that copy (duplicates hidden).
+        assert got >= cant - {ulib.ids_a[0]}
+        assert ulib.ids_a[6] in got and ulib.ids_a[0] not in got
         dup = (await c.get("/api/smart/duplicates")).json()
         flat = json.dumps(dup)
         assert ulib.ids_a[0] in flat and ulib.ids_a[6] in flat

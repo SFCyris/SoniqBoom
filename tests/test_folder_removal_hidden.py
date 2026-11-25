@@ -344,7 +344,7 @@ async def test_removing_the_same_folder_twice_keeps_the_first_removal(lib, monke
 async def test_a_failed_removal_is_kept_and_shown(lib, monkeypatch):
     monkeypatch.setattr(removals, "UNDO_S", 0.0)
 
-    async def _boom(_path):
+    async def _boom(_path, *_rest):
         raise OSError("disk full")
     monkeypatch.setattr(removals, "_drop_folder", _boom)
     await removals.begin(ROOT)

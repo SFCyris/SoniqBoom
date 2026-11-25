@@ -253,13 +253,12 @@ def _local_root_hashes(store, path: str) -> "tuple[list[str], list[str]]":
     it (it, or a folder above it) and the roots below it.
 
     Nested roots (``/M`` and ``/M/Box/CD2`` both registered) both cover the
-    inner folder, and each of its tracks is tagged with ONE of them: the root
-    whose scan read it last.  That tag moves.  A scan of a root counts only the
-    tracks tagged with that root as indexed (``scanner._run_scan_body``,
-    ``refresh_subtree_under_root``), so it reads the files under it that the
-    other root holds again and tags them with itself — a scan of both roots
-    swaps the inner folder's tags.  A folder's tracks can sit in any of these
-    indexes: listing only the roots above it misses what the roots below hold."""
+    inner folder, and each of its tracks is tagged with ONE of them: the
+    innermost root holding it (the scanner's owner rule: a root's walk skips
+    the roots inside it), or the outer one while a removal of the inner root
+    can still be undone or before a scan handed an older tag over.  A folder's
+    tracks can sit in any of these indexes: listing only the roots above it
+    misses what the roots below hold."""
     from soniqboom.core.data import path_hash
     p = path.rstrip("/")
     pre = p + "/"

@@ -2037,6 +2037,148 @@ label.m-settings-row .label small {
   letter-spacing: 0.04em;
 }
 
+/* ── Library › Folders: one folder per screen (views/library.js) ──────────
+   Inside a folder the selector keys step aside and one bar stays at the top
+   (#lib-sticky): Back, the folder's name under the folders above it (both on
+   the display; tap it to go straight up), the filter key — and the filter
+   field under it when open.  Play / Shuffle head the list and scroll away
+   with it.  On the Folders home a music folder that can't be reached is
+   greyed with a red lamp; a healthy one shows no lamp. */
+.m-lib-folder .m-group-bar { display: none; }
+.m-lib-folder .m-lib-sticky { position: sticky; top: 0; z-index: 2; }
+.m-crumb-text--path {
+  display: flex; flex-direction: column; justify-content: center;
+  height: 44px;
+  line-height: 1.15;
+  cursor: pointer;
+}
+.m-crumb-parent, .m-crumb-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-crumb-parent {
+  font: 600 11px/1.25 var(--hx-face);
+  letter-spacing: 0.06em;
+  color: var(--hx-vfd-dim);
+  text-shadow: none;
+}
+.m-crumb-name { font: 700 15px/1.25 var(--hx-face); letter-spacing: 0.04em; }
+.m-crumb-find svg {
+  width: 20px; height: 20px;
+  fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round;
+}
+.m-crumb-find::before {
+  content: ""; position: absolute; top: 5px; right: 6px;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--hx-lamp-off);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,0.6), 0 1px 0 rgba(255,255,255,0.12);
+}
+.m-crumb-find[aria-pressed="true"] { background: var(--hx-key-pressed); box-shadow: var(--hx-key-shadow-in); }
+.m-crumb-find[aria-pressed="true"]::before { background: var(--hx-lamp-on); box-shadow: var(--hx-lamp-glow); }
+.m-ffilter {
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 12px 8px;
+  background: var(--hx-plate);
+  border-bottom: 1px solid var(--hx-edge);
+}
+.m-ffilter .m-search-input { flex: 1 1 auto; min-width: 0; width: auto; }
+.m-ffilter-count {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font: 700 12px/1.2 var(--hx-face);
+  letter-spacing: 0.06em;
+  color: var(--hx-print-2);
+  font-variant-numeric: tabular-nums;
+}
+.m-fhead {
+  padding: 10px 14px 9px 11px;
+  border-left: 3px solid var(--hx-margin);
+  border-bottom: 1px solid var(--hx-rule);
+  background: var(--hx-card-2);
+}
+.m-fhead-keys { display: flex; gap: 8px; }
+.m-fhead-keys .m-key { padding: 0 14px; }
+.m-fhead-keys .m-key[aria-busy="true"] { background: var(--hx-key-pressed); box-shadow: var(--hx-key-shadow-in); }
+.m-fhead-text {
+  margin-top: 7px;
+  font: 700 12px/1.3 var(--hx-face);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--hx-ink-2);
+  font-variant-numeric: tabular-nums;
+}
+/* A short landscape screen: the keys and their line on one row */
+@media (orientation: landscape) and (max-height: 540px) {
+  .m-fhead { display: flex; align-items: center; gap: 14px; padding-top: 7px; padding-bottom: 7px; }
+  .m-fhead-text { margin-top: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+/* A folder row: its name on up to two lines in the row's own height */
+.m-row--folder .m-row-title {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+.m-row--folder .m-row-meta .m-row-artist,
+.m-row--folder .m-row-album { display: none; }          /* (the album column of a wide list: none for a folder) */
+/* The path on the display is a button (to go straight up) that looks like the display */
+.m-crumb-path {
+  display: flex; flex-direction: column; justify-content: center;
+  width: 100%; height: 100%; min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  text-shadow: inherit;
+}
+/* The Folders home: a band per kind of music folder */
+.m-fband {
+  padding: 9px 16px 8px 14px;
+  border-left: 3px solid var(--hx-margin);
+  border-bottom: 1px solid var(--hx-rule);
+  background: var(--hx-card-2);
+  font: 700 12px/1.2 var(--hx-face);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--hx-ink-2);
+}
+.m-froot--off .m-row-title, .m-froot--off .m-row-artist { color: var(--hx-ink-2); }
+.m-froot--off .m-row-art { opacity: 0.5; }
+.m-froot-badge {
+  flex: none;
+  padding: 3px 6px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  font: 700 11px/1 var(--hx-face);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--danger);
+}
+.m-froot-lamp {
+  flex: none;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--hx-led-bad);
+  box-shadow: 0 0 6px var(--hx-led-bad);
+}
+@media (prefers-color-scheme: light) {
+  /* (a lit lamp on silver: the deep colour in a dark ring, no glow) */
+  .m-froot-lamp { background: #c8321f; box-shadow: 0 0 0 1px rgba(0,0,0,0.45); }
+}
+/* Back from a folder: the one you came from flashes and keeps a ring a moment
+   (the focus colour — amber means "on", green "playing") */
+@keyframes m-row-pulse {
+  0%, 35% { box-shadow: inset 0 0 0 999px color-mix(in srgb, var(--hx-focus) 28%, transparent); }
+  100%    { box-shadow: inset 0 0 0 999px color-mix(in srgb, var(--hx-focus) 0%, transparent); }
+}
+.m-row--pulse { outline: 2px solid var(--hx-focus); outline-offset: -2px; }
+.m-row--pulse > .m-row-content { animation: m-row-pulse 1.3s ease-out both; }
+@media (prefers-reduced-motion: reduce) {
+  .m-row--pulse > .m-row-content {
+    animation: none;
+    box-shadow: inset 0 0 0 999px color-mix(in srgb, var(--hx-focus) 22%, transparent);
+  }
+}
+
 /* ── Queue header: a tape counter of the time left, the count, Clear ───── */
 
 .m-queue-head {

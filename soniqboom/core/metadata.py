@@ -1668,6 +1668,20 @@ def _apev2_fields(tags) -> dict:
     return d
 
 
+# The formats whose stored bitrate is the file's size over its length (the
+# header states none, or an uncompressed rate): ``_flac``, ``_mp4`` (ALAC),
+# ``_extract_wma`` (WMA Lossless), ``_apev2_audio`` (WavPack, APE, TTA — their
+# headers state no bitrate).  A file read through a front window gets this
+# from the whole file's size instead (``scanner``, ``repair``).
+SIZE_RATE_FORMATS = frozenset(("FLAC", "ALAC", "WMA LOSSLESS", "WAVPACK", "APE", "TTA"))
+
+
+def size_rate_format(fmt) -> bool:
+    """Whether ``fmt``'s bitrate is the file's size over its length
+    (``SIZE_RATE_FORMATS``)."""
+    return isinstance(fmt, str) and fmt.upper() in SIZE_RATE_FORMATS
+
+
 def _apev2_audio(path: Path, track_id: str, ext: str) -> "dict | None":
     """WavPack / Musepack / Monkey's Audio / TTA: the stream (mutagen) and an
     APEv2 tag's fields (an ID3 tag's on a TTA without one); None when

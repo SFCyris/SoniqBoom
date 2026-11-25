@@ -51,7 +51,8 @@ from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable, Iterable
 
 from soniqboom.core.metadata import (
-    SID_EXTS, SUPPORTED_EXTENSIONS, extract, is_supported_music_name, title_from_filename,
+    SID_EXTS, SUPPORTED_EXTENSIONS, extract, is_supported_music_name, size_rate_format,
+    title_from_filename,
 )
 
 
@@ -1667,6 +1668,7 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                       scope: "dict[str, frozenset[str]] | None" = None,
                       known_archives: "dict[str, tuple[float | None, list[str]]] | None" = None,
                       failed_archives: "set[str] | None" = None,
+                      prune: "frozenset[str] | None" = None,
                       ) -> dict[str, list[Path]]:
     """Discover the audio files of each root.  With ``scope`` (root → changed
     paths, from the folder watcher) a root lists only the files under those
@@ -1679,7 +1681,13 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
 
     ``failed_archives`` (optional, filled in): archives that exist but could
     not be read (corrupt, encrypted, permission) — their already-indexed
-    members must not be pruned as deleted."""
+    members must not be pruned as deleted.
+
+    ``prune`` (the owning local roots: registered, not being removed —
+    ``_owning_roots``): nested roots — a file belongs to the innermost
+    registered root holding it, so a root's walk skips the folders inside it
+    that are roots of their own (their scan lists them), and a scoped path
+    inside one."""
     import io
     import os
     import zipfile
@@ -1722,7 +1730,13 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
         _scoped = scope.get(str(p)) if scope else None
         _walk = (_scope_walk(_scoped, _on_walk_error, str(p)) if _scoped is not None
                  else os.walk(p, onerror=_on_walk_error))
+        _inner = frozenset(_roots_pruned_below(_root_key, prune))
         for dirpath, _dirs, filenames in _walk:
+            if _inner:
+                if any(dirpath == q or dirpath.startswith(q + os.sep) for q in _inner):
+                    _dirs[:] = []                   # (a root of its own: its scan lists it)
+                    continue
+                _dirs[:] = [x for x in _dirs if os.path.join(dirpath, x) not in _inner]
             try:
                 _note_folder_image(dirpath, filenames, _folder_names,
                                    complete=_scoped is None, gen=_folder_gen)
@@ -3480,7 +3494,14 @@ async def _refresh_browse_after_commit(store, old_versions: "dict[str, dict | No
     """Folder-browse caches are validated by track COUNT / folder mtime, which
     an in-place re-tag doesn't move: re-shape the re-extracted rows in place,
     and patch the per-root listing where tracks came or went
-    (``fstree.patch_scan_root_rows``; an out-of-step entry is dropped)."""
+    (``fstree.patch_scan_root_rows``; an out-of-step entry is dropped) — a
+    track whose ``scan_root_hash`` changed (nested roots) goes out of its old
+    root's listing and into its new one's, rather than being re-shaped in a
+    listing that doesn't hold it (which dropped every browse cache); then it
+    is re-shaped there like the others (``refresh_album_caches``: the
+    aggregations and the folder metadata listings holding it).  Run
+    after a local scan's commit, a folder click's refresh, and each flush and
+    the ghost purge of a network share's scan, inside their ``root_commit``."""
     try:
         from soniqboom.api import fstree
         from soniqboom.core.folder_album import _drop_browse_disk_cache, refresh_album_caches
@@ -3489,7 +3510,13 @@ async def _refresh_browse_after_commit(store, old_versions: "dict[str, dict | No
         removed: dict[str, set[str]] = {}
         for tid, old in old_versions.items():
             new = store._tracks.get(tid)
-            if old is not None and new is not None:
+            if (old is not None and new is not None and old.get("scan_root_hash")
+                    and new.get("scan_root_hash")
+                    and old.get("scan_root_hash") != new.get("scan_root_hash")):
+                removed.setdefault(old["scan_root_hash"], set()).add(old.get("path") or "")
+                added.setdefault(new["scan_root_hash"], []).append(new)
+                existing.append(tid)        # (its new row, once patched in: re-shaped there)
+            elif old is not None and new is not None:
                 existing.append(tid)
             elif new is not None and new.get("scan_root_hash"):
                 added.setdefault(new["scan_root_hash"], []).append(new)
@@ -3516,8 +3543,23 @@ async def _refresh_browse_after_commit(store, old_versions: "dict[str, dict | No
             mark_browse_disk_stale()
         if existing:
             await refresh_album_caches(existing)
-    except Exception:                                   # noqa: BLE001 — cosmetic
-        log.debug("browse cache refresh after commit failed", exc_info=True)
+    except Exception:                                   # noqa: BLE001
+        # Rows it didn't get to would be served as they were (their counts
+        # match): the indexes of the roots it was refreshing and the on-disk
+        # browse copy are dropped instead — the next listing builds them from
+        # the store.
+        log.debug("browse cache refresh after commit failed: dropping its roots",
+                  exc_info=True)
+        try:
+            from soniqboom.api import fstree as _fs
+            from soniqboom.core.folder_album import _drop_browse_disk_cache as _drop_disk
+            for h in {(t or {}).get("scan_root_hash")
+                      for tid, old in old_versions.items()
+                      for t in (old, store._tracks.get(tid))} - {None, ""}:
+                _fs.invalidate_scan_root(h)
+            _drop_disk()
+        except Exception:                               # noqa: BLE001
+            log.debug("dropping the browse caches failed", exc_info=True)
 
 
 async def _apply_duplicate_annotations(annotations: dict) -> int:
@@ -3616,6 +3658,39 @@ class _FolderPaths:
                 for p in fresh:
                     bisect.insort(self.sorted, p)
         return self.sorted
+
+    async def sync_sliced(self, store) -> list[str]:
+        """``sync``, with a big first build done in slices of the loop (the
+        folders of a 263K-track library took ~40 ms in one go).  The list is
+        sorted at every yield, so a ``sync`` meanwhile finds it whole."""
+        import os
+        cur = store._tag_dir_hash
+        todo = ([h for h in cur.keys() if h not in self.by_hash]
+                if len(cur) - len(self.by_hash) > 2048 else ())
+        if len(todo) > 2048:
+            from soniqboom.core.modland_catalog import _SLICE_S
+            fresh: list[str] = []
+            t0 = time.perf_counter()
+            for h in todo:
+                ids = cur.get(h)
+                if ids and h not in self.by_hash:
+                    tracks = store._tracks
+                    for tid in ids:
+                        t = tracks.get(tid)
+                        if t is not None:
+                            p = os.path.dirname((t.get("path") or "").split("::", 1)[0])
+                            self.by_hash[h] = p
+                            fresh.append(p)
+                            break
+                if time.perf_counter() - t0 >= _SLICE_S:
+                    self.sorted.extend(fresh)
+                    self.sorted.sort()
+                    fresh = []
+                    await asyncio.sleep(0)
+                    t0 = time.perf_counter()
+            self.sorted.extend(fresh)
+            self.sorted.sort()
+        return self.sync(store)
 
 
 _folder_paths = _FolderPaths()
@@ -4242,6 +4317,172 @@ def _root_is_live(root: str) -> bool:
         return False
 
 
+def _local_root_keys(store) -> list[str]:
+    """The registered LOCAL scan roots (as registered — resolved paths)."""
+    return [r for r in store._scan_dirs
+            if isinstance(r, str) and r.startswith("/") and not is_remote_path(r)]
+
+
+def _owning_roots(store) -> frozenset[str]:
+    """The registered local roots that own files under the nested-roots rule
+    — all but those being removed: a removal hands what another root covers
+    over to that root, which owns it until an Undo hands it back."""
+    local = _local_root_keys(store)
+    if len(local) < 2:
+        return frozenset(local)
+    from soniqboom.core import removals
+    removing = removals.registry(store)
+    return frozenset(r for r in local if r not in removing)
+
+
+def _strictly_below(q: str, r: str) -> bool:
+    """Is folder ``q`` inside folder ``r`` (component-wise, not ``r`` itself)?"""
+    q, r = q.rstrip("/"), r.rstrip("/")
+    return q != r and (q.startswith(r + "/") if r else bool(q))
+
+
+def _owner_tag_now(store, root: str) -> "str | None":
+    """Nested roots: while ``root`` is being removed it owns nothing — the
+    path hash of the innermost owning root holding it, else None."""
+    try:
+        from soniqboom.core import removals
+        if root not in removals.registry(store):
+            return None
+    except Exception:                                   # noqa: BLE001 — a stand-in store
+        return None
+    o = _innermost_root(root, _owning_roots(store) - {root})
+    return path_hash(o) if o is not None else None
+
+
+def _sorted_roots_inside(path: str, roots: list[str]) -> list[str]:
+    """The roots of the sorted list ``roots`` inside folder ``path`` (by
+    binary search: a watcher's scope can hold a thousand paths)."""
+    import bisect
+    pre = path.rstrip("/") + "/"
+    i = j = bisect.bisect_left(roots, pre)
+    while j < len(roots) and roots[j].startswith(pre):
+        j += 1
+    return roots[i:j]
+
+
+def _roots_pruned_below(root: str, prune) -> list[str]:
+    """The roots of ``prune`` inside folder ``root``: the ones its walk skips."""
+    return [q for q in (prune or ()) if _strictly_below(q, root)]
+
+
+def _inside_any(path: str, roots) -> bool:
+    """Is a track path (an archive member: its archive) inside one of ``roots``?"""
+    p = path.split("::", 1)[0]
+    return any(p.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def _innermost_root(path: str, roots) -> "str | None":
+    """The innermost of ``roots`` (paths) that holds ``path``, or None."""
+    best = None
+    for r in roots:
+        rr = r.rstrip("/")
+        if (not rr or path == rr or path.startswith(rr + "/")) and (
+                best is None or len(rr) > len(best.rstrip("/"))):
+            best = r
+    return best
+
+
+async def _root_tracks_under(store, r: str, paths) -> list[str]:
+    """Root ``r``'s tracks at or under ``paths`` — a folder's through the
+    folder index (``_folder_paths``: the folders below it by binary search,
+    their tracks by ``_tag_dir_hash``), in slices of the loop; a file or an
+    archive through ``_scoped_track_ids``.  No pass over the root."""
+    import bisect
+    from soniqboom.core.modland_catalog import _SLICE_S
+    h = path_hash(r)
+    if not store._tag_scan_root_hash.get(h):
+        return []
+    allf = await _folder_paths.sync_sliced(store)
+    folders: list[str] = []
+    others: set[str] = set()
+    for p in paths:
+        i = bisect.bisect_left(allf, p)
+        own = i < len(allf) and allf[i] == p
+        pre = p.rstrip("/") + "/"
+        i = j = bisect.bisect_left(allf, pre)
+        while j < len(allf) and allf[j].startswith(pre):
+            j += 1
+        if own:
+            folders.append(p)
+        folders.extend(allf[i:j])                 # (a copy: the index changes meanwhile)
+        if not own and j == i:
+            others.add(p)
+    out: list[str] = list(_scoped_track_ids(store, r, frozenset(others))) if others else []
+    t0 = time.perf_counter()
+    for f in folders:
+        ids = store._tag_dir_hash.get(path_hash(f))
+        if ids:
+            root_ids = store._tag_scan_root_hash.get(h) or ()    # (live: re-read each folder)
+            out.extend(t for t in ids if t in root_ids)
+        if time.perf_counter() - t0 >= _SLICE_S:
+            await asyncio.sleep(0)
+            t0 = time.perf_counter()
+    return out
+
+
+async def _hand_over_inside(store, r: str, paths, inner: list, local: list) -> None:
+    """Root ``r``'s tracks under ``paths`` go to the innermost of its deeper
+    roots ``inner`` holding each (``data.hand_over_covered``: a re-tag, no
+    file read; a track in none of them stays)."""
+    from soniqboom.core.data import hand_over_covered
+    ids = list(dict.fromkeys(await _root_tracks_under(store, r, paths))) if paths else ()
+    if ids:
+        await hand_over_covered(store, r, exclude=[q for q in local if q not in inner],
+                                only=ids, owning=True)
+
+
+async def _release_under(store, paths) -> None:
+    """``_release_to_inner_roots`` for a watcher's changed paths or a clicked
+    folder: each root holding one of ``paths`` hands its tracks under it that
+    a deeper root owns over to that root — tags an older scan left: under a
+    path inside a deeper root's folder, and in the deeper roots' folders a
+    path holds."""
+    owning = sorted(_owning_roots(store), key=lambda q: (len(q), q))
+    if len(owning) < 2 or not paths:
+        return
+    local = _local_root_keys(store)
+    for r in owning:
+        inner = [q for q in owning if _strictly_below(q, r)]
+        if not inner:
+            continue
+        mine = [p for p in paths if p == r or _strictly_below(p, r)]
+        look = ({p for p in mine if any(p == q or _strictly_below(p, q) for q in inner)}
+                | {q for q in inner if any(_strictly_below(q, p) for p in mine)})
+        await _hand_over_inside(store, r, look, inner, local)
+
+
+async def _release_to_inner_roots(store, roots) -> None:
+    """Nested roots (``Music`` and ``Music/Box/CD2`` both registered): a file
+    belongs to the innermost registered root holding it.  Before a full scan
+    of ``roots``, each local root among, above or below them hands the tracks
+    it holds inside a deeper registered root over to that root
+    (``data.hand_over_covered``: a re-tag, nothing is read again), outermost
+    first, so one pass moves a track to its innermost root.  The scan then
+    finds every file already its owner's: none is read again or re-tagged.
+    The tracks are found in the deeper roots' folders (``_root_tracks_under``),
+    not by a pass over each root.  Roots being removed neither give (their
+    removal hands over) nor take."""
+    from soniqboom.core import removals
+    local = _local_root_keys(store)
+    if len(local) < 2:
+        return
+    wanted = list(roots)
+    removing = set(removals.registry(store))
+    involved = [r for r in local
+                if any(r == s or _strictly_below(r, s) or _strictly_below(s, r) for s in wanted)]
+    for r in sorted(involved, key=lambda q: (len(q), q)):
+        if r in removing:
+            continue
+        inner = [q for q in local if _strictly_below(q, r) and q not in removing]
+        if inner:
+            await _hand_over_inside(store, r, inner, inner, local)
+
+
 async def _run_scan(
     directories: list[str],
     on_progress: Callable[[ScanProgress], Awaitable[None]] | None = None,
@@ -4292,11 +4533,121 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
 
     def _drop_removed_roots(chunk: list) -> list:
         """A commit chunk minus the tracks of roots removed meanwhile (the
-        removal's purge may already have run)."""
+        removal's purge may already have run) — but those inside a root
+        owning their folder go to that root (``_to_owners``)."""
+        chunk = _to_owners(chunk)
         gone = {path_hash(r) for r in _registered0 if r not in get_store()._scan_dirs}
         if not gone:
             return chunk
         return [t for t in chunk if t.get("scan_root_hash") not in gone]
+
+    # Nested roots: scans this one leaves to another root (a root whose
+    # owner changed while it ran) — queued once it ends.
+    _requeue_full: set[str] = set()                 # roots: a full, light scan
+    _requeue_scoped: dict[str, set[str]] = {}       # root → paths: a scoped scan
+
+    def _requeue_to_owner(paths, root: str) -> None:
+        """``paths`` (a root's folder, or its changed paths) of ``root``, which
+        owns nothing now: each to the owning root holding it, if any."""
+        own = _owning_roots(get_store()) - {root}
+        for q in paths:
+            o = _innermost_root(q, own)
+            if o is not None:
+                _requeue_scoped.setdefault(o, set()).add(q)
+
+    def _owns_nothing(root: str) -> bool:
+        """Nested roots: is ``root`` being removed inside an owning root?
+        (Its folder is that root's: a root being removed owns nothing.)"""
+        if not _nested:
+            return False
+        own = _owning_roots(get_store())
+        return (root not in own and root in set(_local_root_keys(get_store()))
+                and _innermost_root(root, own) is not None)
+
+    def _to_owners(rows: list) -> list:
+        """Rows tagged with a root being removed inside an owning root, or
+        removed since this scan began (a removal begun while it ran), get the
+        innermost owning root holding them instead — not hidden until the
+        removal ends, nor dropped with the root: its folder is that root's."""
+        if not _nested or not rows:
+            return rows
+        st = get_store()
+        try:
+            from soniqboom.core import removals as _rm
+            reg = _rm.registry(st)
+        except Exception:                               # noqa: BLE001 — a stand-in store
+            reg = {}
+        gone = ({path_hash(r) for r in (reg or ())}
+                | {path_hash(r) for r in _registered0 if r not in st._scan_dirs})
+        if not gone or not any(t.get("scan_root_hash") in gone for t in rows):
+            return rows
+        own = _owning_roots(st)
+        out = []
+        for t in rows:
+            if t.get("scan_root_hash") in gone:
+                o = _innermost_root((t.get("path") or "").split("::", 1)[0], own)
+                if o is not None:
+                    t = {**t, "scan_root_hash": path_hash(o)}
+            out.append(t)
+        return out
+
+    # Nested roots: a file belongs to the innermost registered root holding
+    # it (a root being removed owns none).  Each root's walk skips the roots
+    # inside it (``prune``), and a scan first has the roots involved hand the
+    # tracks they hold inside a deeper root over to it — a full scan
+    # (``_release_to_inner_roots``), a scoped one under its changed paths
+    # (``_release_under``) — so no scan reads or re-tags another root's files
+    # again.  (The roots as registered — resolved when added: no realpath of
+    # every root, a stale mount blocks.)
+    _nested = len(_local_root_keys(get_store())) > 1
+    _owning = _owning_roots(get_store()) if _nested else frozenset()
+    _prune = _owning if _nested else None
+    if _nested and scope:
+        # A path routed when the scan was queued may have another owner by
+        # now (a removal begun or undone meanwhile): it goes to that root's
+        # walk — that root's own folder to its full walk (``_scoped_track_ids``
+        # can't scope a root's own folder).
+        _to: dict[str, set] = {}
+        _whole: set[str] = set()
+        for _r, _paths in scope.items():
+            for _p in _paths:
+                _o = _innermost_root(_p, _owning)
+                if _o is None or _o == _r:
+                    _to.setdefault(_r, set()).add(_p)
+                elif _p == _o:
+                    _whole.add(_o)
+                else:
+                    _to.setdefault(_o, set()).add(_p)
+        if _whole or {r: frozenset(v) for r, v in _to.items()} != {r: frozenset(v)
+                                                                 for r, v in scope.items()}:
+            log.info("Scan: %d changed path(s) go to the root owning them now",
+                     sum(len(v) for v in scope.values()))
+            # (a root's own folder: its full, light scan, queued — with the
+            #  hand-over and the give-up records a full scan has)
+            _requeue_full |= _whole
+            scope = {r: frozenset(v) for r, v in _to.items() if r not in _whole}
+            directories = list(scope)
+            for _r in directories:
+                _res.setdefault(_r, _r)
+    elif _nested:
+        # A root being removed inside an owning root owns nothing: a full scan
+        # of it would re-read its files and tag them with it (hidden until its
+        # removal ends).  Its folder goes to the owning root's scoped scan
+        # instead, queued: its tracks there were handed over, so only what
+        # changed is read.
+        _drop = [d for d in directories if _owns_nothing(_res[d])]
+        for d in _drop:
+            _requeue_to_owner([_res[d]], _res[d])
+        directories = [d for d in directories if d not in _drop]
+    try:
+        if _prune and not scope:
+            await _release_to_inner_roots(get_store(), [_res[x] for x in directories])
+        elif _prune:
+            await _release_under(get_store(), frozenset().union(*scope.values()))
+    except Exception:                                   # noqa: BLE001 — never fails the scan
+        # (a track left with an outer root is not deleted for it — the stale
+        #  cleanup skips the inner roots' folders — at worst read again)
+        log.warning("Handing nested roots' tracks over before the scan failed", exc_info=True)
 
     # ── Discover files ────────────────────────────────────────────────────────
     from soniqboom.config import settings as _settings
@@ -4317,6 +4668,17 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     # whose wait is over is enumerated again, not listed from the store
     # (which never held that member).
     _giveups = await _load_giveups(get_store(), list(scope) if scope else _full_roots)
+    if _prune:
+        # (nested roots: what a root gave up in a deeper root's folder is that
+        #  root's file now — this root's walk never lists it, so it would never
+        #  settle; the deeper root records it if it fails there)
+        for _r, _gu in _giveups.items():
+            _theirs = {p for p in _gu.records
+                       if _innermost_root(_GiveUps.outer(p), _prune) not in (_r, None)}
+            if _theirs:
+                _gu.void |= _theirs
+                _gu.due -= _theirs
+                _gu.wait -= _theirs
     if _known_archives:
         for _gu in _giveups.values():
             for _p in _gu.due:
@@ -4339,7 +4701,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
         None, _find_audio_files, directories, _settings.scan_zips, scope, _known_archives,
-        _failed_archives,
+        _failed_archives, _prune,
     )
     try:
         from soniqboom.api.art import announce_folder_changes
@@ -4427,10 +4789,44 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         _prog_batch_entered = True
 
     for scan_root, files in dir_files.items():
+        _scoped_here = bool(scope) and scan_root in scope
         if _removed_now(scan_root):
             log.info("Scan: %s was removed while scanning — skipped", scan_root)
+            if _nested:                         # (its folder's changes: the owner's)
+                _requeue_to_owner(sorted(scope[scan_root]) if _scoped_here else [scan_root],
+                                  scan_root)
+            continue
+        if not _scoped_here and _owns_nothing(scan_root):
+            # (its removal began while this scan ran: its folder is the
+            #  owning root's — reading it now would hide what it tags; the
+            #  owner's scoped scan of it is queued)
+            log.info("Scan: %s is being removed inside a root that owns its folder — skipped",
+                     scan_root)
+            _requeue_to_owner([scan_root], scan_root)
             continue
         await upsert_scan_dir(scan_root)
+        # Nested roots: a root inside this one whose removal was undone since
+        # the walk owns its folder again, which this root's walk listed: its
+        # files are left out, its tracks are not this root's to prune, and
+        # its own scan is queued (of its folder for a full walk, of those
+        # files for a scoped one) — the files listed meanwhile may be new.
+        _joined: list[str] = []
+        if _nested:
+            _joined = [q for q in _roots_pruned_below(scan_root, _owning_roots(store))
+                       if q not in (_prune or ())]
+            if _joined:
+                _left_out = await asyncio.to_thread(
+                    lambda fl=files, j=_joined: [f for f in fl if _inside_any(str(f), j)])
+                if _left_out:
+                    _out = set(_left_out)
+                    files = [f for f in files if f not in _out]
+                    dir_files[scan_root] = files
+                    if _scoped_here:            # (those changed paths: their root's scan)
+                        for f in _left_out:
+                            _o = _innermost_root(str(f).split("::", 1)[0], _joined)
+                            _requeue_scoped.setdefault(_o, set()).add(str(f).split("::", 1)[0])
+                    else:                       # (its folder: its full, light scan)
+                        _requeue_full |= set(_joined)
 
         # HVSC auto-detect: if this root has SID files and no HVSC DOCUMENTS
         # path is configured yet, look for one up the tree and auto-configure
@@ -4723,7 +5119,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                         # a progressive write stores, byte for byte.
                         _pending_tracks.extend(chunk)
                     else:
-                        store.upsert_tracks_batch(chunk)
+                        store.upsert_tracks_batch(_to_owners(chunk))
                     await asyncio.sleep(0)
                 log.debug("Flushed %d tracks in %.2fs", n, time.time() - t0)
             except Exception as exc:
@@ -5059,6 +5455,15 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         else:
             existing_ids = await get_track_ids_for_scan_root(scan_root)
         orphan_ids = existing_ids - expected_ids
+        _skipped_roots = ([*_roots_pruned_below(scan_root, _prune), *_joined]
+                          if orphan_ids else ())
+        if _skipped_roots:
+            # Nested roots: the walk skipped the roots inside this one, so a
+            # track of this root in their folders (a removal begun meanwhile
+            # handed it over, or an older scan's tag) is not known to be gone.
+            orphan_ids = {tid for tid in orphan_ids
+                          if not _inside_any((store._tracks.get(tid) or {}).get("path") or "",
+                                             _skipped_roots)}
         if orphan_ids and _failed_archives:
             # An archive that exists but couldn't be read this time: its
             # indexed members are not deletions (a later readable scan decides).
@@ -5141,6 +5546,9 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     # other tracks during the extract survive, and memory stays consistent with
     # the AOF.  First scan (progressive) path: exit batch mode, rebuilding the
     # live indexes in place with yield points.
+    # (rows of a root being removed or removed meanwhile go to the root
+    #  owning their folder first: only rows no root owns are dropped below)
+    _pending_tracks = _to_owners(_pending_tracks)
     _gone = [r for r in dir_files if _removed_now(r)]
     if _gone:
         from soniqboom.core.data import path_hash as _ph_gone
@@ -5179,8 +5587,11 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
             await asyncio.sleep(0)
         from soniqboom.api.fstree import root_commit as _root_commit
         # Browse clicks during the commit keep the pre-commit rows (no rebuild
-        # from a half-committed store) until the patch below lands.
-        with _root_commit({path_hash(r) for r in dir_files}):
+        # from a half-committed store) until the patch below lands — on every
+        # root the commit touches, the old root of a re-tagged track too.
+        _old_roots = {(o or {}).get("scan_root_hash") for o in _old_versions.values()} - {None, ""}
+        _old_roots |= {t.get("scan_root_hash") for t in _material} - {None, ""}
+        with _root_commit({path_hash(r) for r in dir_files} | _old_roots):
             if _material or _pending_deleted:
                 _changed = True
                 _dup_delta = _old_versions
@@ -5322,6 +5733,18 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
             await on_progress(_progress)
         from soniqboom.api.library import invalidate_agg_cache
         invalidate_agg_cache()
+
+    # Nested roots: what this scan left to another root (a removal begun or
+    # undone while it ran) — that root's scan, queued (it runs after this).
+    for _r in _requeue_full:
+        _requeue_scoped.pop(_r, None)               # (its full scan covers those paths)
+    try:
+        if _requeue_full:
+            await start_scan(sorted(_requeue_full), rescan_if_running=True, light=True)
+        if _requeue_scoped:
+            await start_scan([], scope={r: sorted(v) for r, v in _requeue_scoped.items()})
+    except Exception:                                   # noqa: BLE001 — never fails the scan
+        log.warning("Queueing the nested roots' own scans failed", exc_info=True)
 
     _scan_count = max(0, _scan_count - 1)
     if _scan_count == 0:
@@ -5826,6 +6249,11 @@ def schedule_startup_enrichment() -> None:
                 await repair.repair_multi_values_once()
             except Exception:                       # noqa: BLE001
                 log.exception("multi-value tag repair failed")
+            try:
+                # Network-share bitrates a scan's front window set (FLAC …).
+                await repair.repair_window_bitrates_once()
+            except Exception:                       # noqa: BLE001
+                log.exception("network-share bitrate repair failed")
             genre_derive.install()
             genre_derive.schedule()
         t = asyncio.get_running_loop().create_task(_genres(), name="derived-genres-startup")
@@ -6156,26 +6584,42 @@ async def _drain_scan_queue() -> None:
 def forget_root(path: str) -> None:
     """A scan root was removed: drop it from every queued scan, so a scan
     queued before the removal doesn't re-register and re-index it — and
-    what its scans gave up (``_GiveUps``).  No realpath (a stalled mount
-    would block the caller): ``path`` is the folder list's resolved spelling."""
+    what its scans gave up (``_GiveUps``).  Nested roots: what was queued for
+    it in the folder of a root still owning it (a root above it, or one
+    inside it) goes to that root — its changed paths, or for a full scan its
+    whole folder — since its watch's changes were routed to it alone.  No
+    realpath (a stalled mount would block the caller): ``path`` is the
+    folder list's resolved spelling."""
     norm = os.path.normpath(os.path.abspath(path))
     try:
         store = get_store()
         for p in {path, norm}:
             if _GIVEUP_KEY + path_hash(p) in store._config:
                 store.delete_config(_GIVEUP_KEY + path_hash(p))
+        own = _owning_roots(store) - {path, norm}
     except Exception:                                       # noqa: BLE001
         log.debug("could not drop the give-up records of %s", path, exc_info=True)
+        own = frozenset()
+    moved: dict[str, set[str]] = {}
     for i in range(len(_scan_queue) - 1, -1, -1):
         dirs, cb, scope, light = _scan_queue[i]
         if norm not in dirs:
             continue
+        for q in ([norm] if scope is None else scope.get(norm, ())):
+            o = _innermost_root(q, own) if own else None
+            if o is not None:
+                moved.setdefault(o, set()).add(q)
         rest = frozenset(dirs - {norm})
         if not rest:
             del _scan_queue[i]
         else:
             _scan_queue[i] = (rest, cb, None if scope is None
                               else {r: v for r, v in scope.items() if r != norm}, light)
+    for o, qs in moved.items():
+        # (a scoped scan of the owner over those paths: its tracks there were
+        #  handed over by the removal, so only what changed is read)
+        _scan_queue.append((frozenset({o}), None, {o: frozenset(qs)}, False))
+        log.info("Scan: %d queued path(s) of removed %s go to %s", len(qs), norm, o)
 
 
 def full_scan_active() -> bool:
@@ -6242,6 +6686,32 @@ async def start_scan(
         return _scan_task
     _res = await _resolve_all([*directories, *(scope or ())])
     norm_dirs = frozenset(_res[d] for d in directories)
+    # Nested roots: a file belongs to the innermost registered root holding it
+    # (each root's walk skips the roots inside it; a root being removed owns
+    # none), so a full scan of a root also scans the roots inside it, and a
+    # changed path goes to its owner's scoped scan — not to an outer root's as
+    # well, nor to a root being removed.  (The roots as registered — resolved
+    # when added: no realpath of every root.)
+    _nested = len(_local_root_keys(get_store())) > 1
+    _owning = _owning_roots(get_store()) if _nested else frozenset()
+    if _nested and not scope:
+        # (a root being removed inside an owning root owns nothing: its folder
+        #  goes to that root's scoped scan — its tracks there were handed
+        #  over, so only what changed is read)
+        _locals0 = set(_local_root_keys(get_store()))
+        _theirs = {d: _innermost_root(d, _owning) for d in norm_dirs
+                   if d in _locals0 and d not in _owning}
+        _theirs = {d: o for d, o in _theirs.items() if o is not None}
+        if _theirs:
+            _sc: dict[str, list[str]] = {}
+            for d, o in _theirs.items():
+                _sc.setdefault(o, []).append(d)
+            await start_scan([], scope=_sc)
+        norm_dirs = frozenset(d for d in norm_dirs if d not in _theirs)
+        norm_dirs = norm_dirs | {q for q in _owning
+                                 if any(_strictly_below(q, d) for d in norm_dirs)}
+        if not norm_dirs:
+            return _scan_task
 
     if scope:
         # Changed paths are normalized LEXICALLY (never ``resolve()``d): a
@@ -6254,10 +6724,31 @@ async def start_scan(
             pre = nr.rstrip(os.sep) + os.sep
             keep = frozenset(q for q in (os.path.normpath(os.path.abspath(x)) for x in paths)
                              if q == nr or q.startswith(pre))
+            if _nested and nr.startswith("/") and not is_remote_path(nr):
+                # (each path to the innermost owning root holding it — this
+                #  one or one inside it; for a root being removed, the root
+                #  owning its folder now.  That root's own folder changed →
+                #  its full scan)
+                cands = ([nr, *(o for o in _owning if _strictly_below(o, nr))]
+                         if nr in _owning else list(_owning))
+                inside = sorted(o for o in cands if o != nr)
+                mine = set()
+                for q in keep:
+                    owner = _innermost_root(q, cands)
+                    if owner == nr or owner is None:
+                        mine.add(q)
+                    elif q == owner:
+                        full_roots.append(owner)
+                    else:
+                        nscope[owner] = nscope.get(owner, frozenset()) | {q}
+                    # (a change at a folder holding roots of their own: their
+                    #  folders are their walks' — each gets a full, light scan)
+                    full_roots.extend(_sorted_roots_inside(q, inside))
+                keep = frozenset(mine)
             if nr in keep:
                 full_roots.append(nr)           # the root itself changed → full scan
             elif keep:
-                nscope[nr] = keep
+                nscope[nr] = nscope.get(nr, frozenset()) | keep
         if full_roots:
             await start_scan(full_roots, on_progress, rescan_if_running=True, light=True)
         if not nscope:
@@ -7746,6 +8237,15 @@ async def _remote_scan_body(
         _hvsc_on = False
     _gave_up: dict[str, str] = {}       # rel → why this scan could not store it
     _fetched_ok = [0]                   # downloads that worked
+    # The share's folder index (``fstree._SCAN_ROOT_FULL_CACHE``: the folder
+    # tree, the recursive listings, a share folder's own listing) is patched
+    # with what each flush and the ghost purge below wrote — as a local scan's
+    # commit patches it — inside a commit window, so listings keep the rows
+    # from before a flush until its patch (``fstree.root_commit``).  Without
+    # it a change that kept the share's track count (a file re-tagged on the
+    # share, or moved: one add, one purge) never reached the index.
+    from soniqboom.api.fstree import root_commit as _root_commit
+    _browse_added = [0]                 # tracks this scan added (for the disk copy, below)
 
     async def _flush():
         nonlocal track_buffer, art_buffer
@@ -7755,39 +8255,61 @@ async def _remote_scan_body(
         # identically) only has its mtime / size refreshed — no re-index, not
         # a library change; a changed one keeps its ``added_at`` and duplicate
         # annotation (``_classify_reextract``, as a local scan's commit).
-        for i in range(0, len(track_buffer), WRITE_CHUNK):
-            touch: list[tuple[str, dict]] = []
-            material: list[dict] = []
-            for td in _track_dicts(track_buffer[i : i + WRITE_CHUNK]):
-                _old, patch = _classify_reextract(store, td)
-                if patch is not None:
-                    touch.append((td["id"], patch))
-                else:
-                    material.append(td)
-            if touch:
-                store.update_track_fields_batch(touch)
-            if material:
-                # A changed file's cached thumbnails were made from its old
-                # cover — dropped before the new full cover below is stored
-                # (they are made again from it when asked for).
-                try:
-                    from soniqboom.core import art_cache as _ac
-                    await _ac.delete_art_batch([td["id"] for td in material])
-                except Exception:                       # noqa: BLE001
-                    log.debug("stale covers not dropped", exc_info=True)
-                await upsert_tracks_batch(material)
-            batch_state["changed"] = batch_state.get("changed", 0) + len(material)
-            batch_state["unchanged"] = batch_state.get("unchanged", 0) + len(touch)
-            changed_ids.update(td["id"] for td in material)
-            if (_hvsc_on and not _hvsc_marked[0]
-                    and any(str(td.get("path") or "").lower().endswith(_SID_DETECT_EXTS)
-                            for td in material)):
-                _hvsc_marked[0] = True
-                try:
-                    store.set_config(_hvsc_key, True)
-                except Exception:                       # noqa: BLE001
-                    log.debug("HVSC join bookkeeping not saved", exc_info=True)
-            await asyncio.sleep(0)
+        _old_versions: dict[str, "dict | None"] = {}
+        _wrote = [False]                # (an upsert of this flush began)
+        with _root_commit({scan_root_hash}):
+            try:
+                for i in range(0, len(track_buffer), WRITE_CHUNK):
+                    touch: list[tuple[str, dict]] = []
+                    material: list[dict] = []
+                    for td in _track_dicts(track_buffer[i : i + WRITE_CHUNK]):
+                        _old, patch = _classify_reextract(store, td)
+                        if patch is not None:
+                            touch.append((td["id"], patch))
+                        else:
+                            material.append(td)
+                            _old_versions.setdefault(td["id"], _old)
+                    if touch:
+                        store.update_track_fields_batch(touch)
+                    if material:
+                        # A changed file's cached thumbnails were made from its old
+                        # cover — dropped before the new full cover below is stored
+                        # (they are made again from it when asked for).
+                        try:
+                            from soniqboom.core import art_cache as _ac
+                            await _ac.delete_art_batch([td["id"] for td in material])
+                        except Exception:                       # noqa: BLE001
+                            log.debug("stale covers not dropped", exc_info=True)
+                        _wrote[0] = True
+                        await upsert_tracks_batch(material)
+                    batch_state["changed"] = batch_state.get("changed", 0) + len(material)
+                    batch_state["unchanged"] = batch_state.get("unchanged", 0) + len(touch)
+                    changed_ids.update(td["id"] for td in material)
+                    if (_hvsc_on and not _hvsc_marked[0]
+                            and any(str(td.get("path") or "").lower().endswith(_SID_DETECT_EXTS)
+                                    for td in material)):
+                        _hvsc_marked[0] = True
+                        try:
+                            store.set_config(_hvsc_key, True)
+                        except Exception:                       # noqa: BLE001
+                            log.debug("HVSC join bookkeeping not saved", exc_info=True)
+                    await asyncio.sleep(0)
+                if _old_versions:
+                    _browse_added[0] += sum(1 for o in _old_versions.values() if o is None)
+                    await _refresh_browse_after_commit(store, _old_versions)
+            except BaseException:
+                # Cut short — a cancel (shutdown, the share removed) or a write
+                # error, during the writes or their patch: what this flush stored
+                # may not be (all) in the share's index.  The index and the
+                # on-disk browse copy (checked by count alone at the next boot)
+                # are both dropped, so the next listing and the next boot read
+                # the store.
+                if _wrote[0]:
+                    from soniqboom.api.fstree import invalidate_scan_root as _drop_index
+                    from soniqboom.core.folder_album import _drop_browse_disk_cache
+                    _drop_index(scan_root_hash)
+                    _drop_browse_disk_cache()
+                raise
         # The full cover of every re-read file that has one is written anew:
         # its thumbnails were made from the old one (a file whose only change
         # is its picture is a "touch" above, not a material change).
@@ -8268,10 +8790,11 @@ async def _remote_scan_body(
                     # A length mutagen measured over the front window only
                     # (CBR MP3, Ogg) becomes the whole file's.
                     await _fix_window_length(meta, remote_path, file_data, listing_size)
-                if (was_partial and meta.format == "ALAC" and listing_size > 0
-                        and (meta.duration or 0) > 0):
-                    # ALAC's bitrate is the file's size over its length
-                    # (``metadata._mp4``) — the index window's size isn't.
+                if (was_partial and listing_size > 0 and (meta.duration or 0) > 0
+                        and size_rate_format(meta.format)):
+                    # These formats' bitrate is the file's size over its length
+                    # (``metadata``: FLAC, ALAC, WMA Lossless, WavPack / APE /
+                    # TTA) — the fetched window's size isn't the file's.
                     meta.bitrate = int(listing_size * 8 / meta.duration)
                 if parent_dir not in hash_map:
                     new_hashes = await store_hash_lookups_batch([parent_dir])
@@ -8437,6 +8960,7 @@ async def _remote_scan_body(
             "Ghost cleanup for %s skipped (partial walk): %d absent path(s) are "
             "unverified (next clean full walk decides)", scan_root, len(ghost_ids),
         )
+    _browse_removed = 0                 # tracks this scan's ghost purge removed
     if ghost_ids and len(entries) > 0 and walk_completed:
         if walk_failed_dirs:
             purge_ids = [tid for rel, tid in ghost_pairs
@@ -8450,7 +8974,20 @@ async def _remote_scan_body(
                 await _carry_renamed_members(purge_ids)
                 await _carry_healed_smb_paths(scan_root, ghost_pairs, set(purge_ids),
                                               seen_rel_paths)
-            removed = await delete_track_ids(purge_ids) if purge_ids else 0
+            # (Their rows as stored: the folder index's patch takes them out.)
+            _gone = {tid: store._tracks.get(tid) for tid in purge_ids}
+            if _browse_added[0] and _browse_added[0] == sum(
+                    1 for t in _gone.values() if t is not None):
+                # (This purge brings the count back to where the on-disk
+                # browse copy has it — a move: drop that copy first, so no
+                # crash between the delete and the check below restores it.)
+                from soniqboom.core.folder_album import _drop_browse_disk_cache
+                _drop_browse_disk_cache()
+            with _root_commit({scan_root_hash}):
+                removed = await delete_track_ids(purge_ids) if purge_ids else 0
+                if purge_ids:
+                    await _refresh_browse_after_commit(store, _gone)
+            _browse_removed = removed
             batch_state["changed"] = batch_state.get("changed", 0) + removed
             if purge_ids:
                 # … and their copies in the remote cache (an archive member's:
@@ -8474,6 +9011,15 @@ async def _remote_scan_body(
             )
         except Exception as exc:
             log.warning("Ghost cleanup for %s failed: %s", scan_root, exc)
+
+    # A scan that added as many tracks as it purged (a move: the add in a
+    # flush, the purge above) leaves the share's count as it was, so the
+    # on-disk browse copy — checked by count alone at the next boot — would
+    # bring the rows from before it back: drop it, as a same-count commit does
+    # (each patch above saw only one half).
+    if _browse_added[0] and _browse_added[0] == _browse_removed:
+        from soniqboom.core.folder_album import _drop_browse_disk_cache
+        _drop_browse_disk_cache()
 
     # The walk's folder listings become the state the next fast walk prunes
     # by — only now that its changes are stored.  A folder whose new or
@@ -8590,8 +9136,17 @@ async def refresh_subtree_under_root(
     attribution to *root*.  New and changed files are extracted and upserted;
     index entries whose files vanished are removed.
 
+    Nested roots: the folder belongs to the innermost registered root holding
+    it (a root being removed owns none), which refreshes it (the client's
+    tree root may be an outer one).  Tags an older scan left there are handed
+    over first (``_release_under``: no file read); the roots inside it are
+    left out of the walk and refreshed in passes of their own, so no track
+    moves to another root.
+
     Safety rails:
-      * subtrees above ``max_files`` are skipped (use Re-Index for those);
+      * subtrees above ``max_files`` are skipped (use Re-Index for those) —
+        with roots inside the folder, its passes share that budget: one that
+        would go over it is skipped (``skipped`` in the result);
       * removals only happen when ``subdir`` still exists as a directory
         (an unmounted share must never mass-orphan its tracks), and are
         capped per pass — a partial walk on a flaky mount can't wipe a
@@ -8603,20 +9158,72 @@ async def refresh_subtree_under_root(
     store = get_store()
     _res = await _resolve_all([subdir, root])
     sub = _res[subdir]
+    # (the roots as registered: resolved when added; a root being removed owns none)
+    _nested = (len(_local_root_keys(store)) > 1 and sub.startswith("/")
+               and not is_remote_path(sub))
+    _owning = _owning_roots(store) if _nested else frozenset()
+    _prune = _owning if _nested else None
+    if _nested:
+        _owner = _innermost_root(sub, _owning)
+        if _owner is not None and _owner != _res[root]:
+            root = _owner
+            _res[root] = _owner
+        try:
+            await _release_under(store, [sub])          # (tags an older scan left)
+        except Exception:                               # noqa: BLE001 — at worst read again
+            log.warning("Handing nested roots' tracks over before refreshing %s failed",
+                        sub, exc_info=True)
+    res = await _refresh_subtree_once(store, loop, root, sub, _res, max_files, _prune)
+    # (the roots inside the folder as they own now — a removal begun or
+    #  undone during the first pass — each in a pass of its own)
+    _inner = _roots_pruned_below(sub, _owning_roots(store)) if _nested else []
+    if _inner:
+        left = max_files - (0 if res.get("skipped") else res.get("checked", 0))
+        for k in sorted(_inner, key=lambda q: (len(q), q)):   # (outermost first, in order)
+            if any(_strictly_below(k, o) for o in _inner if o != k):
+                continue                        # (refreshed with the root it sits in)
+            if res.get("skipped") or left <= 0:
+                res["skipped"] = True           # (over the budget: Re-Index for those)
+                break
+            more = await refresh_subtree_under_root(k, k, left)
+            for f in ("checked", "added", "updated", "removed", "errors", "unchanged"):
+                res[f] = res.get(f, 0) + more.get(f, 0)
+            if more.get("skipped"):
+                res["skipped"] = True
+            else:
+                left -= more.get("checked", 0)
+    return res
 
+
+async def _refresh_subtree_once(store, loop, root: str, sub: str, _res: dict,
+                                max_files: int, _prune) -> dict:
+    """``refresh_subtree_under_root``'s pass over ``sub`` for ``root``, the
+    roots inside ``sub`` left out of the walk (``prune``)."""
+    from soniqboom.config import settings as _settings
     _failed_archives: set[str] = set()
     dir_files, walk_errors = await loop.run_in_executor(
         None, _find_audio_files, [sub], _settings.scan_zips, None, None, _failed_archives,
+        _prune,
     )
     files_strs = [str(p) for fl in dir_files.values() for p in fl]
+    # (nested roots: a root inside ``sub`` whose removal was undone since the
+    #  walk owns its folder again — its files are its own pass's, and its
+    #  tracks not this pass's to prune)
+    _joined = ([q for q in _roots_pruned_below(sub, _owning_roots(store)) if q not in _prune]
+               if _prune is not None else [])
+    if _joined:
+        files_strs = [x for x in files_strs if not _inside_any(x, _joined)]
     _old_versions: dict[str, "dict | None"] = {}
     if len(files_strs) > max_files:
         return {"skipped": True, "checked": len(files_strs),
                 "added": 0, "updated": 0, "removed": 0, "errors": 0}
     found = set(files_strs)
 
-    # Existing index entries under this subtree (scoped to the parent root).
+    # Existing index entries under this subtree (scoped to the parent root) —
+    # not in the folders of the roots inside it, which the walk skipped (a
+    # track of this root there is not known to be gone).
     prefix = sub.rstrip("/") + "/"
+    _skipped_roots = [*_roots_pruned_below(sub, _prune), *_joined]
     existing: dict[str, dict] = {}
     # (from the root's cached sorted browse rows when they are in step — a
     # binary search instead of visiting every track of the root per click)
@@ -8626,7 +9233,8 @@ async def refresh_subtree_under_root(
         t = store._tracks.get(tid)
         if t:
             p_str = t.get("path") or ""
-            if p_str.startswith(prefix):
+            if p_str.startswith(prefix) and not (_skipped_roots
+                                                 and _inside_any(p_str, _skipped_roots)):
                 existing[p_str] = t
 
     mtime_size_map = {
@@ -8727,7 +9335,11 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
                 "checked": n_checked, "errors": errors, "skipped": True}
     stopped = False
     unchanged = 0
-    with _root_commit({path_hash(root)}):
+    # (the old root of a track this pass re-tags too: nested roots — and the
+    #  root owning this one's folder while this one is being removed)
+    _olds = {(store._tracks.get(t.id) or {}).get("scan_root_hash") for t in ready} - {None, ""}
+    _to0 = _owner_tag_now(store, root)
+    with _root_commit({path_hash(root)} | _olds | ({_to0} if _to0 else set())):
         # Small chunks with a loop turn after each: a store upsert doesn't
         # yield, so 200-row chunks blocked the loop ~1.9 s for 5,000 new files
         # (perf round 7).  The removal check runs before every chunk.  A
@@ -8740,7 +9352,13 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
                 break
             touch: list[tuple[str, dict]] = []
             material: list[dict] = []
+            # (a removal of this root begun meanwhile: what it reads is the
+            #  owning root's — not hidden until the removal ends)
+            _to = _owner_tag_now(store, root)
+            _mine = path_hash(root)
             for td in _track_dicts(ready[i : i + _DRILL_WRITE_CHUNK]):
+                if _to is not None and td.get("scan_root_hash") == _mine:
+                    td = {**td, "scan_root_hash": _to}
                 _prev, patch = _classify_reextract(store, td)
                 if patch is not None:
                     touch.append((td["id"], patch))
