@@ -12,6 +12,7 @@ import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, XMP_FORMAT_NAMES, ZX_FORMAT_NA
 // Remove the feature by deleting this import + the one branch it guards below.
 import { sidWasmPlaybackEnabled, isC64SidTrack, renderSidForPlayback,
          sidWasmSupported, sidRenderStatus } from './sid-wasm-player.js';
+import { multiSidTrack } from './vu/vumr.js';
 
 export const Player = (() => {
   const audio = document.getElementById('audio-el');
@@ -2342,7 +2343,9 @@ export const Player = (() => {
     // app.js 'sidwarm' handler.  (VU for warm-hits / incapable browsers comes
     // from the server .vu sidecar via _handleVU's poll — see app.js.)
     const _sidWasmActive = false;   // SID always plays the server stream below
-    if (sidWasmPlaybackEnabled() && isC64SidTrack(track) && sidWasmSupported()) {
+    // (not a 2SID / 3SID tune: the WASM core renders one SID chip — its meter
+    // would show 3 of 6 / 9 voices, and its warm is refused)
+    if (sidWasmPlaybackEnabled() && isC64SidTrack(track) && !multiSidTrack(track) && sidWasmSupported()) {
       _dropNextPreload();
       const _bgId = track.id, _bgSub = _curSub;
       const _bgLens = Array.isArray(track.hvsc_lengths) ? track.hvsc_lengths : null;   // in tune order

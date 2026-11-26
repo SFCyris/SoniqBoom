@@ -50,8 +50,9 @@ import { MobileRadio } from '../radio-player.js';
 import { Auth } from '../../auth.js';
 import { setVizSettings } from '../../viz/engine.js';
 import { createVumrFetcher, parseVUMR, vuEligible, vuKeyOf, vuLabelStep, vumrLevelsAt, serverPassTrack,
-         fftColumnLevels, vuFallbackText, FFT_FALLBACK_BARS, SID_VU_RETRY_MS,
-         AMIGA_VU_RETRY_MS, AMIGA_VU_SETTLE_S, AMIGA_VU_SETTLE_POLL_MS,
+         fftColumnLevels, vuFallbackText, FFT_FALLBACK_BARS,
+         AMIGA_VU_SETTLE_S, AMIGA_VU_SETTLE_POLL_MS,
+         vuExpectedVoices, vuRetryLadder, vuRetryDelay,
          AMIGA_VU_SETTLE_MAX_WAITS } from '../../vu/vumr.js';
 import { ASPECT as NEEDLE_ASPECT, READ_MS, createNeedleState, readNeedleLevels, stepNeedles,
          drawNeedleFace, drawNeedle, needleAngle } from '../../vu/needles.js';
@@ -170,7 +171,7 @@ export function mountNpVisuals({ root, np, ctx }) {
     const amiga = serverPassTrack(t);                   // (Amiga, libgme, AdLib: the server's pass)
     _buildLeds(FFT_FALLBACK_BARS, false);
     vuNote = ''; _paintNote();
-    const r = await vuFetch.fetch(t.id, t.subsong, { start: !amiga });
+    const r = await vuFetch.fetch(t.id, t.subsong, { start: !amiga, voices: vuExpectedVoices(t) });
     if (key !== vuKey || key !== vuKeyOf(Player.currentTrack)) return;
     if (r && !r.unavailable) { _useVumr(r); return; }
     vuPhase = 'done';
@@ -179,11 +180,12 @@ export function mountNpVisuals({ root, np, ctx }) {
     vuNote = willPoll ? 'Spectrum — per-voice meters loading…'
                       : vuFallbackText(primary, unavailable ? r.reason : '', Auth.isAdmin);
     _paintNote();
-    if (willPoll) { pollKey = key; vuPhase = 'poll'; _poll(t, key, amiga ? AMIGA_VU_RETRY_MS : SID_VU_RETRY_MS, amiga, 0, 0); }
+    if (willPoll) { pollKey = key; vuPhase = 'poll'; _poll(t, key, vuRetryLadder(t, amiga), amiga, 0, 0); }
   }
 
   function _poll(t, key, ladder, amiga, attempt, waits) {
-    if (attempt >= ladder.length) {
+    const wait = vuRetryDelay(t, ladder, attempt);       // (null: the ladder is done)
+    if (wait === null) {
       if (pollKey === key) { pollKey = ''; vuPhase = 'done'; vuNote = vuFallbackText(String(t.format || '').split('/')[0].trim() || 'this format', '', Auth.isAdmin); _paintNote(); }
       return;
     }
@@ -199,7 +201,7 @@ export function mountNpVisuals({ root, np, ctx }) {
         else { pollKey = ''; vuPhase = 'done'; }
         return;
       }
-      const r = await vuFetch.fetch(t.id, t.subsong);
+      const r = await vuFetch.fetch(t.id, t.subsong, { voices: vuExpectedVoices(t) });
       if (pollKey !== key) return;
       if (r && r.unavailable) {
         pollKey = ''; vuPhase = 'done';
@@ -209,7 +211,7 @@ export function mountNpVisuals({ root, np, ctx }) {
       }
       if (r) { pollKey = ''; _useVumr(r); return; }
       _poll(t, key, ladder, amiga, attempt + 1, 0);
-    }, waits > 0 ? AMIGA_VU_SETTLE_POLL_MS : ladder[attempt]);
+    }, waits > 0 ? AMIGA_VU_SETTLE_POLL_MS : wait);
   }
 
   function _useVumr(r) {

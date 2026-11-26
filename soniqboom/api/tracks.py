@@ -2146,10 +2146,25 @@ async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, 
     subsong = _stream.tune_index(
         track_id, track,
         _stream.explicit_wire(subsong if isinstance(subsong, int) else None, request))
+    # A C64 SID: its meter has 3 voices per SID chip — a sidecar with another
+    # count is another render's (the mono one a 2SID / 3SID tune had before
+    # 2.3.0) or a one-chip pass, never this tune's meter.
+    _sid_voices = 3 * _stream.sid_chips(track) if _is_sid_format(track) else 0
     sidecar = get_vu_sidecar_path(
         track_id, subsong,
         uade_variant=_stream.uade_cache_variant(
-            subsong, _stream._uade_base_known(track_id, track) or 0))
+            subsong, _stream._uade_base_known(track_id, track) or 0),
+        sid_voices=_sid_voices)
+    if sidecar is None and _sid_voices:
+        # A SID whose pass ran without a result (or too long a tune): none is
+        # coming — say so, the player stops asking.
+        _sid_reason = _stream.sid_vu_unavailable_reason(track_id, subsong)
+        if _sid_reason is not None:
+            return _no_content({"X-VU-Unavailable": _sid_reason})
+        if start is not False:
+            # (the play started the pass; this covers one a wrong sidecar
+            # blocked until it was just put aside — dedup'd while one runs)
+            _stream.request_sid_vu(track, track_id, subsong)
     if sidecar is None:
         # Amiga (uade) meters come from a second full uade pass, started
         # only here — i.e. only when the web now-playing meter asks for the

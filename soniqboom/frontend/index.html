@@ -1383,6 +1383,8 @@
               <button id="btn-save-render-options">Save</button>
             </div>
             <div id="admin-render-options-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
           <!-- MIDI synths (FluidSynth / midirender) -->
           <div class="admin-section admin-midi-synths">
             <h3>&#127929; MIDI synths</h3>
@@ -3216,8 +3218,8 @@
           <div class="sc-row"><kbd>← / →</kbd><span>Previous / next track in Track Info</span></div>
           <div class="sc-row"><kbd>V</kbd><span>Toggle visualizer mode</span></div>
           <div class="sc-row"><kbd>N</kbd><span>Show / hide the now-playing cover</span></div>
-          <div class="sc-row"><kbd>1–6</kbd><span>Library views (All, Artists, …)</span></div>
-          <div class="sc-row"><kbd>⌥ 1–6</kbd><span>Smart views (History, Most Played, …)</span></div>
+          <div class="sc-row"><kbd>1–6</kbd><span>All Tracks, Artists, Album Artists, Albums, Genres, Years</span></div>
+          <div class="sc-row"><kbd>⌥ 1–6</kbd><span>History, Most Played, Recently Added, Top Rated, Unplayed, Duplicates</span></div>
         </div>
         <div class="shortcuts-col">
           <h4>Library</h4>
@@ -3238,7 +3240,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=198"></script>
+  <script type="module" src="/assets/js/app.js?v=199"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

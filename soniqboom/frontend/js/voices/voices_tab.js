@@ -40,7 +40,7 @@ export function voicesKind(track) {
 const _FAMILY_NOTE = {
   gme: 'Console chip (libgme): Mute and Solo play the tune again with those voices switched off inside the emulation.',
   adlib: 'AdLib / OPL (AdPlug, Nuked OPL3): Mute and Solo play the tune again without those FM channels in the mix.',
-  sid: 'C64 SID (sidplayfp): Mute and Solo play the tune again with those voices switched off; the SID’s filter and mixer act on the voices left. sidplayfp starts each render after a random power-on delay, so the muted render can sit a fraction of a millisecond or more from the saved one. On a tune for two or three SID chips the keys act on the first chip’s voices.',
+  sid: 'C64 SID (sidplayfp): Mute and Solo play the tune again with those voices switched off; the SID’s filter and mixer act on the voices left. sidplayfp starts each render after a random power-on delay, so the muted render can sit a fraction of a millisecond or more from the saved one. A tune for two or three SID chips has three voices per chip.',
 };
 
 export function mountVoicesTab({ overlay, tabBtn, pane, tabInfo }) {

@@ -33,6 +33,7 @@ const SCOPE_CHUNK_S = 1;
 const RETRY_MS = 300;
 const RAMP_S = 0.005;                // gate / render swaps ramp over this
 const SCOPE_BACKOFF_MS = 4000;       // after a failed scope fetch
+const SCOPE_PARTIAL_MS = 500;        // a chunk not every voice had reached: asked again
 
 export function allMask(n) { return n >= 32 ? 0xFFFFFFFF : ((1 << n) >>> 0) - 1; }
 
@@ -234,7 +235,13 @@ export function createVoiceMixer({ player, fetchImpl = (...a) => fetch(...a) }) 
     const sr = info.scope_rate || 22050;
     const size = SCOPE_CHUNK_S * sr;
     const cur = Math.floor(tuneTime() * sr / size) * size;
-    const want = [cur, cur + size].filter(k => !scopeChunks.has(k));
+    // (a chunk some voice's render hadn't reached — X-Voices-Partial — is
+    // asked again, at most every SCOPE_PARTIAL_MS, until every voice is in it)
+    const now = performance.now();
+    const want = [cur, cur + size].filter((k) => {
+      const c = scopeChunks.get(k);
+      return !c || (c.partial && now - c.at >= SCOPE_PARTIAL_MS);
+    });
     // Forget chunks behind the playhead.
     for (const k of scopeChunks.keys()) if (k < cur - size) scopeChunks.delete(k);
     if (!want.length) return;
@@ -257,7 +264,8 @@ export function createVoiceMixer({ player, fetchImpl = (...a) => fetch(...a) }) 
           for (let i = 0, o = v * frames * 2; i < frames; i++, o += 2) a[i] = dv.getInt16(o, true) / 32768;
           voices.push(a);
         }
-        scopeChunks.set(k, { frames, voices });
+        scopeChunks.set(k, { frames, voices, partial: res.headers.get('X-Voices-Partial') === '1',
+                             at: performance.now() });
       } else if (res.status !== 202) {
         scopeWait = performance.now() + SCOPE_BACKOFF_MS;
       }

@@ -508,21 +508,45 @@ class _Job:
         self.error: "str | None" = None
         self.last = time.monotonic()
         self.task: "asyncio.Future | None" = None
+        self.pins = 0                 # users reading its files (never swept meanwhile)
+        self.dur: "int | None" = None  # a SID job: the length it renders (s)
 
     def frames_ready(self) -> int:
+        """Frames every voice can be read to.  A mix: its render's.  A scope
+        made by renders of their own (a SID's, one per voice): the furthest
+        any has got — a voice whose render hasn't reached a frame, or hasn't
+        started (they wait for background render slots one after another: 9
+        of them for a 3SID tune), reads silent there (``read``), so the voices
+        already rendering show without waiting for the last one to start."""
         if not self.measure:
             return self.ready
-        if any(f is None for f in self.files):
+        started = [f for f in self.files if f is not None]
+        if not started or (self.kind != "scope" and len(started) < len(self.files)):
             return 0                    # (a render not started yet)
         n = None
-        for path, off, fb, dec in self.files:
+        for path, off, fb, dec in started:
             try:
                 k = max(0, (path.stat().st_size - off) // fb) // dec
             except OSError:
                 k = 0
-            n = k if n is None else min(n, k)
+            n = k if n is None else (max(n, k) if self.kind == "scope" else min(n, k))
         n = n or 0
         return n if self.total is None else min(n, self.total)
+
+    def covered(self, end: int) -> bool:
+        """Has every voice been rendered up to frame ``end`` (a scope made by
+        renders of their own — ``frames_ready`` goes by the furthest one)?"""
+        if not self.measure or self.kind != "scope":
+            return True
+        if not self.files or any(f is None for f in self.files):
+            return False
+        for path, off, fb, dec in self.files:
+            try:
+                if max(0, (path.stat().st_size - off) // fb) // dec < end:
+                    return False
+            except OSError:
+                return False
+        return True
 
     def read(self, start: int, count: int) -> bytes:
         """Frames [start, start + count): a mix interleaved, a scope one
@@ -562,12 +586,11 @@ def _render_dir() -> str:
 def _sweep_jobs() -> None:
     now = time.monotonic()
     for k, job in list(_JOBS.items()):
-        if now - job.last > _JOB_IDLE_S:
+        if now - job.last > _JOB_IDLE_S and not job.pins:
             _JOBS.pop(k, None)
             job.close()
-    while len(_JOBS) > _JOBS_MAX:
-        _, job = _JOBS.popitem(last=False)
-        job.close()
+    for k in [k for k, j in _JOBS.items() if not j.pins][:max(0, len(_JOBS) - _JOBS_MAX)]:
+        _JOBS.pop(k).close()
 
 
 _SWEEPER: "asyncio.Future | None" = None
@@ -639,7 +662,8 @@ def _sid_voice_names(track) -> "list[str]":
 
 
 def _sid_voice_cmds(binary: str, sid_path, track, subsong: int, dur: int, start: int,
-                    kind: str, mask: int, outs: "list[str]") -> "list[list[str]]":
+                    kind: str, mask: int, outs: "list[str]",
+                    light: bool = False) -> "list[list[str]]":
     """The sidplayfp commands of a SID voice job (``outs``: one WAV each).
 
     A mix (``kind == "mix"``) is ONE render with the voices not in ``mask``
@@ -647,7 +671,9 @@ def _sid_voice_cmds(binary: str, sid_path, track, subsong: int, dur: int, start:
     (``stream._sid_render_cmd``): a 2SID / 3SID tune in stereo
     (``sid_stereo``) and the SID fade (``-fob``), so with every voice on it
     equals it.  A scope is one mono pass per voice, the others muted
-    (``sid_vu.voice_mutes``)."""
+    (``sid_vu.voice_mutes``) — with ``light``, on sidplayfp's sidlite
+    engine (``stream.sidlite_ok``): a scope (and the per-voice meter built
+    from the same passes) is only seen; the mix is heard and stays on reSIDfp."""
     from soniqboom.api import stream as _s
     from soniqboom.core import sid_vu
     chips = _s.sid_chips(track)
@@ -656,7 +682,8 @@ def _sid_voice_cmds(binary: str, sid_path, track, subsong: int, dur: int, start:
         mute = tuple(v + 1 for v in range(n) if not mask & (1 << v))
         return [_s._sid_render_cmd(binary, sid_path, subsong, dur, outs[0], mute=mute,
                                    start=start, stereo=_s.sid_stereo(track), isolate=False)]
-    return [_s._sid_render_cmd(binary, sid_path, subsong, dur, o, mute=m, start=start)
+    return [_s._sid_render_cmd(binary, sid_path, subsong, dur, o, mute=m, start=start,
+                               light=light)
             for o, m in zip(outs, sid_vu.voice_mutes(chips))]
 
 
@@ -763,8 +790,10 @@ async def _start_job(track, track_id: str, subsong: int, kind: str, mask: int,
                    2 if kind == "mix" else 0)
         job.task = asyncio.ensure_future(_adlib_job(job, src, int(subsong), int(mask), track_id))
     else:
+        # (a scope: one voice per isolation render — 3 per SID chip)
+        from soniqboom.api import stream as _s
         job = _Job(key, kind, MIX_RATE if kind == "mix" else MIX_RATE // 2,
-                   0 if kind == "mix" else 3)
+                   0 if kind == "mix" else 3 * _s.sid_chips(track))
         job.task = asyncio.ensure_future(_sid_job(job, src, track, int(subsong), int(mask)))
     _JOBS[key] = job
     _ensure_sweeper()
@@ -1036,12 +1065,14 @@ async def _sid_job(job: _Job, src: dict, track, subsong: int, mask: int) -> None
         if not binary:
             raise ValueError("no sidplayfp")
         dur = int(src.get("duration") or _s._sid_target_seconds(track, subsong))
+        job.dur = dur
         start = await _s._psid_start_song(src["src"]) if subsong > 0 else 1
         n = 1 if job.kind == "mix" else len(sid_vu.voice_mutes(_s.sid_chips(track)))
         prio = _s.PRIO_NEXT if job.kind == "mix" else _s.PRIO_VU
         outs = [job.work / f"v{i}.wav" for i in range(n)]
+        light = job.kind == "scope" and await asyncio.to_thread(_s.sidlite_ok, binary)
         cmds = _sid_voice_cmds(binary, src["src"], track, subsong, dur, start, job.kind,
-                               mask, [str(o) for o in outs])
+                               mask, [str(o) for o in outs], light=light)
 
         async def one(cmd, out):
             async with _s._bg_render_sem.slot(prio):
@@ -1049,8 +1080,8 @@ async def _sid_job(job: _Job, src: dict, track, subsong: int, mask: int) -> None
                                          require_audio=False)
         tasks = [asyncio.ensure_future(one(c, o)) for c, o in zip(cmds, outs)]
         # Each WAV joins once sidplayfp has written its header — the renders
-        # may wait for background slots one after another; until all three
-        # have started, a scope has no frames (``frames_ready``).
+        # may wait for background slots one after another; a scope shows each
+        # voice once its render has started (``frames_ready``).
         job.files = [None] * len(outs)
         job.measure = True
         job.total = dur * MIX_RATE if job.kind == "mix" else dur * MIX_RATE // 2
@@ -1082,6 +1113,45 @@ async def _sid_job(job: _Job, src: dict, track, subsong: int, mask: int) -> None
                 t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def sid_voice_renders(track, track_id: str, subsong: int, sid_path, dur: int
+                            ) -> "_Job | None":
+    """The voice-isolation renders of a SID tune — one mono WAV per voice, 3
+    per SID chip — finished, for its per-voice meter (``stream._sid_vu_worker``).
+
+    They are the Voices tab's scope renders (the same sidplayfp commands,
+    ``_sid_voice_cmds``), so the tune's scope job is joined when the tab
+    started it, or started here for the tab to find: the meter and the scopes
+    share one set of renders instead of each running all of them.  Returns
+    the job PINNED (``job.pins``: the sweeper leaves its files alone) — the
+    caller reads ``job.files`` and must unpin it; None when the renders failed,
+    the job went away, or a running one renders another length."""
+    key = (track_id, int(subsong), "scope", 0)
+    job = _JOBS.get(key)
+    if job is not None and job.dur is not None and job.dur != int(dur):
+        return None                     # (another length's renders: not this meter's)
+    src = {"family": "sid", "cache_key": "", "src": Path(sid_path), "pin": None,
+           "duration": int(dur)}
+    job = await _start_job(track, track_id, int(subsong), "scope", 0, src)
+    if job.dur is not None and job.dur != int(dur):
+        return None
+    job.pins += 1
+    try:
+        while True:
+            job.last = time.monotonic()
+            # (its length is known once its task has begun: one the tab
+            # started a moment ago may render another — never this meter's)
+            if (job.error or _JOBS.get(key) is not job
+                    or (job.dur is not None and job.dur != int(dur))):
+                job.pins -= 1
+                return None
+            if job.done:
+                return job
+            await asyncio.sleep(0.5)
+    except BaseException:
+        job.pins -= 1
+        raise
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
@@ -1168,4 +1238,7 @@ async def get_voice_pcm(track_id: str,
     n = min(count, ready - start)
     data = await asyncio.to_thread(job.read, start, n)
     hdr.update({"X-Voices-Start": str(start), "X-Voices-Frames": str(n)})
+    if not job.done and not await asyncio.to_thread(job.covered, start + n):
+        # (some voice reads silent here — its render hasn't reached it: ask again)
+        hdr["X-Voices-Partial"] = "1"
     return Response(content=data, media_type="application/octet-stream", headers=hdr)

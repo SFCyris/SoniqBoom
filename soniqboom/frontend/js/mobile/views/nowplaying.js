@@ -13,6 +13,7 @@ import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
 import { fmtDur, freshArt, reaskArt } from './_common.js';
 import { healthBadge } from '../../health.js';
 import { mountNpVisuals } from './np_visuals.js';
+import { vuExpectedVoices } from '../../vu/vumr.js';
 import { attachSeekGesture } from '../seek_gesture.js';
 
 export function mountNowPlaying(root, ctx) {
@@ -128,7 +129,8 @@ export function mountNowPlaying(root, ctx) {
   let visuals = null;
 
   // The VFD's source annunciator: the format (a tracker's voice count after
-  // it), LIVE for a station; empty with nothing loaded.
+  // it — a SID's 3 per chip, as the meter shows them), LIVE for a station;
+  // empty with nothing loaded.
   function paintSource(t) {
     let txt = '';
     if (MobileRadio.active) txt = _onAir() ? 'LIVE' : '';
@@ -137,7 +139,8 @@ export function mountNowPlaying(root, ctx) {
       const f = String(t.format || '').split('/')[0].trim().toUpperCase();
       const ext = (String(t.path || '').split('::').pop().match(/\.([a-z0-9]{1,5})$/i) || [])[1] || '';
       txt = f.length <= 8 ? f : (ext ? ext.toUpperCase() : f.split(/\s+/)[0].slice(0, 8));
-      const ch = Number(t.channels) || 0;
+      // (a SID's channels are its chips — known once the scan has read them)
+      const ch = Number(t.channels) > 0 ? (vuExpectedVoices(t) || Number(t.channels)) : 0;
       if (txt && ch > 2 && ch <= 64) txt += ` ${ch}CH`;
     }
     if (annSrc.textContent !== txt) annSrc.textContent = txt;

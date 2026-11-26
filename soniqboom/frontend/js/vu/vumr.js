@@ -37,6 +37,45 @@ export const FFT_FALLBACK_BARS = 32;
 // (cumulative ~3/8/16/28/44/66/96/141/201/261 s — the pass is serialised on the
 // server, so a few queued tunes can push it minutes out).  See app.js.
 export const SID_VU_RETRY_MS = [3000, 5000, 8000, 12000, 16000, 22000, 30000, 45000, 60000, 60000];
+// A tune for two or three SID chips: the server's pass (3 isolation renders per
+// chip, 6 or 9, started at once on the play — the browser's WASM core renders
+// one chip) lands some 30–60 s in on a desktop, minutes on a small box: every
+// 3 s for half a minute, then every 5, 10 and 15 s (~4.5 min in all).
+export const MULTI_SID_VU_RETRY_MS = [
+  ...Array(10).fill(3000), ...Array(12).fill(5000), ...Array(12).fill(10000), ...Array(4).fill(15000)];
+
+/** SID chips of a C64 SID ``track`` (1–3: the chip count the scan stored as its
+ *  ``channels``, from the PSID header); 0 for any other track. */
+export function sidChips(track) {
+  const p = String(track?.format || '').split('/')[0].trim().toUpperCase();
+  if (p !== 'SID' && p !== 'PSID' && p !== 'RSID') return 0;
+  return Math.max(1, Math.min(3, Math.floor(Number(track.channels) || 1)));
+}
+
+/** A 2SID / 3SID tune: its per-voice meter (6 / 9 voices) comes from the
+ *  server's pass alone — the browser's WASM core renders the first chip only. */
+export function multiSidTrack(track) { return sidChips(track) >= 2; }
+
+/** The voices a track's per-voice meter has, when known before it is read: a
+ *  SID tune's 3 per chip; 0 for the rest.  (``createVumrFetcher`` turns away a
+ *  sidecar with another count — another render's.) */
+export function vuExpectedVoices(track) { const c = sidChips(track); return c ? 3 * c : 0; }
+
+/** The re-ask schedule of a track whose meter comes from the server's pass. */
+export function vuRetryLadder(track, serverPass) {
+  if (serverPass) return AMIGA_VU_RETRY_MS;
+  return multiSidTrack(track) ? MULTI_SID_VU_RETRY_MS : SID_VU_RETRY_MS;
+}
+
+/** The wait before ask ``attempt`` on ``ladder``, or null when it is done.  A
+ *  2SID / 3SID tune keeps asking at the last rung (15 s) for as long as it
+ *  plays: its meter comes from the server's pass alone, which on a small box
+ *  (one background render slot, 9 renders one after another) can take longer
+ *  than any ladder — the server answers "unavailable" when none is coming. */
+export function vuRetryDelay(track, ladder, attempt) {
+  if (attempt < ladder.length) return ladder[attempt];
+  return multiSidTrack(track) ? ladder[ladder.length - 1] : null;
+}
 // Amiga modules: the sidecar lands some 5–12 s after the first ask.  Ask every
 // 3 s through that window, then back off — never beyond 15 s: the server drops
 // a queued pass that has not been polled for ``_UADE_VU_POLL_FRESH_S`` (20 s,
@@ -164,13 +203,14 @@ export function shortVoiceName(name) {
  *  not yet / try later (a plain 204, an error, an abort).  ``subsong``: the
  *  playing tune's wire number (a plain play of the file — none — is its default
  *  tune).  ``start: false`` answers from the cache only: a miss must not start
- *  the Amiga per-voice pass (a second full uade render). */
+ *  the Amiga per-voice pass (a second full uade render).  ``voices`` (> 0): the
+ *  voice count the meter must have at least (``vuExpectedVoices``) — fewer is null. */
 export function createVumrFetcher() {
   let ctl = null;
   function abort() {
     if (ctl) { try { ctl.abort(); } catch (_) {} ctl = null; }
   }
-  async function fetchVu(trackId, subsong, { start = true } = {}) {
+  async function fetchVu(trackId, subsong, { start = true, voices = 0 } = {}) {
     if (!trackId) return null;
     abort();
     const mine = (typeof AbortController === 'function') ? new AbortController() : null;
@@ -179,6 +219,9 @@ export function createVumrFetcher() {
       const qs = new URLSearchParams();
       if (Number.isInteger(subsong)) qs.set('subsong', String(subsong));
       if (!start) qs.set('start', '0');
+      // A 2SID / 3SID meter (``vuExpectedVoices``): its own URL — the answer is
+      // cached for good, and before 2.3.1 this URL could hold a 3-voice one.
+      if (voices > 3) qs.set('voices', String(voices));
       const q = qs.toString();
       const res = await fetch(`/api/tracks/${encodeURIComponent(trackId)}/vu${q ? `?${q}` : ''}`,
                               mine ? { credentials: 'include', signal: mine.signal }
@@ -187,7 +230,12 @@ export function createVumrFetcher() {
         const reason = res.headers.get('X-VU-Unavailable');
         return reason ? { unavailable: true, reason: reason.trim().toLowerCase() } : null;
       }
-      return parseVUMR(await res.arrayBuffer());
+      const parsed = parseVUMR(await res.arrayBuffer());
+      // (``voices``: fewer is another render's meter — "not yet".  More is
+      // the server's word for this tune: it checks the count itself, and a
+      // row not yet carrying the tune's chips (an online collection's tune
+      // before its first play is read) under-counts.)
+      return parsed && voices > 0 && parsed.channels < voices ? null : parsed;
     } catch (_) {
       return null;                                  // aborted or failed: "not yet"
     } finally {

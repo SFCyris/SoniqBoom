@@ -2816,9 +2816,46 @@ def _sid_channels(stereo: bool) -> int:
     return 2 if stereo else _SID_WAV_CHANNELS
 
 
+_SIDLITE_OK: "dict[str, bool]" = {}
+
+
+def sidlite_ok(binary: str) -> bool:
+    """Does ``binary`` (sidplayfp) render with its light sidlite engine — for
+    the voice-isolation passes that are only seen (``_sid_render_cmd``
+    ``light``)?  A one-second render of a made one-voice tune, once per
+    binary (cached): a build without sidlite (an older sidplayfp, a Debian
+    package) answers False, and those passes stay on reSIDfp.  Blocking."""
+    if binary in _SIDLITE_OK:
+        return _SIDLITE_OK[binary]
+    import struct
+    ok = False
+    work = Path(tempfile.mkdtemp(prefix="sidlite-", dir=_rtmp()))
+    try:
+        code = bytes([0xA9, 0x0F, 0x8D, 0x18, 0xD4, 0xA9, 0x1D, 0x8D, 0x01, 0xD4,
+                      0xA9, 0xF0, 0x8D, 0x06, 0xD4, 0xA9, 0x11, 0x8D, 0x04, 0xD4, 0x60, 0x60])
+        h = bytearray(0x7C)
+        h[0:4] = b"PSID"
+        struct.pack_into(">HHHHHHHI", h, 4, 2, 0x7C, 0, 0x1000, 0x1000 + len(code) - 1, 1, 1, 0)
+        sid = work / "probe.sid"
+        sid.write_bytes(bytes(h) + struct.pack("<H", 0x1000) + code)
+        out = work / "probe.wav"
+        r = forksafe.run([binary, "--sidlite", "-t1", f"-f{_SID_WAV_RATE}", "-m",
+                          f"-w{out}", str(sid)], capture_output=True, timeout=15)
+        ok = r.returncode == 0 and _render_has_audio(out) and out.stat().st_size > 44 + 4410
+    except Exception:                                   # noqa: BLE001
+        ok = False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    _SIDLITE_OK[binary] = ok
+    log.info("sidplayfp %s: the per-voice passes use %s", binary,
+             "sidlite" if ok else "reSIDfp (no sidlite)")
+    return ok
+
+
 def _sid_render_cmd(binary: str, path: Path, subsong: int, dur: int, out_wav: str,
                     mute: "tuple[int, ...]" = (), start: int = 1,
-                    stereo: bool = False, isolate: "bool | None" = None) -> list[str]:
+                    stereo: bool = False, isolate: "bool | None" = None,
+                    light: bool = False) -> list[str]:
     """Build the sidplayfp argv shared by the blocking and progressive renders,
     so the two paths never drift on chip-model / filter / digiboost flags.
 
@@ -2835,11 +2872,22 @@ def _sid_render_cmd(binary: str, path: Path, subsong: int, dur: int, out_wav: st
     channels (``stereo``) and fade with voices muted (the mixer's mix, so an
     all-voices-on mix is the reference render's command).
 
+    ``light`` (an isolation pass only — ``sidlite_ok``): sidplayfp's light
+    sidlite engine instead of reSIDfp.  Those passes are only ever SEEN — the
+    per-voice meter and the Voices tab's scopes — never heard, and sidlite
+    renders them ~11x faster, so a 2SID / 3SID tune's 6 / 9 passes take
+    seconds; everything heard (playback, the mixer's Mute / Solo mix) stays on
+    reSIDfp.
+
     SID chip-model / filter overrides (settings; defaults = no flags, i.e.
     sidplayfp honours the tune's own PSID header).  Flags verified against
     sidplayfp --help: -m<o|n>[f], -nf, --fcurve=<num>, --digiboost, -u<n> mute
     voice; no space between a short flag and its value."""
+    if isolate is None:
+        isolate = bool(mute)
     cmd = [binary]
+    if light and isolate:
+        cmd.append("--sidlite")
     if subsong > 0:
         cmd.append(f"-o{sid_wire_tune(subsong, start)}")
     for _v in mute:
@@ -2866,8 +2914,6 @@ def _sid_render_cmd(binary: str, path: Path, subsong: int, dur: int, out_wav: st
     # stream's header can say it) is forced to stereo, every other tune to
     # mono (``_SID_WAV_CHANNELS``) — a per-voice isolation pass (``isolate``)
     # always mono.
-    if isolate is None:
-        isolate = bool(mute)
     cmd.append("-s" if stereo and not isolate else "-m")
     # A fade over the end of the length (``render_options.sid_fade_s``):
     # sidplayfp's "-fob", within the length — HVSC's length stays the length.
@@ -2982,6 +3028,7 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
     from soniqboom.core import sid_vu, openmpt_vu
     binary = _find_renderer(settings.sidplayfp_path, "sidplayfp")
     tmps: list[Path] = []
+    no_result = False                   # (the pass ran and wrote nothing: say so — _SID_VU_NO_RESULT)
     try:
         if not binary:
             return
@@ -2990,24 +3037,44 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
             # while we queued.
             if cached_wav.with_suffix(".vu").exists():
                 return
-            # Run the 3 voice-isolation renders concurrently when the background
-            # gate has the slots (total gen time ~one render, not three — a 6-min
-            # tune drops from ~68 s to ~23 s); each takes a PRIO_VU background
-            # slot, so they never hold the slot playback needs (GitHub #32).
-            voice_wavs: list[Path] = []
-            render_coros = []
-            start = await _psid_start_song(sid_path) if subsong > 0 else 1
-            for mute in sid_vu.voice_mutes(chips):
-                tf = tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=".wav", prefix="sidvu-", delete=False)
-                tf.close()
-                tp = Path(tf.name)
-                tmps.append(tp)
-                cmd = _sid_render_cmd(binary, sid_path, subsong, dur, tf.name, mute=mute,
-                                      start=start)
-                render_coros.append(_sid_vu_pass(cmd, tp, dur))
-                voice_wavs.append(tp)
-            await asyncio.gather(*render_coros)
-            result = await asyncio.to_thread(sid_vu.build_vu, voice_wavs, float(dur))
+            # The voice-isolation renders (one per voice, 3 per SID chip) are the
+            # Voices tab's scope renders: shared with it (``voices.sid_voice_renders``
+            # — joined when the tab started them, started here for the tab to
+            # find), so a listener watching the scopes doesn't run them twice
+            # and the scopes show from the meter's renders.
+            from soniqboom.api import voices as _voices
+            from types import SimpleNamespace
+            track_id = full_key.split("__sub", 1)[0]
+            shared = await _voices.sid_voice_renders(
+                SimpleNamespace(channels=chips, format="SID"), track_id, subsong, sid_path, dur)
+            if shared is not None:
+                try:
+                    result = await asyncio.to_thread(
+                        sid_vu.build_vu, [f[0] for f in shared.files], float(dur))
+                finally:
+                    shared.pins -= 1
+            else:
+                # (no shared renders for this length: renders of its own)
+                # Run the voice-isolation renders concurrently when the background
+                # gate has the slots (total gen time ~one render, not three — a 6-min
+                # tune drops from ~68 s to ~23 s); each takes a PRIO_VU background
+                # slot, so they never hold the slot playback needs (GitHub #32).
+                voice_wavs: list[Path] = []
+                render_coros = []
+                start = await _psid_start_song(sid_path) if subsong > 0 else 1
+                light = await asyncio.to_thread(sidlite_ok, binary)   # (only seen, never heard)
+                for mute in sid_vu.voice_mutes(chips):
+                    tf = tempfile.NamedTemporaryFile(dir=_rtmp(), suffix=".wav", prefix="sidvu-",
+                                                     delete=False)
+                    tf.close()
+                    tp = Path(tf.name)
+                    tmps.append(tp)
+                    cmd = _sid_render_cmd(binary, sid_path, subsong, dur, tf.name, mute=mute,
+                                          start=start, light=light)
+                    render_coros.append(_sid_vu_pass(cmd, tp, dur))
+                    voice_wavs.append(tp)
+                await asyncio.gather(*render_coros)
+                result = await asyncio.to_thread(sid_vu.build_vu, voice_wavs, float(dur))
             if result is not None:
                 vu_path = cached_wav.with_suffix(".vu")
                 # A client upload may have landed while our 3 passes rendered
@@ -3023,11 +3090,17 @@ async def _sid_vu_worker(full_key: str, cached_wav: Path, sid_path: Path,
                 # ``ensure_sid_vu_sidecar``), so nothing else has created it.
                 vu_path.parent.mkdir(parents=True, exist_ok=True)
                 await asyncio.to_thread(openmpt_vu.write_sidecar, vu_path, result)
+                _SID_VU_NO_RESULT.pop(full_key, None)
                 log.info("SID VU: wrote %d-voice sidecar for %s",
                          result.channels, cached_wav.name)
+            else:
+                no_result = True        # (every voice silent, or the renders unreadable)
     except Exception:
+        no_result = True
         log.debug("SID VU pass failed for %s", sid_path, exc_info=True)
     finally:
+        if no_result:
+            _note_sid_vu_no_result(full_key)
         for tp in tmps:
             try:
                 tp.unlink(missing_ok=True)
@@ -3047,7 +3120,7 @@ def _spawn_sid_vu(full_key: str, cached_wav: Path, sid_path: Path,
     No-op if too long, already present, or in flight."""
     if dur <= 0 or dur > _SID_VU_MAX_DURATION:
         return
-    if full_key in _SID_VU_INFLIGHT:
+    if full_key in _SID_VU_INFLIGHT or _sid_vu_no_result(full_key):
         return
     if len(_SID_VU_INFLIGHT) >= _SID_VU_MAX_QUEUED:
         return                                  # backlog full — retry on a later play
@@ -3066,10 +3139,13 @@ async def _sid_vu_worker_delayed(full_key: str, cached_wav: Path, sid_path: Path
                                  subsong: int, dur: int, chips: int = 1) -> None:
     """Hold ``_SID_VU_SERVER_DELAY`` seconds so a browser client can upload its
     WASM-rendered sidecar first (offload), then generate server-side only if the
-    ``.vu`` still doesn't exist.  Owns the inflight-slot release for the skip
+    ``.vu`` still doesn't exist.  A 2SID / 3SID tune (``chips`` ≥ 2) starts at
+    once: the browser's core renders one chip, and its upload is refused.  Owns the inflight-slot release for the skip
     path; ``_sid_vu_worker`` releases it for the render path (both idempotent)."""
     try:
-        if _SID_VU_SERVER_DELAY > 0:
+        # (a tune for two or three SID chips: the browser's WASM core renders
+        # one chip — its meter comes from this pass alone, so it starts at once)
+        if _SID_VU_SERVER_DELAY > 0 and chips < 2:
             await asyncio.sleep(_SID_VU_SERVER_DELAY)
         if cached_wav.with_suffix(".vu").exists():
             return                              # client (or a prior play) won — skip the render
@@ -3106,6 +3182,67 @@ def ensure_sid_vu_sidecar(track_id: str, sid_path: Path, subsong: int, dur: int,
     # The would-be WAV path: _spawn_sid_vu only reads ``.with_suffix(".vu")``
     # off it, so it need not exist.
     _spawn_sid_vu(full_key, _cache_path(full_key, "sid"), sid_path, subsong, dur, chips)
+
+
+# A SID render key whose per-voice pass ran and wrote no sidecar (every voice
+# silent — a digi-only tune —, or the renders failed) → when.  Its meter isn't
+# coming: GET /vu says so (``sid_vu_unavailable_reason`` → "skipped", the
+# player stops asking) and no play or ask starts the pass again for an hour —
+# a 3SID tune's is 9 full renders.
+_SID_VU_NO_RESULT: "dict[str, float]" = {}
+_SID_VU_NO_RESULT_TTL = 3600.0
+_SID_VU_NO_RESULT_MAX = 512
+
+
+def _note_sid_vu_no_result(full_key: str) -> None:
+    now = time.monotonic()
+    for k in [k for k, t in _SID_VU_NO_RESULT.items() if now - t > _SID_VU_NO_RESULT_TTL]:
+        _SID_VU_NO_RESULT.pop(k, None)
+    while len(_SID_VU_NO_RESULT) >= _SID_VU_NO_RESULT_MAX:
+        _SID_VU_NO_RESULT.pop(next(iter(_SID_VU_NO_RESULT)))
+    _SID_VU_NO_RESULT[full_key] = now
+
+
+def _sid_vu_no_result(full_key: str) -> bool:
+    t = _SID_VU_NO_RESULT.get(full_key)
+    return t is not None and time.monotonic() - t < _SID_VU_NO_RESULT_TTL
+
+
+def sid_vu_unavailable_reason(track_id: str, subsong: int) -> "str | None":
+    """Why the SID tune this server is playing gets no per-voice meter
+    ("skipped": its pass ran without a result, or it is longer than the pass
+    takes — ``_SID_VU_MAX_DURATION``), or None (one may come)."""
+    from soniqboom.api import voices as _voices
+    src = _voices._SOURCES.get((track_id, int(subsong)))
+    if not src or src.get("family") != "sid":
+        return None
+    if int(src.get("duration") or 0) > _SID_VU_MAX_DURATION:
+        return "skipped"
+    return "skipped" if _sid_vu_no_result(str(src.get("cache_key") or "")) else None
+
+
+def forget_sid_vu_no_result(track_id: str) -> None:
+    """A changed file (the scanner): its tunes' passes may run again."""
+    for k in [k for k in _SID_VU_NO_RESULT if k.startswith(f"{track_id}__")]:
+        _SID_VU_NO_RESULT.pop(k, None)
+
+
+def request_sid_vu(track, track_id: str, subsong: int) -> None:
+    """``ensure_sid_vu_sidecar`` for the SID tune this server is playing
+    (GET /vu on a miss): from the source and length its play rendered
+    (``voices.note_voice_source``).  Nothing when it isn't being played, or
+    when its pass already ran without a result (``_SID_VU_NO_RESULT``)."""
+    try:
+        from soniqboom.api import voices as _voices
+        src = _voices._SOURCES.get((track_id, int(subsong)))
+        if not src or src.get("family") != "sid" or not src.get("duration"):
+            return
+        if _sid_vu_no_result(str(src.get("cache_key") or "")):
+            return
+        ensure_sid_vu_sidecar(track_id, Path(src["src"]), int(subsong),
+                              int(src["duration"]), chips=sid_chips(track))
+    except Exception:                                   # noqa: BLE001
+        log.debug("request_sid_vu failed for %s", track_id, exc_info=True)
 
 
 async def _sid_prewarm_render(full_key: str, path: Path, subsong: int, dur: int,
@@ -17704,7 +17841,7 @@ async def stream_track(
                          "X-SID-Target-Seconds": str(target_dur)})
             if _packed is not None:
                 _spawn_sid_vu(full_key, _conversion_cache_mod._cache_path(full_key, "sid"),
-                              path, subsong, target_dur)
+                              path, subsong, target_dur, chips=_chips)
                 return _packed
             exact = await get_cached(full_key)
             if exact:

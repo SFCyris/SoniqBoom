@@ -74,7 +74,8 @@ import { artPlaceholderEmoji,
 // label thinning, re-ask ladders) — shared with the phone's Now Playing.
 import { parseVUMR, createVumrFetcher, vuEligible, vuKeyOf, vuLabelStep,
          vumrLevelsAt, fftColumnLevels, vuFallbackText, FFT_FALLBACK_BARS,
-         serverPassTrack, vuVoiceLabel,
+         serverPassTrack, vuVoiceLabel, multiSidTrack, vuExpectedVoices, MULTI_SID_VU_RETRY_MS,
+         vuRetryDelay,
          SID_VU_RETRY_MS, AMIGA_VU_RETRY_MS, AMIGA_VU_SETTLE_S,
          AMIGA_VU_SETTLE_POLL_MS, AMIGA_VU_SETTLE_MAX_WAITS } from './vu/vumr.js';
 // The shared Modern / Retro hi-fi look: the waveform's colours follow it, and
@@ -1414,7 +1415,9 @@ function _scheduleSidVURetry(track, key, attempt = 0, settleWaits = 0) {
   // (Amiga and chip tunes: the server's pass starts on the first ask, once
   // the track has played a few seconds — vu/vumr.js serverPassTrack.)
   const amiga = serverPassTrack(track);
-  const ladder = amiga ? _AMIGA_VU_RETRY_MS : _SID_VU_RETRY_MS;
+  const ladder = amiga ? _AMIGA_VU_RETRY_MS
+    : multiSidTrack(track) ? MULTI_SID_VU_RETRY_MS     // (2SID / 3SID: the server's pass, sooner)
+    : _SID_VU_RETRY_MS;
   if (attempt === 0 && settleWaits === 0) _sidPollActive = key;
   // ``final``: polling ended without meters for the track still playing — the
   // spectrum label stops saying "loading…".
@@ -1422,7 +1425,9 @@ function _scheduleSidVURetry(track, key, attempt = 0, settleWaits = 0) {
     if (_sidPollActive === key) _sidPollActive = '';
     if (final && key === _vuKey) _settleFallbackLabel(reason);
   };
-  if (attempt >= ladder.length) { _end(true); return; }   // ladder exhausted
+  // (a 2SID / 3SID tune asks on at the last rung while it plays — vuRetryDelay)
+  const wait = vuRetryDelay(track, ladder, attempt);
+  if (wait === null) { _end(true); return; }   // ladder exhausted
   setTimeout(async () => {
     if (key !== _vuKey) return _end();          // a different track/subsong took over
     if (key === _sidClientDone) return _end();  // client render COMPLETED — sidecar exists
@@ -1438,7 +1443,7 @@ function _scheduleSidVURetry(track, key, attempt = 0, settleWaits = 0) {
       return;
     }
     let fetched = null;
-    try { fetched = await _fetchVUMR(track.id, track.subsong); } catch (_) {}
+    try { fetched = await _fetchVUMR(track.id, track.subsong, { voices: vuExpectedVoices(track) }); } catch (_) {}
     if (key !== _vuKey) return _end();
     if (fetched && fetched.unavailable) return _end(true, fetched.reason);   // none is coming — stop asking
     if (fetched) {
@@ -1451,7 +1456,7 @@ function _scheduleSidVURetry(track, key, attempt = 0, settleWaits = 0) {
     } else {
       _scheduleSidVURetry(track, key, attempt + 1);
     }
-  }, settleWaits > 0 ? _AMIGA_VU_SETTLE_POLL_MS : ladder[attempt]);
+  }, settleWaits > 0 ? _AMIGA_VU_SETTLE_POLL_MS : wait);
 }
 
 /** Abandon any in-flight / queued client WASM VU render.
@@ -1610,7 +1615,7 @@ function _debouncedSidVU(track, key) {
 // Returns true when the meter was populated locally; false → let the
 // server-poll fallback (_scheduleSidVURetry) handle it.
 async function _generateSidVUClient(track, key) {
-  if (_sidVuUnavailable) return false;
+  if (_sidVuUnavailable || multiSidTrack(track)) return false;   // (one SID chip only)
   try {
     const res = await fetch(`/api/tracks/${encodeURIComponent(track.id)}/sid`,
                             { credentials: 'include' });
@@ -1708,7 +1713,8 @@ async function _handleVU(track) {
   // (``start: false``) — a cached sidecar still paints at once, but a miss
   // leaves starting the per-voice pass to the re-ask ladder below, once the
   // track has really played.
-  const fetched0 = await _fetchVUMR(track.id, track.subsong, { start: !serverPassTrack(track) });
+  const fetched0 = await _fetchVUMR(track.id, track.subsong,
+                                    { start: !serverPassTrack(track), voices: vuExpectedVoices(track) });
   // "None is coming" paints the spectrum like a miss, but arms no re-ask ladder.
   const vuUnavailable = !!(fetched0 && fetched0.unavailable);
   const fetched = vuUnavailable ? null : fetched0;
@@ -1761,7 +1767,9 @@ async function _handleVU(track) {
       // ``_sidClientDone`` the moment the client paints, so it never double-work
       // when the flag-on background render (player.js → ``sidwasmvu``) succeeds.
       _scheduleSidVURetry(track, key);
-      if (!sidWasmPlaybackEnabled() && !_sidVuPending) {
+      // (a 2SID / 3SID tune: the WASM core renders the first chip only — its 6 /
+      // 9 voices come from the server's pass, which starts at once for it)
+      if (!sidWasmPlaybackEnabled() && !_sidVuPending && !multiSidTrack(track)) {
         _debouncedSidVU(track, key);             // flag off → client renders the VU (offload)
       }
       // flag on: player.js runs the in-browser render in the background and emits
@@ -2451,6 +2459,7 @@ _paintCued();         // a queue restored before this module finished booting
 Player.on('sidwasmvu', ({ id, subsong, vumr }) => {
   const key = `${id}:${Number.isInteger(subsong) ? subsong : 0}`;
   if (key !== _vuKey || !vumr) return;
+  if (multiSidTrack(Player.currentTrack)) return;     // (the WASM core: one SID chip)
   const parsed = _parseVUMR(vumr);
   if (!parsed) return;
   _initVU(parsed.channels, { useVUMR: true, vumr: parsed });

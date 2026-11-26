@@ -462,7 +462,8 @@ def sid_warm_eligible() -> bool:
 
 
 def _find_orphan_sidecar(track_id: str, subsong: int,
-                         uade_variant: str | None = None) -> Path | None:
+                         uade_variant: str | None = None,
+                         sid_voices: int = 0) -> Path | None:
     """Find a VU sidecar whose WAV is absent — evicted, never cached, or written
     ahead of the audio.
 
@@ -479,6 +480,16 @@ def _find_orphan_sidecar(track_id: str, subsong: int,
     base = get_conversion_cache_dir()
     exact = f"{track_id}__sub{int(subsong)}"
     shard = track_id[:2]
+    if sid_voices:
+        # A C64 SID tune: only its own render keys (``sid/<shard>/<id>__sub<N>__…``),
+        # and only a sidecar that is its meter as it plays now.
+        try:
+            for cand in sorted((base / "sid" / shard).glob(f"{exact}__*.vu")):
+                if _sid_sidecar_fits(cand.stem, cand, sid_voices):
+                    return cand
+        except OSError:
+            pass
+        return None
     # A tracker render's own key carries its render revision (``_RENDER_REVS``).
     p = base / "tracker" / shard / f"{_cache_key(track_id, 'tracker', int(subsong))}.vu"
     if not uade_variant and p.exists():
@@ -507,8 +518,50 @@ def _find_orphan_sidecar(track_id: str, subsong: int,
     return None
 
 
+def _vumr_channels(path: Path) -> int:
+    """The voice count a VUMR sidecar's header states (byte 5), 0 when the
+    file can't be read or isn't one.  Blocking (6 bytes)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(6)
+    except OSError:
+        return 0
+    return head[5] if len(head) == 6 and head[:4] == b"VUMR" else 0
+
+
+def _sid_sidecar_fits(cache_key: str, sidecar: Path, sid_voices: int) -> bool:
+    """Is ``sidecar`` (of the SID render ``cache_key``) the meter of the tune
+    as it plays now: ``sid_voices`` voices (3 per SID chip)?
+
+    A 2SID / 3SID tune renders in stereo under its own key (variant "st",
+    ``stream._sid_key_variant``) since 2.3.0, and its meter has 6 / 9 voices.
+    The same ``<id>__sub<N>__`` prefix also names the mono render keyed before
+    — whose 3-voice sidecar (a browser upload, an older server pass) is another
+    render's, never this tune's meter: skipped, and left to its key.  A sidecar
+    under the tune's OWN key that still has the wrong count (a pass that ran
+    for one chip only — the packed-cache-hit path before 2.3.1) is removed:
+    the voice pass writes a sidecar only where none exists, so leaving it
+    would keep the 3-voice meter for good."""
+    stereo_key = "st" in cache_key.split("__")[2:]
+    if stereo_key != (sid_voices > 3):
+        return False
+    have = _vumr_channels(sidecar)
+    if have == sid_voices:
+        return True
+    if not have:
+        return False                    # (unreadable just now, or being replaced: left alone)
+    try:
+        sidecar.unlink()
+        log.info("VU sidecar %s has the wrong voice count for its tune (%d wanted) — removed",
+                 sidecar.name, sid_voices)
+    except OSError:
+        pass
+    return False
+
+
 def get_vu_sidecar_path(track_id: str, subsong: int = 0,
-                        uade_variant: str | None = None) -> Path | None:
+                        uade_variant: str | None = None,
+                        sid_voices: int = 0) -> Path | None:
     """Return the on-disk path to the VU sidecar for *track_id* at
     *subsong* (0-based wire index), or None if that subsong hasn't been
     rendered yet.
@@ -528,14 +581,21 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0,
 
     ``uade_variant`` (a uade module whose tunes are numbered from 1, see
     ``_cache_key``): the uade key is ``<track_id>__sub<N>__v<variant>``.
+
+    ``sid_voices`` (a C64 SID tune: 3 per SID chip): only a SID sidecar with
+    that many voices, of a render keyed for the tune as it plays now, is its
+    meter (``_sid_sidecar_fits``).  0 — any sidecar of the tune, as before.
     """
     want = f"{track_id}__sub{int(subsong)}"
     want_sid_prefix = want + "__"      # SID keys append __dur{D}[+fidelity parts]
     want_uade = _cache_key(track_id, "uade", int(subsong), variant=uade_variant)
     want_tracker = _cache_key(track_id, "tracker", int(subsong))
+    sid_found: "list[tuple[str, Path]]" = []
     with _state_lock:
         for cache_key, entry in _meta.items():
             fmt = entry.get("format_type")
+            if sid_voices and fmt != "sid":
+                continue
             if fmt in ("tracker", "uade"):
                 # tracker renders get VU from libopenmpt; uade renders from the
                 # Paula --write-audio dump (uade_vu.py).  Their keys are exactly
@@ -559,12 +619,18 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0,
                 continue
             wav_path = Path(entry["path"])
             sidecar  = wav_path.with_suffix(".vu")
+            if sid_voices:
+                sid_found.append((cache_key, sidecar))   # (checked below, off the lock)
+                continue
             if sidecar.exists():
                 return sidecar
+    for cache_key, sidecar in sid_found:
+        if sidecar.exists() and _sid_sidecar_fits(cache_key, sidecar, sid_voices):
+            return sidecar
     # No cached WAV to hang the sidecar off — but one may still exist on disk:
     # eviction now KEEPS sidecars, and the VU pass can write one before (or
     # without) the audio ever being cached.  Look it up by its deterministic path.
-    return _find_orphan_sidecar(track_id, subsong, uade_variant)
+    return _find_orphan_sidecar(track_id, subsong, uade_variant, sid_voices)
 
 
 def get_sid_wav_path_for_upload(track_id: str, subsong: int = 0) -> Path | None:

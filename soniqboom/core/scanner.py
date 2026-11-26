@@ -8428,6 +8428,7 @@ async def _purge_made_from(track_ids: "list[str]") -> None:
                 # module's subsong base, a SID's start song)
                 st._UADE_BASE_MEMO.pop(tid, None)
                 st._SID_START_SONG.pop(tid, None)
+                st.forget_sid_vu_no_result(tid)
         cr = _sys.modules.get("soniqboom.core.cast_render")
         if cr is not None:
             # (cast's memo of a chip render's cache key: the old content's key
