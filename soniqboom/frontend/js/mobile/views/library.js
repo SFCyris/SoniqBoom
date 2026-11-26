@@ -1168,9 +1168,10 @@ export function mountLibrary(root, ctx) {
         extraField: 'year_max', extraValue: String(value),
       };
     } else if (item.label && !String(value).trim()) {
-      // "[No Artist]" / "[No Album Artist]": the tracks whose tag is blank — the
-      // rows the bucket counts.  (``artist=`` with no value is no filter at all:
-      // it listed, played and shuffled the whole library.)
+      // "[No Artist]" / "[No Album Artist]" / "[No Album]" / "[No Genre]": the
+      // tracks whose tag is blank — the rows the bucket counts.  (``artist=``
+      // with no value is no filter at all: it listed, played and shuffled the
+      // whole library.)
       crumb = { label: display, field: 'untagged', value: groupField, url: '/api/tracks' };
     } else {
       crumb = { label: display, field: groupField, value: String(value) };

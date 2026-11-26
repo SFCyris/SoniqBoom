@@ -6000,7 +6000,8 @@ class TrackStore:
         return max(0, n)
 
     def untagged_count(self, field: str, primary_only: bool = False, exclude=None,
-                       swap: PrimarySwap | None = None) -> int:
+                       swap: PrimarySwap | None = None, *, artist: str | None = None,
+                       album_artist: str | None = None) -> int:
         """The size of the "[No Artist]"-style bucket for ``field``: how many rows
         ``filter_tracks(untagged=field, filter_duplicates=primary_only,
         exclude=exclude, swap=swap)`` lists.  Counted from the same blank-tag
@@ -6009,15 +6010,27 @@ class TrackStore:
         out short (or negative) and the bucket vanished while its drill-down
         still listed tracks.  The maintained bucket (``_untagged_ids``) less
         what the list hides (``_invisible``) — set arithmetic, memoised until
-        the next browse write (or another ``exclude`` set / swap)."""
+        the next browse write (or another ``exclude`` set / swap).
+
+        ``artist`` / ``album_artist``: only that artist's tracks (the
+        "[No Album]" row of ``aggregate_albums(artist=…)``, the same scope
+        and precedence; its drill-down passes the same predicate)."""
         ids = self._untagged_ids(field)
         if not primary_only:
             swap = None
         key = f"untagged:{field}:{int(bool(primary_only))}"
+        if artist:
+            key += f":artist={artist.lower()}"
+        elif album_artist:
+            key += f":album_artist={album_artist.lower()}"
         cached = (self._agg_x_get(key, exclude, swap) if exclude or swap is not None
                   else self._agg_cache_get(key))
         if cached is not None:
             return cached
+        if artist:
+            ids = ids & self._tag_artist.get(artist.lower(), set())
+        elif album_artist:
+            ids = ids & self._tag_album_artist.get(album_artist.lower(), set())
         inv = self._invisible(bool(primary_only), exclude, swap)
         n = len(ids) - len(ids.intersection(inv)) if inv else len(ids)
         if exclude or swap is not None:

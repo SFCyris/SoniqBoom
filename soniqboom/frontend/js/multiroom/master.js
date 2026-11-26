@@ -435,9 +435,13 @@ async function _openAlbum(summary) {
   try {
     const params = new URLSearchParams();
     params.set('limit', '500');
+    // "[No Album]": the tracks without an album tag (a filter with no album
+    // would be no filter at all — the whole library).
+    const noAlbum = !!summary.label || !summary.album;
+    if (noAlbum) params.set('untagged', 'album');
     if (summary.album_artist) params.set('album_artist', summary.album_artist);
     else if (summary.artist)  params.set('artist',       summary.artist);
-    if (summary.album)        params.set('album',        summary.album);
+    if (!noAlbum)             params.set('album',        summary.album);
     const r = await fetch(`/api/search/filter?${params.toString()}`);
     if (!r.ok) throw new Error('album fetch');
     const tracks = await r.json();

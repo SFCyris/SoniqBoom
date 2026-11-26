@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
@@ -650,6 +651,7 @@ async def filter_tracks(
     playable: bool = False,
     after: str | None = None,
     uid: str | None = Depends(optional_listener_uid),
+    untagged: Annotated[str | None, Query(pattern="^(artist|album_artist|album|genre)$")] = None,
 ):
     """Structured filter — combine any fields.
 
@@ -678,6 +680,10 @@ async def filter_tracks(
     ``playable=1`` (the play queue's pages): ``{tracks, next_offset, ended}``
     without those tracks in Mark / Hide mode, each row with its ``_pos``;
     ``after=<track id>`` starts right after that track (``player_page``).
+
+    ``untagged``: only tracks whose tag of that name is blank — with ``artist``
+    / ``album_artist``, the drill-down of that artist's "[No Album]" row
+    (``/library/albums?artist=…``), whose count is the length of this list.
     """
     from soniqboom.core import availability
     from soniqboom.core.store import get_store
@@ -715,7 +721,8 @@ async def filter_tracks(
             ("length_min", length_min), ("length_max", length_max),
             ("rating_min", rating_min), ("rating_max", rating_max),
             ("plays_min", plays_min), ("plays_max", plays_max),
-            ("added", added), ("played", played)) if v is not None and v != ""})
+            ("added", added), ("played", played), ("untagged", untagged))
+            if v is not None and v != ""})
         extra = with_uid(extra, _uid_of(uid))
         await search_indexes_for(extra)
         hide = bool(store.get_config("filter_duplicates", False))
@@ -777,6 +784,8 @@ async def filter_tracks(
         parts.append(_parse_advanced_query(q) or _escape_text(q))
     query = " ".join(parts) if parts else "*"
     parsed = with_uid(_parse_tag_query(query), _uid_of(uid))
+    if untagged:
+        parsed = and_predicates(parsed, {"untagged": untagged})
     await search_indexes_for(parsed)
     hide_dups = bool(store.get_config("filter_duplicates", False))
     return await _reply(lambda off, lim: store.filter_tracks(

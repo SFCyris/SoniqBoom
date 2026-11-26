@@ -3721,7 +3721,8 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
   // groups — drilling in would dead-end on an "No tracks found" empty state even
   // though the artist HAS tracks (e.g. loose singles).  Fall back to the flat
   // track list for that artist so the drill is never a dead end.
-  if (albums.length === 0 && (artist || albumArtist)) {
+  // (A "[No Album]" row alone is that same flat list.)
+  if (albums.every((a) => a.label) && (artist || albumArtist)) {
     const fbBack = backView === 'album_artist'
       ? () => showAlbumArtists()
       : backView === 'artist'
@@ -3730,7 +3731,7 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
     if (artist) { showArtistTracks(artist, fbBack); return; }
     if (albumArtist) { showAlbumArtistTracks(albumArtist, fbBack); return; }
   }
-  if (!artist && !albumArtist) _updateNavBadge('albums', albums.length);
+  if (!artist && !albumArtist) _updateNavBadge('albums', _navCount(albums));
   const backLabel = artist || albumArtist || null;
   const backFn = backView === 'album_artist'
     ? () => showAlbumArtists()
@@ -3745,8 +3746,8 @@ async function showAlbums(artist = null, albumArtist = null, backView = null) {
   renderGroupList(albums, 'album', 'count', 'Tracks', (item) => {
     const backTo = () => showAlbums(artist, albumArtist, backView);
     if (item.label || !item.album) {
-      // "[No Album]" — show tracks without album metadata
-      showUntaggedTracks('album', '[No Album]', backTo, item.count);
+      // "[No Album]" — the tracks without an album tag (of this artist)
+      _openNoAlbum(item, backTo);
     } else {
       showAlbumTracks(item.artist, item.album_artist, item.album, backTo);
     }
@@ -3776,14 +3777,18 @@ async function showNameAlbums(name) {
     const have = merged.get(key);
     if (!have || (item.count || 0) > (have.count || 0)) merged.set(key, item);
   }
-  const albums = [...merged.values()].sort((a, b) =>
+  // (the "[No Album]" row last, as in the Albums view)
+  const albums = [...merged.values()].sort((a, b) => (!!a.label - !!b.label) ||
     String(a.album || '').localeCompare(String(b.album || ''), undefined, { sensitivity: 'base' }));
   if (albums.length === 0) { showArtistTracks(name, () => showArtists()); return; }
+  // A lone "[No Album]" row opens by its own scope: the name may be only an album
+  // artist, whose tracks the flat artist list would not have.
+  if (albums.every((a) => a.label)) { _openNoAlbum(albums[0], () => showArtists()); return; }
   setBrowseHeader(name, () => showArtists(), false);   // group/grid view — not a track list
   renderGroupList(albums, 'album', 'count', 'Tracks', (item) => {
     const backTo = () => showNameAlbums(name);
     if (item.label || !item.album) {
-      showUntaggedTracks('album', '[No Album]', backTo, item.count);
+      _openNoAlbum(item, backTo);       // (by the scope its row came from)
     } else {
       showAlbumTracks(item.artist, item.album_artist, item.album, backTo);
     }
@@ -3794,7 +3799,34 @@ async function showNameAlbums(name) {
 // The untagged drill's fetch ceiling (its rows go into the play queue whole).
 const _UNTAGGED_LIMIT = 5000;
 
-async function showUntaggedTracks(field, label, backFn, total = 0) {
+// Where an untagged drill reads its rows: the library's blank-tag set
+// (``/api/tracks?untagged=``, 5,000 rows) or, scoped to an artist / album artist
+// (the "[No Album]" row of their albums), ``/api/search/filter``, which takes
+// both predicates (2,000 rows).  The bucket's count counts the same rows.
+function _untaggedSpec(field, scope) {
+  if (scope) {
+    const params = { ...scope, untagged: field };
+    return { path: '/search/filter', params, limit: _DRILL_LIMIT,
+             ordered: { url: '/api/search/filter', params } };
+  }
+  return { path: '/tracks', params: { untagged: field }, limit: _UNTAGGED_LIMIT, ordered: null };
+}
+
+// The scope of a "[No Album]" row: the artist / album artist its list was
+// asked for (``/library/albums?artist=…`` puts it on every row), or none.
+function _albumRowScope(item) {
+  if (item.artist) return { artist: item.artist };
+  if (item.album_artist) return { album_artist: item.album_artist };
+  return null;
+}
+
+function _openNoAlbum(item, backFn) {
+  const scope = _albumRowScope(item);
+  const who = scope ? (scope.artist || scope.album_artist) : '';
+  showUntaggedTracks('album', who ? `${who} — [No Album]` : '[No Album]', backFn, item.count, scope);
+}
+
+async function showUntaggedTracks(field, label, backFn, total = 0, scope = null) {
   const _gen = ++_browseNavGen;
   _hideGroupFilter();
   _hideGridToggle();
@@ -3803,18 +3835,20 @@ async function showUntaggedTracks(field, label, backFn, total = 0) {
   _showSkeletonRows();
   // The server lists exactly the tracks whose tag is blank — the rows the
   // bucket's count counts (same duplicate / unavailable-drive filtering).
-  const tracks = await _viewData(_gen, API('/tracks', { limit: _UNTAGGED_LIMIT, untagged: field }),
-                                 () => showUntaggedTracks(field, label, backFn, total));
+  const spec = _untaggedSpec(field, scope);
+  const tracks = await _viewData(_gen, API(spec.path, { limit: spec.limit, ...spec.params }),
+                                 () => showUntaggedTracks(field, label, backFn, total, scope));
   if (!tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   renderTracks(tracks);
   // A list shorter than the cap is the whole set, so its length is the count —
   // an in-place reload (a drive going away under "Hide") re-runs this with the
   // count the bucket had when it was clicked.
-  if (tracks.length < _UNTAGGED_LIMIT) total = tracks.length;
-  // Capped at 5,000 rows: SHUFFLE deals from the server's full "tag is blank" set;
-  // list-order play covers the rows shown.
-  _setCappedSource(tracks.length, _UNTAGGED_LIMIT, total, { untagged: field }, null, label);
-  _setViewReload(`untagged\0${field}`, () => showUntaggedTracks(field, label, backFn, total));
+  if (tracks.length < spec.limit) total = tracks.length;
+  // Capped (5,000 / 2,000 rows): SHUFFLE deals from the server's full "tag is
+  // blank" set; list-order play covers the rows shown, or pages the scoped list.
+  _setCappedSource(tracks.length, spec.limit, total, { ...spec.params }, spec.ordered, label);
+  _setViewReload(`untagged\0${field}\0${scope ? JSON.stringify(scope) : ''}`,
+                 () => showUntaggedTracks(field, label, backFn, total, scope));
   // A large untagged set (e.g. 200k+ mod/SID files with no album-artist) is shown
   // only partially.  Disclose the shortfall in the crumb like every other capped
   // drill instead of silently implying the badge count is listed.
@@ -3947,8 +3981,10 @@ async function showGenres() {
   _showSkeletonRows(12);
   const genres = await _viewData(_gen, API('/library/genres'), () => showGenres());
   if (!genres || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  _updateNavBadge('genres', genres.length);
-  renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => showGenreTracks(item.genre, item.count));
+  _updateNavBadge('genres', _navCount(genres));
+  renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => ((item.label || !item.genre)
+    ? showUntaggedTracks('genre', '[No Genre]', () => showGenres(), item.count)
+    : showGenreTracks(item.genre, item.count)));
   _setViewReload('genres', () => showGenres());
 }
 
@@ -4325,6 +4361,7 @@ let _gridPadTop = 16;
 const _albumArtIds = new Map();
 
 async function _playAlbumItem(item) {
+  if (item.label || !item.album) { _playNoAlbum(item); return; }
   const name = item.label || item.album || '—';
   const artist = item.artist || item.album_artist || '';
   try {
@@ -4341,6 +4378,25 @@ async function _playAlbumItem(item) {
         : null;
       Player.setQueue(tracks, 0, source ? { source } : {});
       window.Toast?.ok?.(`Playing ${name}`);
+    } else {
+      window.Toast?.warn?.('No tracks found for this album.');
+    }
+  } catch (_) { window.Toast?.error?.('Couldn’t play album.'); }
+}
+
+// A "[No Album]" card's ▶: the rows its drill-down lists (``_untaggedSpec``).
+async function _playNoAlbum(item) {
+  const scope = _albumRowScope(item);
+  const spec = _untaggedSpec('album', scope);
+  const label = scope ? `${scope.artist || scope.album_artist} — [No Album]` : '[No Album]';
+  try {
+    const tracks = await API(spec.path, { limit: spec.limit, ...spec.params });
+    if (Array.isArray(tracks) && tracks.length) {
+      const source = tracks.length >= spec.limit
+        ? { ordered: null, shuffle: { url: SHUFFLE_URL, params: { ...spec.params } }, total: null, label }
+        : null;
+      Player.setQueue(tracks, 0, source ? { source } : {});
+      window.Toast?.ok?.(`Playing ${label}`);
     } else {
       window.Toast?.warn?.('No tracks found for this album.');
     }
@@ -4458,6 +4514,7 @@ function _fillAlbumCard(card, i) {
   initialsEl.style.display = '';
   card.classList.remove('album-card-art-loaded');
   if (item.track_id) { _loadAlbumCardArt(card, item.track_id, tok); return; }
+  if (item.label) return;               // ("[No Album]": no album to find a cover of)
   if (_albumArtIds.has(key)) {
     const id = _albumArtIds.get(key);
     if (id) _loadAlbumCardArt(card, id, tok);

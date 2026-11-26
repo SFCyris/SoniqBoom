@@ -428,7 +428,19 @@ async def test_a_root_coming_back_refreshes_hide_counts_and_lists(lib):
 
 _SEEDS = itertools.count(1000)
 _UNTAGGED_BUCKETS = {"artist": (library.list_artists, "[No Artist]"),
-                     "album_artist": (library.list_album_artists, "[No Album Artist]")}
+                     "album_artist": (library.list_album_artists, "[No Album Artist]"),
+                     "album": (library.list_albums, "[No Album]"),
+                     "genre": (library.list_genres, "[No Genre]")}
+# The fields a track can hold several values of ("A • B", two genres): there the
+# old "visible total minus the tagged buckets" comes out wrong.
+_MULTI_FIELDS = ("artist", "album_artist", "genre")
+
+
+def _names(v) -> set[str]:
+    """The lower-cased names of an artist tag ("A • B" → {"a", "b"}) — the
+    scope of ``/library/albums?artist=…``, worked out from the tag itself."""
+    v = (v or "").strip().lower()
+    return {v, *(x.strip() for x in v.split(" • "))} - {""} if v else set()
 
 
 def _untag_some(lib) -> dict[str, set[str]]:
@@ -458,6 +470,8 @@ def _untag_some(lib) -> dict[str, set[str]]:
             t["genre"], t["genre_derived"] = [], ["Chiptune"]
         elif k % 8 == 3:
             t["genre"] = ["", "Rock"]
+        elif k % 8 == 4:                           # in two genre buckets
+            t["genre"] = [f"Genre {k % 3}", "Rock"]
         if k % 5 == 1:                             # a duplicate copy
             t["is_duplicate_primary"], t["duplicate_group_id"] = False, f"g{k}"
         lib.store.upsert_track(t)
@@ -504,10 +518,45 @@ async def _assert_untagged_counts_match(lib, blank, dedup: bool, mode: str) -> N
             groups = json.loads((await endpoint(_req())).body)
             buckets = [g for g in groups if g.get("label") == label]
             assert [g["count"] for g in buckets] == ([len(rows)] if rows else []), where
-            # The fixture is one where "visible total minus the tagged buckets"
-            # (the old formula) is wrong: multi-name tags count twice.
-            tagged = sum(g["count"] for g in groups if not g.get("label"))
-            assert visible_total - tagged != len(rows), where
+            if field in _MULTI_FIELDS:
+                # The fixture is one where "visible total minus the tagged buckets"
+                # (the old formula) is wrong: multi-name tags count twice.
+                tagged = sum(g["count"] for g in groups if not g.get("label"))
+                assert visible_total - tagged != len(rows), where
+    await _assert_scoped_no_album_rows(lib, blank, dedup, mode, hidden, primary)
+
+
+async def _assert_scoped_no_album_rows(lib, blank, dedup, mode, hidden, primary) -> None:
+    """Every artist's / album artist's "[No Album]" row (``/library/albums?
+    artist=…``) counts the rows of its drill-down (``/search/filter?artist=…
+    &untagged=album``), its shuffle and its play-queue pages."""
+    store = lib.store
+    offline = set(lib.ids_b) if mode != "show" else set()
+    seen_counts = set()
+    for scope in ("artist", "album_artist"):
+        names = {n for t in store._tracks.values() for n in _names(t.get(scope))}
+        assert len(names) >= 4, scope
+        for name in sorted(names):
+            want = {tid for tid in blank["album"]
+                    if name in _names(store._tracks[tid].get(scope))
+                    and tid not in hidden and (not dedup or tid in primary)}
+            where = (scope, name, dedup, mode)
+            q = {scope: name, "untagged": "album"}
+            rows = [r["id"] for r in await _get("/api/search/filter", params={**q, "limit": 2000})]
+            assert len(rows) == len(set(rows)) and set(rows) == want, where
+            groups = json.loads((await library.list_albums(_req(), **{scope: name})).body)
+            buckets = [g for g in groups if g.get("label") == "[No Album]"]
+            assert [g["count"] for g in buckets] == ([len(rows)] if rows else []), where
+            if buckets:                            # (the scope the frontend drills by)
+                assert buckets[0][scope] == name, where
+            play = await _get("/api/search/filter", params={**q, "playable": 1, "limit": 500})
+            assert {r["id"] for r in play["tracks"]} == want - offline and play["ended"], where
+            if mode != "mark":
+                shuf = await _get("/api/tracks/shuffled",
+                                  params={**q, "seed": next(_SEEDS), "limit": 500})
+                assert shuf["total"] == len(rows), where
+            seen_counts.add(len(rows))
+    assert len(seen_counts) >= 3                   # (names really differ: a memo per scope)
 
 
 @pytest.mark.asyncio
@@ -568,6 +617,54 @@ async def test_no_untagged_bucket_when_every_track_is_tagged(lib):
         assert groups and not [g for g in groups if g.get("label")], field
         assert await _get(f"/api/tracks?untagged={field}&limit=500") == [], field
         assert lib.store.untagged_count(field) == 0, field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["mark", "hide"])
+async def test_no_album_and_no_genre_count_the_stand_ins_of_an_offline_primary(lib, mode):
+    """Duplicates hidden, a group's primary on the drive that goes offline: the
+    lists show its other copy instead (``availability.primary_swap``) — the
+    "[No Album]" / "[No Genre]" rows count that copy, scoped or not."""
+    s = lib.store
+    copies, primaries = set(), set()
+    for g in range(4):
+        for root, prim, n in ((lib.root_b, True, 0), (lib.root_a, False, 1)):
+            # (group 3: the primary has an album and a genre, its stand-in neither —
+            # counting the primaries instead would come out one short)
+            tagged = g == 3 and prim
+            r = _row(f"{root}/sw/t{g}{n}.mod", root, 700 + 10 * g + n, title=f"Swap {g}",
+                     artist="Swap Guy", album="Has Album" if tagged else "",
+                     genre=["Rock"] if tagged else [], duplicate_group_id=f"sw{g}",
+                     is_duplicate_primary=prim)
+            s.upsert_track(copy.deepcopy(r))
+            (primaries if prim else copies).add(r["id"])
+    lib.offline()
+    lib.mode(mode)
+    s.set_config("filter_duplicates", True)
+    library.invalidate_agg_cache()
+    swap = availability.primary_swap(s)
+    assert swap is not None and copies <= set(swap.promoted)     # (a real swap)
+    for field, endpoint, label in (("album", library.list_albums, "[No Album]"),
+                                   ("genre", library.list_genres, "[No Genre]")):
+        rows = [r["id"] for r in await _get("/api/tracks", params={"untagged": field, "limit": 500})]
+        assert copies <= set(rows), field                        # the stand-ins are listed
+        groups = json.loads((await endpoint(_req())).body)
+        assert [g["count"] for g in groups if g.get("label") == label] == [len(rows)], field
+    q = {"artist": "Swap Guy", "untagged": "album"}
+    rows = [r["id"] for r in await _get("/api/search/filter", params={**q, "limit": 2000})]
+    assert copies <= set(rows) and len(rows) == len(set(rows))
+    groups = json.loads((await library.list_albums(_req(), artist="Swap Guy")).body)
+    assert [g["count"] for g in groups if g.get("label") == "[No Album]"] == [len(rows)]
+
+
+@pytest.mark.asyncio
+async def test_the_genre_list_leaves_the_stores_list_alone(lib):
+    # (/library/genres appends its "[No Genre]" row to a copy: the store's memoised
+    # list is the one Subsonic serves)
+    _untag_some(lib)
+    groups = json.loads((await library.list_genres(_req())).body)
+    assert any(g.get("label") == "[No Genre]" for g in groups)
+    assert not any(g.get("label") for g in lib.store.aggregate_genres())
 
 
 def test_untagged_count_rejects_an_unknown_field(lib):

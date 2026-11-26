@@ -380,15 +380,17 @@ def _swap(store):
     return availability.primary_swap(store, dedup=_dedup_on(store))
 
 
-def _untagged_count(store, field: str) -> int:
-    """Size of the "[No Artist]" / "[No Album Artist]" catch-all: the rows its
-    drill-down (``GET /api/tracks?untagged=<field>``) lists, in the same mode —
-    duplicates hidden or not, "Tracks on unavailable drives: Hide" or not.
+def _untagged_count(store, field: str, **scope) -> int:
+    """Size of a "[No Artist]" / "[No Album Artist]" / "[No Album]" / "[No
+    Genre]" catch-all: the rows its drill-down (``GET /api/tracks?untagged=
+    <field>``; scoped to ``artist`` / ``album_artist``: ``GET /api/search/
+    filter?untagged=<field>&artist=…``) lists, in the same mode — duplicates
+    hidden or not, "Tracks on unavailable drives: Hide" or not.
     Counted directly, not as "all tracks minus the tagged buckets": a track
     tagged "A • B" sits in two artist buckets, so that subtraction came out
     short and the bucket vanished while its drill-down still listed tracks."""
     return store.untagged_count(field, primary_only=_dedup_on(store),
-                                exclude=_hidden(store), swap=_swap(store))
+                                exclude=_hidden(store), swap=_swap(store), **scope)
 
 
 def _accepts_gzip(request: Request) -> bool:
@@ -847,6 +849,14 @@ async def list_albums(
             {**d, "artist": artist or "", "album_artist": album_artist or ""}
             for d in rows
         ]
+        # The tracks without an album tag (of this artist / album artist, the
+        # same scope and precedence as the rows above).
+        scope = ({"artist": artist} if artist
+                 else {"album_artist": album_artist} if album_artist else {})
+        untagged = _untagged_count(store, "album", **scope)
+        if untagged > 0:
+            cached.append({"album": "", "count": untagged, "label": "[No Album]",
+                           "artist": artist or "", "album_artist": "" if artist else album_artist or ""})
         _cache_set(cache_key, cached)
     return _etag_response(request, cache_key, cached)
 
@@ -856,8 +866,12 @@ async def list_genres(request: Request):
     cached = _cache_get("genres")
     if cached is None:
         store = get_store()
-        cached = store.aggregate_genres(primary_only=_dedup_on(store),
-                                        exclude=_hidden(store), swap=_swap(store))
+        # (a copy: the store's memoised list is served to Subsonic too)
+        cached = list(store.aggregate_genres(primary_only=_dedup_on(store),
+                                             exclude=_hidden(store), swap=_swap(store)))
+        untagged = _untagged_count(store, "genre")
+        if untagged > 0:
+            cached.append({"genre": "", "count": untagged, "label": "[No Genre]"})
         _cache_set("genres", cached)
     return _etag_response(request, "genres", cached)
 
