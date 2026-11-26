@@ -136,9 +136,10 @@ function currentFolderAffectedBy(dirs) {
   return false;
 }
 
-// Cheap "did the folder change?" check for the in-place refresh: same length
-// and same track ids in the same order (and the same offline marks) ⇒ nothing
-// to re-render.
+// [folder-refresh:begin] — tests/js/folder_refresh.test.mjs runs this region as is
+// Cheap "did the folder change shape?" check for the in-place refresh: same
+// length and same track ids in the same order (and the same offline marks).
+// The fields can still differ — see _sameRow.
 function _sameTrackList(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
@@ -148,18 +149,121 @@ function _sameTrackList(a, b) {
   return true;
 }
 
-async function refreshCurrentFolderInPlace() {
-  if (!_currentBrowsePath) return;
-  const wrap = document.getElementById('track-list-wrap');
-  const scrollY = wrap ? wrap.scrollTop : 0;
-  const path = _currentBrowsePath, rec = _currentBrowseRecursive;
-  try {
-    await showFolder(path, rec, { quiet: true });   // no skeleton flash, no re-schedule
-  } catch (_) { return; }
-  // Restore scroll after the new rows paint (best-effort; the windowed
-  // recursive view manages its own scroll and may land at top — acceptable).
-  if (wrap) requestAnimationFrame(() => { try { wrap.scrollTop = scrollY; } catch (_) {} });
+// Values the page learnt LIVE that the server's cached folder rows don't follow
+// (those writes don't re-shape them): a problem report or an unplayable mark
+// (health.js / ``track_updated`` → patchTrack) and a render-only row's length
+// learnt by playing or probing it (patchTrackDuration) — id → { field: value }.
+// Folder rows get them as they arrive (_keepLive), so a re-read neither puts
+// the cached value back nor counts it as a change; a value is forgotten once
+// the server's row says the same, and the server's word counts again.
+const _LIVE_FIELDS = new Set(['health', 'health_note', 'health_by', 'health_at', 'health_renderer',
+                              'defect', 'defect_detail', 'defect_renderer', 'defect_at', 'duration']);
+const _liveVals = new Map();
+function _recordLive(id, fields) {
+  if (!id || !fields) return;
+  let rec = null;
+  for (const k of Object.keys(fields)) {
+    if (!_LIVE_FIELDS.has(k)) continue;
+    rec = rec || _liveVals.get(id) || {};
+    rec[k] = fields[k];
+  }
+  if (rec) _liveVals.set(id, rec);
 }
+
+const _sameVal = (a, b) => {
+  a = a ?? null; b = b ?? null;
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+};
+
+// The page's live values onto folder rows just read (in place; returns them).
+// Once per row object: a second pass must not read the page's own value back
+// as "the server caught up".
+const _liveSeen = new WeakSet();
+function _keepLive(rows) {
+  if (!_liveVals.size || !Array.isArray(rows)) return rows;
+  for (const r of rows) {
+    if (!r || typeof r !== 'object' || _liveSeen.has(r)) continue;
+    _liveSeen.add(r);
+    const rec = _liveVals.get(r.id);
+    if (!rec) continue;
+    for (const k of Object.keys(rec)) {
+      if (_sameVal(r[k], rec[k])) delete rec[k];   // the server caught up
+      else r[k] = rec[k];
+    }
+    if (!Object.keys(rec).length) _liveVals.delete(r.id);
+  }
+  return rows;
+}
+
+// Does the row on screen (``shown``) still say what the server's fresh row
+// (after _keepLive) says?  Every field of the fresh row is compared (folder
+// rows are whole track records, so a cleared field comes back empty rather
+// than missing); a field only the shown row has (set on the page) is not.
+// Missing and null are equal.
+function _sameRow(fresh, shown) {
+  if (!fresh || !shown || fresh.id !== shown.id) return false;
+  if (offlineKind(fresh) !== offlineKind(shown)) return false;
+  for (const k of Object.keys(fresh)) if (!_sameVal(fresh[k], shown[k])) return false;
+  return true;
+}
+
+// Every chunk ``fresh`` (a windowed store) holds says what ``shown``'s chunk of
+// the same index says — and ``shown`` has each of them.
+function _sameChunks(fresh, shown) {
+  for (const [c, arr] of fresh._chunks) {
+    const old = shown._chunks.get(c);
+    if (!old || old.length !== arr.length) return false;
+    for (let j = 0; j < arr.length; j++) if (!_sameRow(arr[j], old[j])) return false;
+  }
+  return true;
+}
+// [folder-refresh:end]
+
+// Re-read the open folder in place (a scan finished in it, an admin pass
+// changed tags, availability changed): an unchanged folder repaints nothing, a
+// changed one is repainted keeping the user's place (showFolder({quiet})).
+// One refresh at a time, like All Tracks': a request arriving meanwhile runs
+// once more after it (up to twice), and one for a folder the user opened
+// meanwhile runs for that folder — so a change isn't lost behind a refresh.
+// [folder-quiet:begin] — tests/js/folder_refresh.test.mjs runs this region as is
+let _folderRun = null, _folderAgain = false;
+function refreshCurrentFolderInPlace() {
+  if (!_currentBrowsePath) return Promise.resolve();
+  if (_folderRun) { _folderAgain = true; return _folderRun; }
+  _folderRun = (async () => {
+    let moved = false;
+    try {
+      for (let i = 0; i < 3; i++) {                    // (bounded: a refresh can't chase itself)
+        _folderAgain = false;
+        const path = _currentBrowsePath, rec = _currentBrowseRecursive;
+        if (path == null) break;                       // the user went elsewhere
+        const wrap = document.getElementById('track-list-wrap');
+        const scrollY = wrap ? wrap.scrollTop : 0;
+        try {
+          await showFolder(path, rec, { quiet: true }); // no skeleton flash, no re-schedule
+        } catch (_) { break; }
+        // A list rendered anew at the top (a windowed folder whose size changed,
+        // or a list whose rows weren't on screen to keep place by): put the
+        // scroll offset back.  Every other quiet render keeps the user's place
+        // itself — by track — and is left alone.
+        if (wrap && scrollY > 0 && wrap.scrollTop === 0) {
+          requestAnimationFrame(() => {
+            try { if (_currentBrowsePath === path && wrap.scrollTop === 0) wrap.scrollTop = scrollY; } catch (_) {}
+          });
+        }
+        if (_currentBrowsePath !== path) { moved = _folderAgain && _currentBrowsePath != null; break; }
+        if (!_folderAgain) break;
+      }
+    } finally {
+      _folderRun = null;                               // (in the same step as the last check)
+    }
+    if (moved) await refreshCurrentFolderInPlace();    // asked for the folder now open
+  })();
+  return _folderRun;
+}
+// [folder-quiet:end]
 
 // ── Refresh All Tracks in place ───────────────────────────────────────────────
 // The library changed under an open All-Tracks list (a scan finished, the page
@@ -5540,9 +5644,9 @@ async function showFolder(path, recursive = false, opts = {}) {
     }
     const windowed   = first && !Array.isArray(first) && typeof first.total === 'number';
     const total      = windowed ? Number(first.total) : (Array.isArray(first) ? first.length : 0);
-    const firstChunk = windowed
+    const firstChunk = _keepLive(windowed
       ? (Array.isArray(first.tracks) ? first.tracks : [])
-      : (Array.isArray(first) ? first : []);
+      : (Array.isArray(first) ? first : []));
     if (_gen !== _browseNavGen) return;   // superseded by a newer view (or nav during a quiet refresh)
 
     // Branch-folder case: the clicked directory has no DIRECT audio
@@ -5569,8 +5673,15 @@ async function showFolder(path, recursive = false, opts = {}) {
       const rows = folderSorted
         ? _sortRows(firstChunk, sortKey, sortAsc)
         : firstChunk;
-      if (opts.quiet && _sameTrackList(rows, currentTracks)) return;
-      renderTracks(rows);
+      if (opts.quiet) {
+        // An in-place refresh: nothing to repaint when the same tracks come
+        // back in the same order saying the same things; otherwise (a re-tag,
+        // an enrichment pass, tracks that came or went) the rows are repainted
+        // keeping the user's place — scroll offset, selection and keyboard row
+        // follow their tracks.  (The rows carry the page's live values: _keepLive.)
+        if (_sameTrackList(rows, currentTracks) && rows.every((t, i) => _sameRow(t, currentTracks[i]))) return;
+      }
+      renderTracks(rows, { keepScroll: !!opts.quiet });
       if (!opts.quiet) _scheduleBackgroundRefresh(path);
       return;
     }
@@ -5637,7 +5748,7 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
   }
   if (_gen !== _browseNavGen) return;   // superseded by a newer view (or nav during a quiet refresh)
   const total      = Number(firstRes?.total || 0);
-  const firstChunk = Array.isArray(firstRes?.tracks) ? firstRes.tracks : [];
+  const firstChunk = _keepLive(Array.isArray(firstRes?.tracks) ? firstRes.tracks : []);
 
   // Silent, size-gated drill-down freshness: skip in-place refreshes
   // (opts.quiet) and huge static archive subtrees (modarchive) whose recursive
@@ -5645,11 +5756,6 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
   if (!opts.quiet && total > 0 && total <= FRESHNESS_MAX_TRACKS) {
     _scheduleBackgroundRefresh(path);
   }
-
-  // On a silent in-place refresh, skip the windowed rebuild (and its scroll
-  // reset) when the subtree's total is unchanged — the common "nothing new"
-  // case.  A same-count add+remove is rare and caught by the next real scan.
-  if (opts.quiet && currentTracks && currentTracks._total === total) return;
 
   if (total === 0) {
     // Truly nothing under this subtree — render standard empty state.
@@ -5665,7 +5771,7 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const j = await r.json();
     if (!Array.isArray(j?.tracks)) throw new Error('not a track page');
-    return j.tracks;
+    return _keepLive(j.tracks);           // (the page's live values: every chunk, now or later)
   };
   const store = createWindowedStore(total, fetcher);
   // Preload chunk 0 from the first response so ``fetchChunk(0)``
@@ -5676,14 +5782,51 @@ async function _showFolderRecursiveWindowed(path, opts = {}, recursive = true, p
   // away from must NOT overwrite the new view — this is what let a slow initial
   // All-Tracks chunk repaint tracks over a just-restored Scene-groups list.
   store.setOnChunkLoad(() => { if (currentTracks === store) _vsRender(true); });
-  // Reset scroll + selection — the indexes the user was looking at no
-  // longer point at the same tracks.
-  _selected.clear();
-  _lastClickIdx = -1;
-  _focusedIdx = -1;
-  const wrap = document.getElementById('track-list-wrap');
-  if (wrap) wrap.scrollTop = 0;
-  renderTracks(store);
+  // A silent in-place refresh of a list of the same size: read the rows on
+  // screen again and compare them with what they show.  Unchanged → nothing is
+  // repainted (rows off screen are read again when scrolled to, so a row that
+  // changed there doesn't come back stale); changed (a re-tag, an enrichment
+  // pass, a same-count add + remove) → the new list replaces the old one in
+  // place: same scroll offset, selection and keyboard row.  (Every chunk read
+  // carries the page's live values: _keepLive.)  A read of the rows on screen that fails keeps
+  // them as they are (a selected row whose read failed off screen is no longer
+  // selected after the swap).
+  const old = currentTracks;
+  const inPlace = !!(opts.quiet && old && old._isWindowedStore && old._total === total);
+  if (inPlace) {
+    const win = () => [Math.floor(_vsStart / CHUNK_SIZE), Math.floor(Math.max(_vsStart, _vsEnd - 1) / CHUNK_SIZE)];
+    // (the chunks on screen, and — so the selection and the keyboard row carry
+    // over — those of the selected rows, bounded as in showAll)
+    let [first, last] = win();
+    const held = new Set([..._selected, _focusedIdx].filter((i) => i >= 0 && i < total)
+      .map((i) => Math.floor(i / CHUNK_SIZE)).filter((c) => c < first || c > last));
+    [...held].slice(0, MAX_CHUNKS - 2).forEach((c) => store.ensureRange(c * CHUNK_SIZE, c * CHUNK_SIZE + 1));
+    // The window is read again after each wait — the user may have scrolled
+    // meanwhile: one more read for rows that came on screen, then give up.
+    for (let round = 0; ; round++) {
+      store.ensureRange(_vsStart, Math.min(total, Math.max(_vsEnd, _vsStart + 1)));
+      await Promise.all([...store._pending.values()]);
+      if (_gen !== _browseNavGen || currentTracks !== old) return;   // the user moved on
+      [first, last] = win();
+      let missing = false;
+      for (let c = first; c <= last; c++) if (!store._chunks.has(c)) missing = true;
+      if (!missing) break;
+      if (round >= 1) return;
+    }
+    if (_sameChunks(store, old)) {
+      for (const c of [...old._chunks.keys()]) if (!store._chunks.has(c)) old._chunks.delete(c);
+      return;
+    }
+  } else {
+    // Reset scroll + selection — the indexes the user was looking at no
+    // longer point at the same tracks.
+    _selected.clear();
+    _lastClickIdx = -1;
+    _focusedIdx = -1;
+    const wrap = document.getElementById('track-list-wrap');
+    if (wrap) wrap.scrollTop = 0;
+  }
+  renderTracks(store, { keepScroll: inPlace });
   // Same endpoint + params as the chunk fetcher above, so the player's queue is
   // exactly this listing (stubs, remote paths, the dedup setting) — in folder
   // order for sequential play, or as its seeded permutation for shuffle.
@@ -5999,7 +6142,10 @@ async function _probeVisibleAdlibDurations() {
     if (!(sec > 0)) continue;
     patchTrackDuration(id, sec);          // updates the visible cell + currentTracks[idx]
     const t = refs.get(id);               // also catch a row scrolled away before the reply
-    if (t && Math.abs((+t.duration || 0) - sec) >= 0.5) t.duration = sec;  // probe result is authoritative
+    if (t && Math.abs((+t.duration || 0) - sec) >= 0.5) {
+      t.duration = sec;                   // probe result is authoritative
+      _recordLive(id, { duration: sec });
+    }
   }
 }
 
@@ -6030,6 +6176,7 @@ function patchTrackDuration(id, seconds, subsong = null) {
   if (!t || t.id !== id || !isRenderOnlyDuration(t)) return;
   const cur = (+t.duration) || 0;
   if (Math.abs(seconds - cur) < 0.5) return;   // already the right value — no-op
+  _recordLive(id, { duration: seconds });      // (a folder re-read keeps it: _keepLive)
   t.duration = seconds;
   const durTd = row.cells[9];             // col-dur
   if (durTd) {
@@ -6046,14 +6193,15 @@ function patchTrackDuration(id, seconds, subsong = null) {
 // is not re-fetched, re-sorted or re-entered, so the scroll position, the nav
 // token and the view flags stay as they are — and the edited row stays where it
 // is even when it no longer fits the list (renamed out of an album drill, a
-// sorted column).  (The folder view's own in-place refresh can't do this: it
-// keeps its rows when the track ids are unchanged.)  With no track rows on
+// sorted column).  (A folder's in-place refresh — refreshCurrentFolderInPlace —
+// re-reads the listing; this needs no request.)  With no track rows on
 // screen — a group list (Albums, Artists, …), or an empty drill / search — an
 // edit to any of _GROUPING_FIELDS re-reads a view that can re-open itself, in
 // place (reloadCurrentView keeps its scroll + filter).
 const _GROUPING_FIELDS = ['artist', 'album_artist', 'album', 'genre', 'year'];
 function patchTrack(id, fields) {
   if (!id || !fields || typeof fields !== 'object') return;
+  _recordLive(id, fields);                // (a problem report / mark: a folder re-read keeps it)
   const list = currentTracks;
   if (!list || !list.length) {
     if (_viewReload && _GROUPING_FIELDS.some((k) => k in fields)) reloadCurrentView();
