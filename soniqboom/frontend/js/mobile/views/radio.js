@@ -69,6 +69,12 @@ function _canPlayDirect(url, stream) {
   return true;
 }
 
+// The tuner's state for each MobileRadio.status: [data-state, the VFD's word].
+const TUNER_STATE = {
+  live: ['live', 'LIVE'], paused: ['paused', 'PAUSE'], tuning: ['tuning', 'TUNING'],
+  buffering: ['buffering', 'BUFFER'], reconnecting: ['reconnecting', 'RECONNECT'],
+};
+
 export function mountRadio(root, ctx) {
   let tab = 'favorites';                 // 'favorites' | 'scene' | 'browse'
   let loadGen = 0;                       // the latest load / search; older answers are dropped
@@ -283,7 +289,8 @@ export function mountRadio(root, ctx) {
   }
 
   // ── Tuner ───────────────────────────────────────────────────────────────
-  // The display: the station on air, LIVE / PAUSE, its codec; the
+  // The display: the station on air, LIVE / PAUSE (TUNING while it comes up,
+  // BUFFER / RECONNECT while it recovers — MobileRadio.status), its codec; the
   // needle at the station's place in the list shown (outside it: its place by
   // name hash, so it still moves from station to station).
   function paintTuner() {
@@ -294,8 +301,10 @@ export function mountRadio(root, ctx) {
     const best = (st.streams || [])[0] || {};
     nowCodec.textContent = [best.codec, best.bitrate ? `${best.bitrate}k` : ''].filter(Boolean).join(' ').toUpperCase();
     const playing = MobileRadio.playing;
-    nowEl.dataset.state = playing ? 'live' : 'paused';
-    nowState.textContent = playing ? 'LIVE' : 'PAUSE';
+    const status = MobileRadio.status;
+    const word = TUNER_STATE[status] || TUNER_STATE.paused;
+    nowEl.dataset.state = status === 'live' && !playing ? 'paused' : word[0];
+    nowState.textContent = status === 'live' && !playing ? 'PAUSE' : word[1];
     nowPlay.textContent = playing ? '\u23F8\uFE0E' : '\u25B6\uFE0E';
     nowPlay.setAttribute('aria-label', playing ? 'Pause' : 'Play');
     const at = shown.findIndex((x) => x && x.sid === st.sid);
@@ -309,6 +318,11 @@ export function mountRadio(root, ctx) {
     needle.style.setProperty('--f', (0.04 + 0.92 * f).toFixed(4));
   }
   nowPlay.addEventListener('click', () => MobileRadio.toggle());
+  // The station dropped and its reconnects ran out: it stopped (like the
+  // desktop, a temporary outage — nothing is marked).
+  MobileRadio.on('lost', (st) => {
+    ctx.toast(`${(st && st.name) || 'The station'} is unavailable right now \u2014 it may be temporary. Try again later.`, 'error');
+  });
   root.querySelector('#radio-now-stop').addEventListener('click', () => MobileRadio.stop());
   MobileRadio.on('state', paintTuner);
 

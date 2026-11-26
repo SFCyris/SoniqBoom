@@ -855,12 +855,33 @@ def drop_aof_prefix(aof_path: Path, size: int) -> None:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+# Store config key: the library was emptied by its own deletes —
+# ``{"at": epoch seconds}`` (``TrackStore._note_emptied``; removed by the next
+# track added, ``_note_filled``).  Old versions ignore it (and fall back to
+# the ``.bak`` as before).
+LIBRARY_EMPTIED = "library_emptied"
+
+
+def emptied_on_purpose(state: Any) -> bool:
+    """Does the snapshot ``state`` hold a library emptied by its own deletes
+    (store config ``LIBRARY_EMPTIED`` — every folder removed, every file
+    deleted) rather than one written empty by mistake?"""
+    if not isinstance(state, dict) or state.get("tracks"):
+        return False
+    cfg = state.get("config")
+    return isinstance(cfg, dict) and isinstance(cfg.get(LIBRARY_EMPTIED), dict)
+
+
 def load_snapshot(data_dir: Path) -> dict:
     """Load the most recent snapshot from disk.
 
     Falls back to .bak if the primary is missing, corrupt, **or empty**
     while the backup has actual data (safety net against a bad merge or
-    shutdown writing an empty state over a populated snapshot).
+    shutdown writing an empty state over a populated snapshot) — unless the
+    empty primary was emptied on purpose (``emptied_on_purpose``: the
+    library's own deletes left no track; the ``.bak`` is the library from
+    before them, and the playlists and settings changed since are only in
+    the primary).
 
     Returns an empty state dict if neither file exists.
     """
@@ -878,6 +899,11 @@ def load_snapshot(data_dir: Path) -> dict:
         if primary_tracks > 0:
             log.info("Loaded snapshot from %s (%d tracks)", primary.name, primary_tracks)
             _last_loaded_from = primary
+            return primary_state
+
+        if emptied_on_purpose(primary_state):
+            log.info("Loaded snapshot from %s (0 tracks — the library was emptied on purpose)",
+                     primary.name)
             return primary_state
 
         # Primary loaded but has 0 tracks — check backup before accepting.
@@ -1062,6 +1088,17 @@ def _entry_undo(state: dict, entry: dict):
     if op == "move_user_data":
         uids = [entry.get("src"), entry.get("dst")]
         return [kv("play_stats", uids), kv("history", uids)]
+    if op == "store_waveforms":
+        data = entry.get("data")
+        return [kv("waveforms", list(data) if isinstance(data, dict) else [])]
+    if op == "forget_waveforms":
+        return [kv("waveforms", list(entry.get("ids", [])))]
+    if op == "clear_waveforms":
+        wf = state.get("waveforms")
+        return [kv("waveforms", list(wf) if isinstance(wf, dict) else [])]
+    if op == "store_hash_lookups":
+        data = entry.get("data")
+        return [kv("hash_lookups", list(data) if isinstance(data, dict) else [])]
     if op == "delete_user_data":
         return [kv("play_stats", [entry.get("uid")]), kv("history", [entry.get("uid")])]
     return None
@@ -1288,15 +1325,38 @@ def forget_derived_caches(store, *, drop_browse_disk: bool = False) -> None:
 
 def _build_search_indexes_after(store) -> None:
     """Start building the search indexes ``rebuild_indexes(defer_search=True)``
-    left to build — on the running loop, else (no loop: a tool) at once."""
+    left to build — on the running loop, else (no loop: a tool) at once —
+    then, on a big library, freeze the heap once more
+    (``store.freeze_long_lived_heap``), then build the composer identities
+    (``TrackStore.composer_index_async``)."""
     import asyncio
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         store._sx_ensure()
         return
-    store._sx_task = loop.create_task(store.build_search_indexes_async(),
-                                      name="search-indexes")
+
+    async def _build() -> None:
+        await store.build_search_indexes_async()
+        try:
+            # The search indexes are millions of small sets built after the
+            # start's heap freeze: move them out of the cyclic GC's
+            # generations too (a big library only), or every full collection —
+            # the composer rebuilds after writes trigger them — walks them on
+            # the loop (measured at 510K tracks: ~190 ms a pass, ~40 ms after;
+            # the freeze itself, once, ~150 ms).
+            from soniqboom.core.store import FREEZE_AFTER_UPSERTS, freeze_long_lived_heap
+            if store.track_count() >= FREEZE_AFTER_UPSERTS:
+                freeze_long_lived_heap("the search indexes")
+        except Exception:                               # noqa: BLE001
+            log.debug("heap freeze after the search indexes failed", exc_info=True)
+        try:
+            # (then the composer identities — off the loop — so the first
+            # Scene / Artists view of the start doesn't wait for them)
+            await store.composer_index_async()
+        except Exception:                               # noqa: BLE001
+            log.debug("composer identities not built after the start", exc_info=True)
+    store._sx_task = loop.create_task(_build(), name="search-indexes")
 
 
 def populate_store(state: dict) -> None:
@@ -1621,18 +1681,20 @@ def _write_snapshot_locked(data_dir: Path, store, consume_aof: bool, aof_writer,
     mark = aof_mark(consumed) if consumed else None     # (hashing: off the loop)
     count_held = consume_aof and aof_writer is not None
 
-    def _encode() -> tuple[int, int, str]:
+    def _encode() -> tuple[int, int, bool, str]:
         held_back = aof_writer.buffer_depth if count_held else 0   # written to the store already
         state = store.to_snapshot()
         if mark is not None:
             state[AOF_MARK] = mark
-        return held_back, len(state.get("tracks", {})), encode_state(state)
+        return (held_back, len(state.get("tracks", {})), emptied_on_purpose(state),
+                encode_state(state))
 
     t0 = time.monotonic()
-    held_back, new_count, text = _call_on_loop(loop, _encode)
+    held_back, new_count, emptied, text = _call_on_loop(loop, _encode)
 
-    # Refuse to overwrite a populated snapshot with an empty one.
-    if new_count == 0 and primary.exists():
+    # Refuse to overwrite a populated snapshot with an empty one — unless the
+    # library was emptied on purpose (its own deletes, ``emptied_on_purpose``).
+    if new_count == 0 and not emptied and primary.exists():
         old = _try_load_json(primary)
         old_count = len(old.get("tracks", {})) if isinstance(old, dict) else 0
         if old_count > 0:

@@ -291,11 +291,9 @@ def library(tmp_path, monkeypatch, tmp_data_dir):
     from soniqboom.core import store as store_mod
     from soniqboom.core.store import TrackStore
     monkeypatch.setattr(store_mod, "_store", TrackStore())
-    # A ``_run_scan`` called directly that raises or is cancelled mid-way
-    # never reaches its bookkeeping (``_drain_scan_queue`` cleans up after
-    # the real scan task): its scan count and running flag would outlive the
-    # test (every later scan counted as concurrent, getScanStatus reporting
-    # a scan forever).
+    # No scan counts as running when a test starts, and what a test leaves
+    # counted is put back after it (every later scan would count as
+    # concurrent, getScanStatus would report a scan forever).
     monkeypatch.setattr(scanner, "_scan_count", 0)
     monkeypatch.setattr(scanner, "_progress", scanner.ScanProgress())
     stats = {"full": 0, "incr": 0, "agg": 0}
@@ -336,7 +334,7 @@ def _scope(root, *rel):
 
 
 @pytest.mark.asyncio
-async def test_scoped_scan_adds_updates_and_prunes_only_what_changed(library):
+async def test_scoped_scan_adds_updates_and_prunes_only_what_changed(library, monkeypatch):
     root, store, stats = library
     assert await scanner._run_scan([str(root)]) is True
     assert _paths(store) == ["A/one.wav", "A/two.wav", "B/three.mod"]
@@ -356,8 +354,16 @@ async def test_scoped_scan_adds_updates_and_prunes_only_what_changed(library):
     assert stats["incr"] == 1 and stats["full"] == 0 and stats["agg"] >= 1
     assert store._scan_dirs[str(root)]["track_count"] == 3     # stored count, recounted
 
-    # A whole deleted folder
+    # A whole deleted folder: missing for now (an unmounted drive inside the
+    # library folder looks the same) — kept as unavailable, deleted once a
+    # later scan still finds it missing ``ABSENT_GRACE_S`` after the first
+    # (``scanner._settle_orphans``; 2.3.0 — before, deleted at once).
     shutil.rmtree(root / "A")
+    assert await scanner._run_scan([str(root)], scope=_scope(root, "A")) is False
+    assert _paths(store) == ["A/four.mod", "A/one.wav", "B/three.mod"]
+    assert sorted(os.path.relpath(store._tracks[t]["path"], str(root))
+                  for t in store._absent_ids) == ["A/four.mod", "A/one.wav"]
+    monkeypatch.setattr(scanner, "ABSENT_GRACE_S", 0)
     assert await scanner._run_scan([str(root)], scope=_scope(root, "A")) is True
     assert _paths(store) == ["B/three.mod"]
     assert store._scan_dirs[str(root)]["track_count"] == 1
@@ -449,9 +455,12 @@ async def test_case_only_rename_does_not_duplicate(library):
 
 
 @pytest.mark.asyncio
-async def test_folder_delete_finds_subfolders_without_the_hash_lookup_table(library):
-    """``_hash_lookups`` is persisted only by the clean-shutdown snapshot —
-    after a crash it can miss folders; the scoped prune must not need it."""
+async def test_folder_delete_finds_subfolders_without_the_hash_lookup_table(library, monkeypatch):
+    """``_hash_lookups`` was persisted only by the clean-shutdown snapshot
+    before 2.3.0 — after a crash it could miss folders; the scoped prune must
+    not need it.  (A deleted folder is kept as missing first: the prune comes
+    after ``ABSENT_GRACE_S`` — 0 here.)"""
+    monkeypatch.setattr(scanner, "ABSENT_GRACE_S", 0)
     root, store, _ = library
     for cd in ("CD1", "CD2"):
         (root / "A" / cd).mkdir()
@@ -459,7 +468,8 @@ async def test_folder_delete_finds_subfolders_without_the_hash_lookup_table(libr
     await scanner._run_scan([str(root)])
     store._hash_lookups.clear()
     shutil.rmtree(root / "A")
-    await scanner._run_scan([str(root)], scope=_scope(root, "A"))
+    await scanner._run_scan([str(root)], scope=_scope(root, "A"))       # (missing now)
+    await scanner._run_scan([str(root)], scope=_scope(root, "A"))       # (still: deleted)
     assert _paths(store) == ["B/three.mod"]
 
 
@@ -655,7 +665,7 @@ async def test_real_observer_reads_never_scan_and_a_new_file_scans_scoped(librar
         assert calls == [], f"reading files triggered a rescan: {calls}"
 
         make_mod(root / "B" / "new.mod")
-        for _ in range(100):
+        for _ in range(300):                         # (up to 30 s: FSEvents under a loaded full run)
             await asyncio.sleep(0.1)
             if calls and (scanner._scan_task is None or scanner._scan_task.done()):
                 break
@@ -1126,13 +1136,19 @@ async def test_folder_browse_rows_follow_an_in_place_retag(library):
 
 
 @pytest.mark.asyncio
-async def test_deleting_a_folder_that_only_holds_folders_prunes_them(library):
+async def test_deleting_a_folder_that_only_holds_folders_prunes_them(library, monkeypatch):
     root, store, _ = library
     (root / "Artist" / "Album").mkdir(parents=True)
     make_mod(root / "Artist" / "Album" / "x.mod")
     await scanner._run_scan([str(root)])
     assert "Artist/Album/x.mod" in _paths(store)
     shutil.rmtree(root / "Artist")
+    # (missing first — an unmounted drive looks the same — then, still
+    # missing ``ABSENT_GRACE_S`` later, deleted)
+    await scanner._run_scan([str(root)], scope=_scope(root, "Artist"))
+    tid = next(t for t, r in store._tracks.items() if r["path"].endswith("Artist/Album/x.mod"))
+    assert tid in store._absent_ids
+    monkeypatch.setattr(scanner, "ABSENT_GRACE_S", 0)
     await scanner._run_scan([str(root)], scope=_scope(root, "Artist"))
     assert "Artist/Album/x.mod" not in _paths(store)
 
@@ -2338,6 +2354,147 @@ async def test_window_closed_after_a_failing_commit(library, monkeypatch, how):
     assert names == _paths(store), "stale listing after an interrupted same-count commit"
 
 
+# ── A failed or cancelled scan counts itself down — and only itself ─────────
+
+async def _cb(_p):
+    pass
+
+
+def _scan_counters(monkeypatch, others: int, loud: int = 0) -> list:
+    """``others`` scans (a share's) counted running, ``loud`` of them with a
+    progress callback; the busy period and the scan task this test's own;
+    returns the scan-end frames sent from now on."""
+    monkeypatch.setattr(scanner, "_scan_count", others)
+    monkeypatch.setattr(scanner, "_progress", scanner.ScanProgress(total=5 * others,
+                                                                    running=bool(others)))
+    monkeypatch.setattr(scanner, "_loud_running", loud)
+    for name in ("_busy_loud", "_busy_changed", "_busy_shown"):
+        monkeypatch.setattr(scanner, name, False)
+    monkeypatch.setattr(scanner, "_busy_dirs", [])
+    monkeypatch.setattr(scanner, "_scan_task", None)
+    ends: list = []
+    real_send = scanner._send_scan_end
+
+    async def spy_send(end):
+        if end is not None:
+            ends.append(end)
+        await real_send(end)
+    monkeypatch.setattr(scanner, "_send_scan_end", spy_send)
+    return ends
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cb", [None, _cb], ids=["silent", "loud"])
+async def test_a_scan_failing_before_it_counted_itself_leaves_the_count_alone(
+        library, monkeypatch, caplog, cb):
+    root, store, _ = library
+    ends = _scan_counters(monkeypatch, 1, loud=1)            # (a share's scan is running)
+
+    async def boom(paths):
+        raise RuntimeError("resolve failed")
+    monkeypatch.setattr(scanner, "_resolve_all", boom)       # (before the scan counts itself)
+    with pytest.raises(RuntimeError):
+        await scanner._run_scan([str(root)], cb)
+    assert (scanner._scan_count, scanner._progress.running, scanner._loud_running) == (1, True, 1)
+    monkeypatch.setattr(scanner, "_scan_queue", [(frozenset({str(root)}), cb, None, False)])
+    await scanner._drain_scan_queue()                        # (its crash handler)
+    assert (scanner._scan_count, scanner._progress.running, scanner._loud_running) == (1, True, 1)
+    assert ends == [] and not scanner._busy_changed
+    assert caplog.text.count("Scan failed with unhandled error") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cb", [None, _cb], ids=["silent", "loud"])
+@pytest.mark.parametrize("others", [0, 1])
+@pytest.mark.parametrize("how", ["raise", "cancel", "raise in the queue"])
+async def test_a_failed_or_cancelled_scan_counts_itself_down(
+        library, monkeypatch, caplog, how, others, cb):
+    root, store, _ = library
+    await scanner._run_scan([str(root)])
+    os.rename(root / "A" / "one.wav", root / "A" / "uno.wav")
+    ends = _scan_counters(monkeypatch, others)               # (a share's scan running too)
+    began = asyncio.Event()
+    real_began = scanner._scan_began
+
+    def spy_began(c, dirs):
+        real_began(c, dirs)
+        began.set()
+    monkeypatch.setattr(scanner, "_scan_began", spy_began)
+    if how != "cancel":
+        def boom(*a, **k):
+            raise RuntimeError("commit failed")
+        monkeypatch.setattr(store, "upsert_tracks_batch", boom)
+    if how == "raise in the queue":
+        monkeypatch.setattr(scanner, "_scan_queue", [(frozenset({str(root)}), cb, None, False)])
+        task = asyncio.create_task(scanner._drain_scan_queue())
+    else:
+        task = asyncio.create_task(scanner._run_scan([str(root)], cb))
+    await asyncio.wait_for(began.wait(), 30)
+    assert scanner._scan_count == others + 1 and scanner._progress.running
+    assert scanner._loud_running == (cb is not None)
+    if how == "cancel":
+        task.cancel()
+    if how == "raise in the queue":
+        await asyncio.wait_for(task, 30)                     # (the queue survives it)
+    else:
+        with pytest.raises(asyncio.CancelledError if how == "cancel" else RuntimeError):
+            await asyncio.wait_for(task, 30)
+    assert scanner._scan_count == others, "a failed scan left counted (or counted down twice)"
+    assert scanner._progress.running is bool(others) and scanner._loud_running == 0
+    failed = how != "cancel"
+    assert ("Scan failed with unhandled error" in caplog.text) is failed
+    # A silent failure ending the busy period asks pages to re-read; a stop,
+    # or a scan with its own progress callback, sends nothing here.
+    assert len(ends) == (1 if failed and cb is None and others == 0 else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("others", [0, 1])
+async def test_a_scan_whose_last_progress_frame_fails_is_counted_down_once(
+        library, monkeypatch, others):
+    root, store, _ = library
+    await scanner._run_scan([str(root)])
+    os.rename(root / "A" / "one.wav", root / "A" / "uno.wav")
+    _scan_counters(monkeypatch, others)
+    seen = {"counted": False, "raised": False}
+
+    async def cb(_p):
+        if scanner._scan_count == others + 1:
+            seen["counted"] = True
+        elif seen["counted"]:                                # its last frame: counted down
+            seen["raised"] = True
+            raise RuntimeError("frame failed")
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(scanner._run_scan([str(root)], cb), 30)
+    assert seen["raised"]
+    assert (scanner._scan_count, scanner._loud_running) == (others, 0)
+    assert scanner._progress.running is bool(others)
+
+
+@pytest.mark.asyncio
+async def test_a_scan_of_an_earlier_server_run_leaves_the_new_runs_count_alone(library, monkeypatch):
+    root, store, _ = library
+    await scanner._run_scan([str(root)])
+    os.rename(root / "A" / "one.wav", root / "A" / "uno.wav")
+    _scan_counters(monkeypatch, 0)
+    began = asyncio.Event()
+    real_began = scanner._scan_began
+
+    def spy_began(c, dirs):
+        real_began(c, dirs)
+        began.set()
+    monkeypatch.setattr(scanner, "_scan_began", spy_began)
+    task = asyncio.create_task(scanner._run_scan([str(root)]))
+    await asyncio.wait_for(began.wait(), 30)
+    # A new server run (``begin_run`` reset the scan state) with a scan of its own …
+    monkeypatch.setattr(scanner, "_run_epoch", scanner._run_epoch + 1)
+    monkeypatch.setattr(scanner, "_scan_count", 1)
+    task.cancel()                                            # … and the old scan ends only now
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 30)
+    assert scanner._scan_count == 1
+
+
 @pytest.mark.asyncio
 async def test_drill_down_window_closed_after_raise(library, monkeypatch):
     from soniqboom.api import fstree
@@ -2612,7 +2769,8 @@ async def test_the_drill_down_reads_existing_tracks_from_the_cached_rows(library
         calls.append(r)
         return await real(r)
     monkeypatch.setattr(scanner, "get_track_ids_for_scan_root", spy)
-    (root / "B" / "three.mod").unlink()
+    (root / "B" / "keep.txt").write_text("the folder still holds something")
+    (root / "B" / "three.mod").unlink()             # (a deletion: its folder isn't empty)
     res = await scanner.refresh_subtree_under_root(str(root), str(root / "B"))
     assert calls == [] and res["removed"] == 1
 

@@ -223,7 +223,7 @@ def _fake_sid_env(monkeypatch, tmp_path):
     monkeypatch.setattr(stream, "_find_renderer", lambda *a: "sidplayfp")
     monkeypatch.setattr(
         stream, "_sid_render_cmd",
-        lambda binary, path, subsong, dur, out, mute=(), start=1:
+        lambda binary, path, subsong, dur, out, mute=(), start=1, stereo=False:
             [sys.executable, str(script), f"-t{int(dur)}", f"-w{out}", str(path)])
     monkeypatch.setattr(stream, "ensure_sid_vu_sidecar", lambda *a, **k: None)
     monkeypatch.setattr(stream, "_spawn_sid_vu", lambda *a, **k: None)

@@ -76,6 +76,9 @@ def lib(w, monkeypatch):
         return None
     monkeypatch.setattr(A, "_fill_remote_art_later", no_backfill)
     A._bg_resolved.clear()
+    # (a retro track's generated cover would stand in for "no cover" here:
+    # those rules are tests/test_retro_covers.py's)
+    monkeypatch.setattr(A.gen_cover, "enabled_now", lambda: False)
 
     def add(tid="t1", **kw):
         L.tracks[tid] = tr(tid, **kw)

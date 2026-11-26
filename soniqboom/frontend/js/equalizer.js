@@ -817,7 +817,7 @@ function toggle() {
 
 btnClose?.addEventListener('click', close);
 overlay?.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-// ReplayGain mode — off / per-track / per-album.  Player persists the choice
+// ReplayGain mode — off / per-track / per-album / auto.  Player persists the choice
 // and re-applies it to the current track immediately.
 if (rgSel) {
   rgSel.addEventListener('change', () => {

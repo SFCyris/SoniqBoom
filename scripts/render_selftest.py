@@ -3,7 +3,8 @@
 """Render self-test for the AdLib (adplay), KSS (kssrender), Dreamcast DSF
 (dsfrender), early DSIK (milkyrender), Musicline Editor (mlrender), X68000
 MDX (mdxrender), GoatTracker (gt2reloc → sidplayfp), FamiTracker (Furnace),
-libxmp (xmprender) and Sawteeth (sawteethrender) renderers.
+libxmp (xmprender), Sawteeth (sawteethrender) and MIDI (midirender: OPL3, OPN2
+— and MT-32 compiled in; no ROMs, so not rendered) renderers.
 
 Synthesizes a three-second id-Software IMF tune (an OPL2 voice, twelve
 notes), a three-second MSX KSS (a Z80 init routine that starts one PSG
@@ -13,8 +14,9 @@ a DSIK v1 module (one looped square-wave note), a Musicline Editor module
 song (one FM voice, eight notes on track A), a GoatTracker 2 song (eight
 sawtooth notes), a FamiTracker module (eight pulse notes) and a ProTracker
 module (eight notes on a square-wave sample — xmprender's check: libxmp
-loads and mixes it) and a Sawteeth song (two channels, eight sawtooth
-notes), renders
+loads and mixes it), a Sawteeth song (two channels, eight sawtooth
+notes) and a Standard MIDI file plus the same song as a DMX MUS (eight
+piano notes — midirender plays each on OPL3 and OPN2), renders
 each as the server does — AdLib at the OPL chip's own rate piped into
 ffmpeg's resampler when ffmpeg is found (``adlib_pipeline``, the same
 command as ``stream._adlib_cmd``; a test keeps them equal); a GoatTracker
@@ -25,7 +27,8 @@ can't read its format fails the build) and by the test suite.
 Usage: ``python scripts/render_selftest.py [--adplay PATH] [--kssrender PATH]
 [--dsfrender PATH] [--milkyrender PATH] [--mlrender PATH] [--mdxrender PATH]
 [--gt2reloc PATH] [--sidplayfp PATH] [--sunvoxrender PATH] [--furnace PATH]
-[--xmprender PATH] [--sawteethrender PATH] [--only NAME] [--examples DIR]`` (a renderer not given is looked up on PATH;
+[--xmprender PATH] [--sawteethrender PATH] [--midirender PATH] [--only NAME]
+[--examples DIR]`` (a renderer not given is looked up on PATH;
 one not found fails).
 
 sunvoxrender gets no synthesized project: without ``--examples`` it must
@@ -249,6 +252,37 @@ RESAMPLE_SOXR = "aresample=44100:resampler=soxr:precision=28:dither_method=trian
 RESAMPLE_SWR = "aresample=44100:filter_size=64:phase_shift=10:dither_method=triangular_hp"
 
 
+def _vlq(n: int) -> bytes:
+    out = [n & 0x7F]
+    n >>= 7
+    while n:
+        out.insert(0, 0x80 | (n & 0x7F))
+        n >>= 7
+    return bytes(out)
+
+
+def midi_tune() -> bytes:
+    """A type-0 Standard MIDI file: eight piano notes, a quarter second
+    each (120 bpm, 480 ticks a beat)."""
+    ev = bytearray(b"\x00\xff\x51\x03\x07\xa1\x20\x00\xc0\x00")
+    for n in (60, 64, 67, 72, 67, 64, 60, 55):
+        ev += b"\x00\x90" + bytes([n, 100]) + _vlq(240) + b"\x80" + bytes([n, 0])
+    ev += b"\x00\xff\x2f\x00"
+    return (b"MThd" + struct.pack(">IHHH", 6, 0, 1, 480) + b"MTrk"
+            + struct.pack(">I", len(ev)) + bytes(ev))
+
+
+def mus_tune() -> bytes:
+    """The same eight notes as a DMX MUS song (Doom's format: 140 ticks a
+    second)."""
+    score = bytearray(b"\x40\x00\x00")             # instrument 0 on channel 0
+    for n in (60, 64, 67, 72, 67, 64, 60, 55):
+        score += bytes([0x90, 0x80 | n, 100]) + _vlq(35) + bytes([0x00, n])
+    score += b"\x60"                                    # score end
+    return (b"MUS\x1a" + struct.pack("<HHHHHH", len(score), 18, 1, 0, 1, 0)
+            + struct.pack("<H", 0) + bytes(score))
+
+
 def sawteeth_tune() -> bytes:
     """A Sawteeth song (binary "SWTD", version 1200): two channels play one
     part — eight sawtooth notes, six ticks each, at 882 samples a tick
@@ -422,7 +456,7 @@ def goat_convert(gt2reloc: str, song: str, work: str) -> "tuple[str | None, str]
 
 def main() -> int:
     names = ("adplay", "kssrender", "dsfrender", "milkyrender", "mlrender", "mdxrender",
-             "gt2reloc", "sunvoxrender", "furnace", "xmprender", "sawteethrender")
+             "gt2reloc", "sunvoxrender", "furnace", "xmprender", "sawteethrender", "midirender")
     ap = argparse.ArgumentParser()
     for name in names + ("sidplayfp",):
         ap.add_argument(f"--{name}")
@@ -506,6 +540,28 @@ def main() -> int:
                          min_db=NOTES_DB)
             if err:
                 errors.append(err)
+        if wanted("midirender"):
+            for label, name, tune in (("MIDI", "selftest.mid", midi_tune()),
+                                      ("DMX MUS", "selftest.mus", mus_tune())):
+                src = os.path.join(tmp, name)
+                with open(src, "wb") as fh:
+                    fh.write(tune)
+                for synth in ("opl3", "opn2"):
+                    out = os.path.join(tmp, f"midi-{synth}.wav")
+                    err = render(f"midirender ({label} on {synth.upper()})",
+                                 [found["midirender"], "-s", synth, src, out], out,
+                                 min_db=-45.0)     # (one FM piano voice peaks near -30 dBFS)
+                    if err:
+                        errors.append(err)
+            try:
+                listed = subprocess.run([found["midirender"], "-L"], capture_output=True,
+                                        timeout=30).stdout.decode(errors="replace")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                listed = str(exc)
+            if "mt32" not in (listed.splitlines() or [""])[0]:
+                errors.append("midirender: built without MT-32 (libmt32emu)")
+            else:
+                print("midirender: ok — MT-32 compiled in")
         examples = sorted(os.listdir(a.examples)) if a.examples else []
 
         def goat(label: str, song: str) -> None:
@@ -555,7 +611,7 @@ def main() -> int:
         if wanted("furnace"):
             home = tempfile.mkdtemp(prefix="home", dir=tmp)     # (Furnace writes a config there)
             env = {**{k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"},
-                   "HOME": home}                         # (XDG_CONFIG_HOME would come first)
+                   "HOME": home, "CFFIXED_USER_HOME": home}   # (XDG_CONFIG_HOME would come first)
 
             def furnace(label: str, song: str) -> None:
                 out = os.path.join(tmp, "furnace.wav")

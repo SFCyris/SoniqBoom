@@ -38,7 +38,7 @@ export const SUPPORTED_OPS = new Set([
   'length', 'added', 'rating', 'plays', 'played',
   'folder', 'path', 'group', 'party', 'status', 'composer', 'title',
   'lossless', 'bitdepth', 'samplerate', 'bitrate', 'source',
-  'bpm', 'tunes', 'chip', 'dup', 'channels', 'has',
+  'bpm', 'tunes', 'chip', 'dup', 'channels', 'has', 'place', 'compo',
 ]);
 
 // The scope keys, in order: [key, label, operator].

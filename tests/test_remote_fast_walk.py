@@ -12,6 +12,7 @@ folder, POSIX folder mtimes) and an in-memory source on the base-class walk
 (the walk SMB uses)."""
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import struct
@@ -148,6 +149,14 @@ async def _poll(sh, *, fast: bool) -> tuple[dict, int]:
     n0 = sh.listings()
     cap = (time.time() - 15 * 60) if fast else None
     plan = await scanner.start_remote_scan("", sh.root, sh.src, dir_mtime_cap=cap)
+    # The folder-art warm-up runs as a background task the scan does not
+    # wait for.  Wait for it here so whatever it lists counts against this
+    # poll, every time, instead of landing in this poll or the next at random.
+    # (only this loop's tasks: another test's may sit on a closed loop; a
+    # warm-up that crashes or hangs fails the test instead of hiding)
+    loop = asyncio.get_running_loop()
+    await asyncio.wait_for(asyncio.gather(
+        *[t for t in scanner._art_prefetch_tasks if t.get_loop() is loop]), 30)
     return plan, sh.listings() - n0
 
 

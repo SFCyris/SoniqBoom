@@ -29,6 +29,7 @@ const BAR = { top: 748, bottom: 900, left: 0, width: 1440, height: 152 };   // 1
 function dock(barRect, { innerHeight = 900, observer = true, promptRect = null, atCentre = ['bar'],
                          hitTest = true } = {}) {
   const offer = { offer: true };
+  const closing = { closest: (sel) => (sel === '.pl-modal-out' ? closing : null) };   // a confirm dialog fading out
   const host = { style: { bottom: '24px' }, contains: (el) => el === offer };
   const bar = barRect && { getBoundingClientRect: () => barRect, contains: (el) => el === bar };
   const els = () => ({ 'player-bar': bar, 'sb-update-prompt': promptRect && { getBoundingClientRect: () => promptRect } });
@@ -37,7 +38,8 @@ function dock(barRect, { innerHeight = 900, observer = true, promptRect = null, 
   if (hitTest) {
     doc.elementsFromPoint = (x, y) => {
       hits.push([x, y]);
-      return atCentre.map((e) => (e === 'bar' ? bar : e === 'offer' ? offer : { other: e }));
+      return atCentre.map((e) => (e === 'bar' ? bar : e === 'offer' ? offer
+        : e === 'closing' ? closing : { other: e }));
     };
   }
   const observed = [];
@@ -88,6 +90,10 @@ test('with Settings or a dialog over the bar, toasts stay low (off the dialog)',
   d.setAtCentre(['bar']);                        // dialog closed: the next toast docks above the bar again
   d.api.again();
   assert.equal(d.host.style.bottom, '164px');
+});
+
+test('a confirm dialog fading out over the bar does not count as covering it', () => {
+  assert.equal(dock(BAR, { atCentre: ['closing', 'bar'] }).host.style.bottom, '164px');
 });
 
 test('an offer toast over the bar does not count as covering it', () => {

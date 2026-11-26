@@ -219,7 +219,11 @@ def test_formats_no_engine_plays_are_not_scanned():
     names = sorted(f.name for f in UNSUPPORTED.iterdir())
     assert names, "internal/testdata/unsupported is empty"
     for name in names:
-        assert not md.is_supported_music_name(name), name
+        if md.is_supported_music_name(name):
+            # (a suffix another format has too — PMD's ``.m`` is Ultima 6's
+            # AdLib suffix: scanned, refused by its content)
+            with pytest.raises(md.NotPlayableHere):
+                md.extract(UNSUPPORTED / name, "u")
 
 
 # ── Real renders ─────────────────────────────────────────────────────────────

@@ -7,7 +7,7 @@
 Provides Start / Restart / Stop / Quit from the system menu bar.
 Launched automatically by run.sh; can also be run standalone.
 
-Usage:  python3 soniqboom-menubar.py [PORT] [SCRIPT_DIR]
+Usage:  python3 soniqboom-menubar.py [PORT] [SCRIPT_DIR] [configured|--port]
 """
 from __future__ import annotations
 
@@ -98,8 +98,30 @@ def _kill_existing_instances(wait_seconds: float = 2.0) -> None:
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-PORT = sys.argv[1] if len(sys.argv) > 1 else "8080"
+def _configured_port() -> str:
+    """The port the server picks by itself (SONIQBOOM_PORT, ~/.soniqboom.env,
+    server.port in SoniqBoom.conf), or "8080" when soniqboom can't be imported
+    (this script run by a Python outside the install's venv)."""
+    try:
+        from soniqboom.config import settings
+        port = int(settings.port)
+        if 0 < port < 65536:
+            return str(port)
+    except Exception:                                   # noqa: BLE001
+        pass
+    return "8080"
+
+
+# run.sh passes the port and, third, "configured" when it came from
+# SONIQBOOM_PORT / SoniqBoom.conf rather than its --port.  Then — and when
+# started by hand with no arguments — Start / Restart leave the port to run.sh,
+# so a port changed in the conf takes effect (run.sh relaunches this menu bar
+# with the new one).  A port given without "configured" (an older run.sh, or
+# by hand) is pinned.
+PORT = sys.argv[1] if len(sys.argv) > 1 else _configured_port()
 SCRIPT_DIR = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(__file__).parent
+_PORT_ARGS = ([] if len(sys.argv) <= 1 or (len(sys.argv) > 3 and sys.argv[3] == "configured")
+              else ["--port", PORT])
 _DATA_DIR_ENV = os.environ.get("SONIQBOOM_DATA_DIR")
 DATA_DIR = Path(_DATA_DIR_ENV).expanduser() if _DATA_DIR_ENV else (
     Path.home() / "Library" / "Application Support" / "SoniqBoom"
@@ -567,7 +589,7 @@ class SoniqBoomMenuBar(rumps.App):
         if _is_running():
             rumps.notification("SoniqBoom", "", "Server is already running.")
             return
-        _run_script(RUN_SH, "--port", PORT)
+        _run_script(RUN_SH, *_PORT_ARGS)
         rumps.notification("SoniqBoom", "", "Server starting...")
 
     def restart_server(self, _sender):
@@ -575,10 +597,10 @@ class SoniqBoomMenuBar(rumps.App):
             # Previously this said "Server restarting..." even when nothing
             # was running — restart.sh then just starts a new instance, so
             # the message was technically wrong on a cold start.
-            _run_script(RUN_SH, "--port", PORT)
+            _run_script(RUN_SH, *_PORT_ARGS)
             rumps.notification("SoniqBoom", "", "Server starting...")
             return
-        _run_script(RESTART_SH, "--port", PORT)
+        _run_script(RESTART_SH, *_PORT_ARGS)
         rumps.notification("SoniqBoom", "", "Server restarting...")
 
     def stop_server(self, _sender):

@@ -146,3 +146,44 @@ async def test_purge_temp_title_fixup_uses_the_member_name(monkeypatch):
     assert s.get_track("real")["title"] == "tmpmachine"
     assert s.get_track("plain")["title"] == "tune"
     assert res["repaired_titles"] == 2
+
+
+# ── Amiga prefix names: the repair re-extract reads a file like the scan ──
+# A loose network-share module named in Amiga prefix form (``BP.commando``,
+# ``mdat.acieed1``) is only recognised under its real name: the repair wrote
+# it to a random ``tmpXXXX.commando`` and read an unknown file (no format, the
+# file name as title), while the scan names its temp file after the module.
+UADE = REPO / "internal/testdata/uade"
+_needs_uade = pytest.mark.skipif(
+    not UADE.is_dir() or not shutil.which("uade123"),
+    reason="needs uade123 and internal/testdata/uade")
+
+
+@_needs_uade
+@pytest.mark.parametrize("rel,src,want", [
+    ("sub/BP.commando", "BP SoundMon 2/commando - hiscore.bp", ("COMMANDOHI", "SoundMon 2.0")),
+    ("sub/mdat.acieed1", "mdat.acieed1", ("acieed1", "TFMX")),
+    ("sub/DW.carrier", "David Whittaker/carrier command.dw", ("carrier", "David Whittaker")),
+    ("pack.zip::mdat.acieed1.mdat", "mdat.acieed1", ("acieed1", "TFMX")),
+    ("pack.zip::SUB\\BP.commando.bp", "BP SoundMon 2/commando - hiscore.bp",
+     ("COMMANDOHI", "SoundMon 2.0")),
+])
+def test_repair_reads_an_amiga_prefix_named_file_like_the_scan(rel, src, want):
+    data = (UADE / src).read_bytes()
+    p = f"ftp://h/s:/a/{rel}"
+    _p, scan, *_ = scanner._extract_one_remote(data, p, "t")
+    assert not isinstance(scan, str), scan
+    got, err = repair._re_extract_remote_sync(data, p, "t")
+    assert err is None
+    assert (scan.title, scan.format) == want
+    assert (got["title"], got["format"]) == want
+    assert got["path"] == p and got["file_size"] == len(data)
+
+
+def test_repair_remote_extract_error_keeps_its_reason(monkeypatch):
+    def boom(*_a, **_k):
+        raise ValueError("unreadable")
+    monkeypatch.setattr(scanner, "extract", boom)
+    got, err = repair._re_extract_remote_sync(_xm(), "ftp://h/s:/a/x.zip::song.xm", "t")
+    assert got is None
+    assert err == "remote-error: ValueError: unreadable"

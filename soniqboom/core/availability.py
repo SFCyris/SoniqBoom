@@ -251,37 +251,45 @@ def _dead_roots(store) -> dict[str, tuple[str, str]]:
 
 class Snapshot:
     """Which roots are offline right now and which of their tracks still play
-    from a cached copy.  Immutable once built; ``unavailable`` is built on
+    from a cached copy — and which tracks of reachable roots are in a folder
+    that is missing for now (``absent``: ``store.ABSENT_FIELD``, a drive
+    unmounted inside a library folder — ``scanner._settle_orphans``; they count
+    as offline on a drive).  Immutable once built; ``unavailable`` is built on
     first use."""
 
-    __slots__ = ("seq", "dead", "paths", "ok", "_unavailable", "_store", "_lock", "_roots")
+    __slots__ = ("seq", "dead", "paths", "ok", "absent", "_unavailable", "_store", "_lock",
+                 "_roots")
 
     def __init__(self, seq: int, dead: dict[str, str], paths: dict[str, str],
-                 ok: frozenset, store) -> None:
+                 ok: frozenset, store, absent: frozenset = frozenset()) -> None:
         self.seq = seq
         self.dead = dead            # root hash → kind
         self.paths = paths          # root hash → root path
         self.ok = ok                # ids under dead roots that still play
+        self.absent = absent        # ids whose folder is missing for now
         self._unavailable: frozenset | None = None
         self._store = store
         self._lock = threading.Lock()
         self._roots: list | None = None          # ``state()``'s per-root rows, built once
 
     def __bool__(self) -> bool:
-        return bool(self.dead)
+        return bool(self.dead) or bool(self.absent)
 
     def kind_of(self, row) -> str | None:
         """``drive`` / ``share`` / ``catalogue`` when the track ``row`` (a
         track dict) can't play right now, else None.  O(1)."""
-        if not self.dead or not row:
+        if not row:
             return None
         try:
-            kind = self.dead.get(row.get("scan_root_hash"))
+            if self.dead:
+                kind = self.dead.get(row.get("scan_root_hash"))
+                if kind is not None:
+                    return None if row.get("id") in self.ok else kind
+            if self.absent and row.get("id") in self.absent:
+                return KIND_DRIVE
         except AttributeError:
             return None
-        if kind is None or row.get("id") in self.ok:
-            return None
-        return kind
+        return None
 
     @property
     def unavailable(self) -> frozenset:
@@ -297,6 +305,8 @@ class Snapshot:
                     ids = idx.get(h)
                     if ids:
                         parts.append(ids - self.ok if self.ok else ids)
+                if self.absent:
+                    parts.append(self.absent)
                 if not parts:
                     self._unavailable = frozenset()
                 elif len(parts) == 1:
@@ -441,9 +451,23 @@ def snapshot(store=None) -> Snapshot:
         store = get_store()
     dead = _dead_roots(store)
     sig = _signature(store, dead)
+    # The tracks of missing folders (``store._absent_ids``): their counter
+    # (``_absent_gen``) also moves with an index swap that installs the same
+    # ids — a new snapshot (a new token, every client re-reading) only when
+    # the ids themselves changed.
+    agen = getattr(store, "_absent_gen", 0)
+    absent = None
     with _state_lock:
-        if _memo["sig"] == sig and _memo["store"] is store and _memo["snap"] is not None:
-            return _memo["snap"]
+        snap0 = _memo["snap"]
+        if _memo["sig"] == sig and _memo["store"] is store and snap0 is not None:
+            if _memo.get("agen") == agen:
+                return snap0
+            absent = frozenset(getattr(store, "_absent_ids", None) or ())
+            if absent == snap0.absent:
+                _memo["agen"] = agen
+                return snap0
+    if absent is None:
+        absent = frozenset(getattr(store, "_absent_ids", None) or ())
     idx = getattr(store, "_tag_scan_root_hash", {}) or {}
     ok: set[str] = set()
     for h, (path, kind) in dead.items():
@@ -455,13 +479,17 @@ def snapshot(store=None) -> Snapshot:
         except Exception:                               # noqa: BLE001 — never fail a list
             log.debug("cached-copy lookup failed for %s", path, exc_info=True)
     with _state_lock:
-        if _memo["sig"] == sig and _memo["store"] is store and _memo["snap"] is not None:
-            return _memo["snap"]
+        cur = _memo["snap"]
+        if (_memo["sig"] == sig and _memo["store"] is store and cur is not None
+                and cur.absent == absent):
+            _memo["agen"] = agen
+            return cur
         _seq += 1
         snap = Snapshot(_seq, {h: k for h, (_p, k) in dead.items()},
                         {h: p for h, (p, _k) in dead.items()},
-                        frozenset(ok) if ok else _EMPTY_OK, store)
-        _memo.update(store=store, sig=sig, snap=snap)
+                        frozenset(ok) if ok else _EMPTY_OK, store,
+                        absent if absent else _EMPTY_OK)
+        _memo.update(store=store, sig=sig, snap=snap, agen=agen)
         for gone in [h for h in _members_memo if h not in dead]:
             _members_memo.pop(gone, None)
     return snap
@@ -638,7 +666,7 @@ def offline_marker(store=None) -> Callable[[dict], str | None] | None:
     if mode(store) == "show":
         return None
     snap = snapshot(store)
-    return snap.kind_of if snap.dead else None
+    return snap.kind_of if snap else None
 
 
 def mark_rows(rows, store=None, snap: Snapshot | None = None) -> list:
@@ -649,7 +677,7 @@ def mark_rows(rows, store=None, snap: Snapshot | None = None) -> list:
     if mode(store) == "show":
         return rows if isinstance(rows, list) else list(rows)
     snap = snap or snapshot(store)
-    if not snap.dead:
+    if not snap:
         return rows if isinstance(rows, list) else list(rows)
     out = []
     for r in rows:
@@ -665,7 +693,7 @@ def offline_kinds(ids: Iterable[str], store=None) -> dict[str, str]:
         from soniqboom.core.store import get_store
         store = get_store()
     snap = snapshot(store)
-    if not snap.dead:
+    if not snap:
         return {}
     tracks = store._tracks
     out: dict[str, str] = {}
@@ -777,7 +805,7 @@ def player_page(fetch: Callable[[int, int], list], offset: int, limit: int,
     page otherwise (``player_page_async`` re-anchors)."""
     from soniqboom.core import skip_rules
     snap = snapshot(store)
-    if mode(store) == "show" or not snap.dead:
+    if mode(store) == "show" or not snap:
         snap = None
     rules = _union("skip+", skip_rules.skip_ids(store) or None, _removing()[0])
     if snap is None and not rules:
@@ -828,7 +856,7 @@ def state(store=None) -> dict:
             "marks": skip_rules.marks_gen(),
             "tune_placeholders": skip_rules.placeholder_seconds(),
             "unavailable": (len(snap.unavailable) - (len(snap.unavailable & rm) if rm else 0))
-                           if snap.dead else 0,
+                           if snap else 0,
             "removing": rver,
             "roots": roots}
 

@@ -1,0 +1,26 @@
+{
+  "_note": "Hand-written in the shape IGDB v4 documents for POST /v4/games with 'fields name,alternative_names.name,platforms.name,platforms.abbreviation,cover.image_id,version_parent' (expanded fields come back as objects with their id). Not a captured answer: no IGDB credentials were available when it was written.",
+  "turrican_ii": [
+    {"id": 2734, "name": "Turrican II: The Final Fight",
+     "alternative_names": [{"id": 1, "name": "Turrican II"}, {"id": 2, "name": "Turrican 2"}],
+     "platforms": [{"id": 16, "name": "Amiga", "abbreviation": "Amiga"},
+                   {"id": 15, "name": "Commodore C64/128/MAX", "abbreviation": "C64"},
+                   {"id": 63, "name": "Atari ST/STE", "abbreviation": "Atari ST"}],
+     "cover": {"id": 90001, "image_id": "co1abc"}},
+    {"id": 2735, "name": "Turrican II: The Final Fight", "version_parent": 2734,
+     "platforms": [{"id": 16, "name": "Amiga", "abbreviation": "Amiga"}],
+     "cover": {"id": 90002, "image_id": "co1abd"}},
+    {"id": 5000, "name": "Turrican", "platforms": [{"id": 16, "name": "Amiga"}],
+     "cover": {"id": 90003, "image_id": "co1abe"}},
+    {"id": 5001, "name": "Super Turrican 2", "platforms": [{"id": 19, "name": "Super Nintendo Entertainment System", "abbreviation": "SNES"}],
+     "cover": {"id": 90004, "image_id": "co1abf"}}
+  ],
+  "two_games": [
+    {"id": 7000, "name": "Outrun", "platforms": [{"id": 16, "name": "Amiga"}], "cover": {"id": 1, "image_id": "co2aaa"}},
+    {"id": 7001, "name": "OutRun", "platforms": [{"id": 16, "name": "Amiga"}], "cover": {"id": 2, "image_id": "co2bbb"}}
+  ],
+  "other_platform": [
+    {"id": 8000, "name": "Chrono Trigger", "platforms": [{"id": 7, "name": "PlayStation", "abbreviation": "PS1"}],
+     "cover": {"id": 3, "image_id": "co3ccc"}}
+  ]
+}

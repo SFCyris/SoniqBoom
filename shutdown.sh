@@ -18,16 +18,54 @@ esac
 DATA_DIR="${SONIQBOOM_DATA_DIR:-$DEFAULT_DATA_DIR}"
 PID_FILE="$DATA_DIR/soniqboom.pid"
 LOG_FILE="$DATA_DIR/log/soniqboom.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PY="$SCRIPT_DIR/.venv/bin/python"
 
-# Parse --port (default 8080) so the port-based fallback below targets the
-# right listener.  Other forwarded args (from restart.sh) are ignored.
-PORT=8080
+# Parse --port so the port-based fallbacks below target the right listener.
+# Other forwarded args (from restart.sh) are ignored.
+PORT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port) PORT="${2:-8080}"; shift 2 ;;
+    --port) PORT="${2:-}"; shift 2 ;;
     *) shift ;;
   esac
 done
+
+_valid_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# No --port: the port of this data dir's RUNNING server, as its
+# startup-status.json records it (still right if SoniqBoom.conf changed since it
+# started) — used only while the pid it names is a live SoniqBoom process and
+# it names this data dir, so a stale file can't send the fallbacks below to an
+# old port; else the
+# port the server would pick — SONIQBOOM_PORT, ~/.soniqboom.env, server.port in
+# SoniqBoom.conf — else 8080.  A fixed 8080 guess made the port-free wait below
+# stop ANOTHER instance's server (it stops any SoniqBoom listener on PORT) when
+# this one ran elsewhere.
+if [ -z "$PORT" ]; then
+  if [ -x "$VENV_PY" ]; then PY="$VENV_PY"; else PY="python3"; fi
+  PORT=$("$PY" -I -c '
+import json, os, subprocess, sys
+s = json.load(open(sys.argv[1]))
+p, pid, d = s.get("port"), s.get("pid"), s.get("data_dir")
+def soniqboom_alive(pid):
+    try:
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    return "soniqboom" in cmd
+ok = (type(p) is int and type(pid) is int and pid > 0 and isinstance(d, str)
+      and os.path.samefile(d, sys.argv[2]) and soniqboom_alive(pid))
+print(p if ok else "")' "$DATA_DIR/startup-status.json" "$DATA_DIR" 2>/dev/null | tail -1 || true)
+  if ! _valid_port "$PORT" && [ -x "$VENV_PY" ]; then
+    PORT=$("$VENV_PY" -I -c 'from soniqboom.config import settings; print(int(settings.port))' 2>/dev/null | tail -1 || true)
+  fi
+  _valid_port "$PORT" || PORT=8080
+fi
 
 # Mount-safe "is the port busy?" probe.  A localhost /dev/tcp connect only ever
 # touches the loopback stack, so — unlike `lsof` — it can NOT block on a stale

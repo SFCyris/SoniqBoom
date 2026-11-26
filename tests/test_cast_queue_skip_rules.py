@@ -56,7 +56,7 @@ def wired(monkeypatch):
     async def get_track(tid):
         return _TM(tid) if tid in tracks else None
 
-    async def base():
+    async def base(*_host):
         return "http://h"
     monkeypatch.setattr(cast_session, "get_track", get_track)
     monkeypatch.setattr(cast_session, "_server_base_url", base)

@@ -104,8 +104,10 @@ Rendered by **libgme** (Game Music Emu), except the VGM and KSS files noted belo
 | **GBS** (`.gbs`) | Game Boy, 1989 | Four voices of the most recognisable handheld sound ever made | |
 | **VGM / VGZ** (`.vgm`, `.vgz`) | Sega Master System / Genesis + arcade, format from 2005 | Chip-register logging across dozens of sound chips; the vgmrips community archives thousands of sets | Yamaha YM2612 FM = the Genesis "growl". libgme plays the Sega PSG (SN76489) and YM2612 logs; a log that uses any other chip — YM2413, YM2151, the NES APU, the AY-3-8910 and the rest — is rendered by **ZXTune**. |
 | **AY** (`.ay`) | ZX Spectrum / Amstrad CPC | The Eastern-European demoscene's chip of choice (AY-3-8910) | |
+| **ZX Spectrum trackers** (`.pt3`, `.pt2`, `.pt1`, `.stc`, `.st1`, `.st3`, `.stp`, `.asc`, `.as0`, `.sqt`, `.psc`, `.psm`, `.gtr`, `.ftc`, `.vtx`, `.psg`, `.ayc`, `.chi`, `.str`, `.dst`, `.sqd`, `.dmm`, `.et1`, `.pdt`, `.tf0`, `.tfe`, `.tfc`, `.tfd`, `.cop`) | ZX Spectrum scene, 1980s to today | Pro Tracker 3, Sound Tracker, ASC Sound Master, SQ-Tracker and the other AY-3-8910 trackers (TurboSound pairs of two chips too), the beeper / Covox sample trackers, TFM Music Maker for two YM2203 (TurboFM), the SAM Coupé's E-Tracker and Amstrad CPC AYC dumps — the music of ZXArt's archive | Rendered by **ZXTune**, which tells the format by content: a file is listed when ZXTune reads it as the module its suffix names. Title, author and the program the module was made with come from the module, its length from ZXTune. A `.stp` / `.sqt` UADE plays (StarTrekker packer, Quartet PSG) stays UADE's, a `.psm` libopenmpt reads stays libopenmpt's. |
 | **KSS, SAP, GYM, HES** | MSX, Atari 8-bit, Genesis, PC Engine | Each platform's native music-rip format | Packed GYM files (GYMX) are unpacked automatically. KSS rips play every sound chip their music uses — PSG, SCC, MSX-MUSIC and MSX-AUDIO, and the SN76489 for a Sega Master System / Game Gear rip — through kssrender (libkss); where kssrender isn't installed, libgme plays their PSG and SCC voices only. |
 | **FamiTracker** (`.ftm`) | NES / Famicom music tracker, from 2005 | The NES chiptune scene's tracker, with the Famicom's expansion chips (VRC6, VRC7, FDS, MMC5, Namco 163, Sunsoft 5B) | Rendered by **Furnace**'s headless player, which imports the module: its first track plays to its end, its loop once more. Title, author and the copyright text come from the module; the library shows the length once the module has been played. A Face The Music `.ftm` (Amiga) is told apart by its content and plays through libopenmpt. |
+| **Furnace** (`.fur`) | Multi-system chiptune tracker by tildearrow, from 2021 | Songs for dozens of sound chips — consoles, home computers, arcade and FM synths, several chips at once | Rendered by **Furnace**'s headless player: its first song plays to its end, its loop once more. Title and author come from the module; the library shows the length once the module has been played. |
 | **DefleMask** (`.dmf`) | Multi-system chiptune tracker by Delek | Songs for the sound chips of the Sega Genesis, Master System, Game Boy, PC Engine, NES, Commodore 64 and other systems | Rendered by **Furnace**'s headless player, which imports the module: it plays to its end, its loop once more. Title and author come from the module, and the system it was written for is shown as the comment; the library shows the length once the module has been played. An X-Tracker, DSMI Compact or Software Visions `.dmf` is told apart by its content and plays through libopenmpt. |
 | **MGSDRV** (`.mgs`) | MSX music driver by Ain., from 1991 | The MML driver many MSX games and scene songs were written for, playing the PSG, MSX-MUSIC (FM) and SCC | Rendered by **kssrender** with the original MGSDRV driver (MGSDRV © Ain./Gigamix). The title comes from the song's text. MuSICA (`.bgm`), MoonBlaster (`.mbm`) and OPLLDRV (`.opx`) songs aren't listed. |
 
@@ -151,9 +153,13 @@ The sound of DOS gaming: Yamaha OPL2/OPL3 FM chips, no samples at all.
 | **IMF** (`.imf`) | id Software / Apogee | *Wolfenstein 3D*, *Commander Keen*, *Duke Nukem II* | The extension collides with Imago Orpheus tracker modules — content decides. |
 | **ROL** (`.rol`) | AdLib Inc.'s own Visual Composer | The "official" AdLib format | Needs AdLib's instrument bank, `standard.bnk` — found automatically (see below). |
 | **CMF, D00, RAD, HSC, SCI, LAA, DRO, RIX, A2M, ADL, BAM, KSM, AMD** | Creative Labs, EdLib, Reality, Sierra, LucasArts, DOSBox, AMUSIC… | Every studio had its own FM format | `.dro` is DOSBox's raw OPL log — a perfect recording of whatever the emulated card played (older DRO v1 captures play too). SoniqBoom renders the whole family, id's IMF included, through AdPlug (`adplay`) with the cycle-accurate Nuked OPL3 core. A Westwood `.adl` whose first song is empty starts at its first audible one. |
+| **The rest of AdPlug's formats** (`.a2t`, `.wlf`, `.adlib`, `.mus`, `.mdy`, `.ims`, `.mdi`, `.xms`, `.dfm`, `.hsp`, `.mad`, `.mkj`, `.cff`, `.dmo`, `.mtk`, `.mtr`, `.raw`, `.rac`, `.sat`, `.sa2`, `.xad`, `.bmf`, `.lds`, `.plx`, `.m`, `.xsm`, `.pis`, `.msc`, `.mkf`, `.jbm`, `.got`, `.sop`, `.hsq`, `.sqx`, `.sdb`, `.agd`, `.ha2`, `.sng`, `.dtm`) | AdLib Inc., RdosPlay, Ultima 6, God of Thunder, Herbulot, the PC trackers of the 90s… | Game soundtracks and PC scene trackers | Played through AdPlug too, listed when `adplay` reads the file as one. A `.mus` / `.ims` / `.sng` / `.dtm` another player plays (C64 Sidplayer, DMX MUS, UADE, GoatTracker, libopenmpt) stays that player's. Korean IMPlay song names are read from their own encoding. |
 
 ROL tunes need AdLib's instrument bank (`standard.bnk`), Sierra `.sci` tunes
-their `*patch.003` file and Ken Silverman's `.ksm` tunes `insts.dat`. A bank
+their `*patch.003` file and Ken Silverman's `.ksm` tunes `insts.dat`; an AdLib
+`.mus` / `.mdy` plays with the `.snd` or `.tim` bank beside it and an `.ims`
+with its `.bnk` in a local folder (inside an archive, on a network share or
+without one, with AdPlug's default instruments). A bank
 beside the tune or in the same archive is used automatically; for a tune
 inside an archive or on a network share, the folders up to four levels above
 are searched too. Without its bank, a tune says so when played.
@@ -174,14 +180,15 @@ are searched too. Without its bank, a tune says so when played.
 | **FastTracker 2** (`.xm`) | Triton, 1994 | *The* 90s tracker: instruments, envelopes, 32 channels | Half the mod archive is XM. |
 | **Impulse Tracker** (`.it`) | Jeffrey Lim, 1995 | The technical peak of DOS trackers — NNAs, filters, stereo samples | Its lineage lives on in OpenMPT/Schism today. |
 | **669, MTM, ULT, FAR, STM, GDM, DSM, AMF, WOW** | Various 90s editors | Each a chapter of tracker evolution | Rendered via libopenmpt, the modern reference engine — as are S3M, XM, IT, ProTracker MOD, Oktalyzer and DigiBooster Pro. Imago Orpheus `.imf` modules are told apart from id Software's AdLib IMF by content. An early Digital Sound Interface Kit `.dsm` (the `DSM\x10` variant) plays through `milkyrender` (MilkyPlay, MilkyTracker's playback library) to the song's natural end; without `milkyrender`, playback says no installed player can read it. The later RIFF `.dsm` plays through libopenmpt. |
-| **PolyTracker, Digitrakker, Epic MegaGames MASI, Galaxy Music System, Real Tracker, STMIK, Astroidea XMF, X-Tracker, Software Visions** (`.ptm`, `.mdl`, `.psm`, `.j2b`, `.rtm`, `.stx`, `.xmf`, `.dmf`) | DOS editors and game engines, 1990s | *Epic Pinball*, *Jazz Jackrabbit 2* and *Imperium Galactica* music, demoscene trackers | Played through libopenmpt, as are MO3 (`.mo3`, modules with MP3 / Ogg compressed samples), OggMod (`.oxm`), OpenMPT's own MPTM (`.mptm`) and the modules inside Unreal / Unreal Tournament music packages (`.umx`). A file under one of these names that is another format (ZX Spectrum `.psm`, DeFy AdLib Tracker `.dtm`, Extensible Music Format `.xmf`) isn't listed. |
+| **PolyTracker, Digitrakker, Epic MegaGames MASI, Galaxy Music System, Real Tracker, STMIK, Astroidea XMF, X-Tracker, Software Visions** (`.ptm`, `.mdl`, `.psm`, `.j2b`, `.rtm`, `.stx`, `.xmf`, `.dmf`) | DOS editors and game engines, 1990s | *Epic Pinball*, *Jazz Jackrabbit 2* and *Imperium Galactica* music, demoscene trackers | Played through libopenmpt, as are MO3 (`.mo3`, modules with MP3 / Ogg compressed samples), OggMod (`.oxm`), OpenMPT's own MPTM (`.mptm`) and the modules inside Unreal / Unreal Tournament music packages (`.umx`). A file under one of these names that is another format plays through its own player (a ZX Spectrum `.psm`: ZXTune; a DeFy AdLib Tracker `.dtm`: AdPlug) or, an Extensible Music Format `.xmf`, isn't listed. |
 | **FlexTrax, Funktracker, Liquid Tracker** (`.flx`, `.fnk`, `.liq`) | DOS editors, 1990s | Smaller trackers of the PC scene | Played through libxmp (`xmprender`). |
 
 ## MIDI & modern audio
 
 | Format | Origin | Notable |
 |---|---|---|
-| **MIDI** (`.mid`, `.midi`) | 1983 industry standard | Sheet music for synthesizers — SoniqBoom renders through FluidSynth with the active SoundFont (`.sf2` or `.sf3`). The Docker image includes the FluidR3 General MIDI bank; on a native install, upload one or pick one from **Download Known Soundfonts** under gear → **Renderers → Soundfonts** before MIDI plays. |
+| **MIDI** (`.mid`, `.midi`, `.kar`, RIFF `.rmi`) | 1983 industry standard | Sheet music for synthesizers — SoniqBoom renders through FluidSynth with the active SoundFont (`.sf2` or `.sf3`). The Docker image includes the FluidR3 General MIDI bank; on a native install, upload one or pick one from **Download Known Soundfonts** under gear → **Renderers → Soundfonts** before MIDI plays. gear → **Renderers → MIDI synths** can play MIDI files on an OPL3 or OPN2 FM chip or a Roland MT-32 instead. |
+| **Game MIDI** (`.xmi`, DMX `.mus`, `.hmi`, `.hmp`, `.gmf`, `.klm`) | DOS games' sound libraries: Miles AIL (XMIDI), DMX (*Doom*), HMI SOS (*Descent*), Creative | The music of a generation of DOS games, written for an AdLib / Sound Blaster FM chip or a Roland MT-32 | Rendered by `midirender` on an emulated OPL3 (Nuked OPL3) with the instrument bank of the game's sound library — AIL's for XMIDI, HMI's for HMI / HMP, DMXOPL3 (a free remake of Doom's instruments; the original bank isn't included) for MUS — or, under gear → **Renderers → MIDI synths**, on OPN2 FM or an MT-32. The MT-32 plays with your own ROMs only (see *Supported formats*, MT-32 ROMs). Of an XMIDI file with several songs, the first plays. |
 | **FLAC / ALAC / WavPack** (`.flac`, `.m4a`, `.wv`) | 2001+ | Lossless everyday listening. FLAC plays directly in the browser; ALAC plays directly in Safari and is converted on the fly elsewhere; WavPack is converted on the fly. |
 | **WAV / AIFF** (`.wav`, `.aiff`, `.aif`) | 1988–1991 | Uncompressed PCM. WAV plays directly; AIFF is converted on the fly. |
 | **Amiga IFF samples** (`.8svx`, `.16sv`) | Electronic Arts' IFF, 1985 | 8-bit (also Fibonacci-delta packed) and 16-bit Amiga samples, mono or stereo; converted on the fly. Their name, author and annotation texts become the title, artist and comment. |
@@ -240,47 +247,107 @@ library once the tune has been rendered.
 
 | Family | Length |
 |---|---|
-| **SID** | The tune's HVSC Songlengths entry; otherwise gear → **System → Settings → SID duration** (180 s by default; 5–1800 s). Changing it doesn't change SIDs already in the library: they keep the length they were scanned with. |
-| **Tracker modules** (libopenmpt) | The length libopenmpt reports when the file is scanned; a module with several subsongs plays them one after another. A one-subsong module whose last section repeats unchanged 8 or more times in a row (a loop count of 63 in a Face The Music module) ends where that section first repeats, with a short fade. |
+| **SID** | The tune's HVSC Songlengths entry; otherwise gear → **System → Settings → SID duration** (180 s by default; 5–1800 s). Changing it doesn't change SIDs already in the library: they keep the length they were scanned with. **SID tunes: fade-out** (gear → **Renderers → Amiga, stereo & endings**) fades out the last seconds of that length; the length stays the same. |
+| **Tracker modules** (libopenmpt) | The length libopenmpt reports when the file is scanned, with a 0.1 s fade; each subsong of a module with several is a tune of its own, with its own length. A one-subsong module whose last section repeats unchanged 8 or more times in a row (a loop count of 63 in a Face The Music module) ends where that section first repeats, with a short fade. **Tracker modules: play the song** plays a one-subsong module (or a picked subsong) twice, three, four or eight times — the repeats start where the song jumps back to — and **Tracker modules: fade-out** sets its fade (gear → **Renderers → Amiga, stereo & endings**); the library shows the new length after the next play. |
 | **Amiga player formats** (UADE) | Until the player reports the song end, or uade's limit of about 8½ minutes. An AHX tune stops at the song end the HivelyTracker replayer measures, where that replayer is available; a Delta Music 2 song plays until all four voices have started over; a Musicline tune mlrender plays runs to its end, or until it loops and fades out, or until it falls silent, at most 10 minutes. |
 | **HivelyTracker** | To the song end, at most 10 minutes. |
 | **SNDH** | The length the file states (`FRMS` / `TIME`); 3 minutes when it states none. |
 | **YM** | Its frame count — from the header of a YM5 / YM6 file, from the size of a YM2 / YM3 one. MIX and YMT files play without a length shown in lists; YM4 files are marked **corrupt**. |
 | **SC68** | The track lengths stored on the disk; 3 minutes for a track without one. |
-| **Console chiptunes** (libgme) | A length the file states (an SPC's ID666 tag, NSFe and AY track lengths, an Atari SAP file's TIME lines, or a VGM's intro plus its loop played twice), followed by an 8 s fade — none after a SAP tune whose TIME isn't marked `LOOP`: it ends there. A GYM plays to its own end (one that loops fades out within 8 s after it). A tune that states none plays for the **SID duration** setting, fading out over its last 8 s.A KSS rip kssrender plays ends where it loops, stops or falls silent for 3 s, at most the **SID duration**, with an 8 s fade. |
+| **Console chiptunes** (libgme) | A length the file states (an SPC's ID666 tag, NSFe and AY track lengths, an Atari SAP file's TIME lines, or a VGM's intro plus its loop played twice), followed by an 8 s fade — or the fade an NSFe's `fade` chunk states for the tune; none after a SAP tune whose TIME isn't marked `LOOP` or a VGM without a loop: it ends where its music ends. A GYM plays to its own end (one that loops fades out within 8 s after it). A tune that states none plays for the **SID duration** setting, fading out over its last 8 s. A KSS rip kssrender plays ends where it loops, stops or falls silent for 3 s, at most the **SID duration**, with an 8 s fade; its tunes' lengths are known once its tune list is (see below). **Console tunes: play the loop** sets how many times a VGM's (or a KSS's) loop plays and **Console tunes: fade-out** the fade (gear → **Renderers → Amiga, stereo & endings**). |
 | **VGM with other chips, MED 2–4** (ZXTune) | Until the tune ends, cut at the **SID duration** setting with an 8 s fade. |
 | **PSF family** | The rip's `length` tag, then its `fade` tag (up to 60 s); an untagged rip plays as long as ZXTune renders it — 3 minutes for a Dreamcast rip through dsfrender, its `fade` tag (if it has one) fading out within them. |
 | **MDX** (mdxrender) | Until the song has looped twice, then MXDRV's own fade-out (a song that doesn't loop plays to its end), plus 2 s for the last notes — measured when the file is scanned; cut at the **SID duration** setting with an 8 s fade. After a change of that setting, the next play renders the song again and the library shows its new length. |
 | **S98, Farbrausch V2** (ZXTune) | The length of the dump or song, read from the file when it is scanned; an S98 dump with a loop point plays through once, without repeating the loop. |
 | **GoatTracker** (gt2reloc + sidplayfp) | The **SID duration** setting, its last 8 s faded out — a GoatTracker song loops. After a change of that setting, the next play renders the song again and the library shows its new length; a change of the **SID fidelity** settings renders it again too. |
 | **FamiTracker** (Furnace) | The first track to its end, its loop played once more; the library shows the length after the first play. |
-| **DefleMask** (Furnace) | To its end, its loop played once more; the library shows the length after the first play. |
+| **DefleMask, Furnace** (Furnace) | To its end, its loop played once more; the library shows the length after the first play. |
+| **ZX Spectrum trackers** (ZXTune) | The module to its end, once (its loop isn't repeated) — the length ZXTune reads when the file is scanned. |
 | **libxmp modules and converted packed modules** (xmprender) | The module's first sequence to its end, measured when the file is scanned; a module longer than 30 minutes is cut there with an 8 s fade. |
 | **C64 Sidplayer** (sidplayfp) | To the song's end (it stops after 3 s of silence), at most 30 minutes; the library shows the length after the first play. |
 | **Sawteeth** (sawteethrender) | To the song's end, measured when the file is scanned; a song longer than 30 minutes is cut there with an 8 s fade. |
 | **SunVox** (sunvoxrender) | The project's length, measured when the file is scanned; a project longer than 30 minutes is cut there with an 8 s fade. |
 | **MGSDRV** (kssrender) | Until the song has looped twice or stopped (or fallen silent for 3 s), then an 8 s fade — measured when the file is scanned; cut at the **SID duration** setting with an 8 s fade. After a change of that setting, the next play renders the song again and the library shows its new length. |
 | **AdLib / OPL** | To the song end; lists show 3:00 until the tune has been rendered. |
-| **MIDI** | To the end of the song, including the instruments' release. |
+| **MIDI** | To the end of the song, including the instruments' release (on OPL3, OPN2 or the MT-32: until it falls silent, at most 6 s after the end; a song's loop isn't repeated). |
 
 gear → **System → Settings → Skip short tunes** judges a tune by these
 lengths, without the fade-out; a tune whose length isn't known yet is never
 skipped.
+
+## Amiga sound, stereo width and endless play
+
+- **Amiga resampler** (gear → **Renderers → Amiga, stereo & endings**):
+  ProTracker and the other Amiga module formats libopenmpt plays are rendered
+  through libopenmpt's emulation of the Amiga's Paula chip, with the filter of
+  an Amiga 500 or 1200 — **Auto** (the default) lets libopenmpt pick it by the
+  format. **Off** is libopenmpt's normal interpolation. Other module formats
+  are not changed.
+- **Stereo width of retro tunes**: Amiga tunes are hard-panned (Paula's four
+  channels go two left, two right), which is tiring on headphones. The width
+  narrows (or widens) the stereo of chip, tracker and Amiga tunes while they
+  play: **Headphones** is 60 %, 100 % the tune as rendered. The server's
+  setting applies to Subsonic apps, DLNA and casting (on the converted stream
+  they get — a Subsonic `format=raw` download is the render as it is) and is
+  the default of every browser; each browser can keep its own under gear →
+  **System → Settings** (or **Preferences**, or the phone page's Settings).
+  Amiga player formats (UADE) render Paula's own stereo, like the modules.
+- **Tunes for two or three SID chips** (2SID / 3SID) play in stereo, as
+  sidplayfp mixes their chips; their meter shows every chip's voices.
+- **Endless play**: with **Repeat One**, a tracker module, a console tune
+  (libgme) or an Amiga player tune repeats through its own loop, without a
+  fade or a gap; **Play looping tunes endlessly** (gear → **System →
+  Settings**, **Preferences**, the phone page's Settings) does this for every
+  such tune until you skip. The player bar shows ∞ for the length. A SID tune
+  repeats from its start.
 
 ## Files with several tunes
 
 When a file holds more than one tune, the tune picker in Track Info lists
 them (the first 60 directly, any later one through **Jump to**) for SID,
 SNDH and SC68 files, Amiga modules played by UADE that report several
-subsongs, AHX and HivelyTracker songs with subsongs, and NSF, NSFe, GBS, AY
-and SAP rips. Of a GoatTracker song or a FamiTracker module with several tunes,
-only the first plays. Playing the file itself starts at its default
-tune: the start song a SID or SNDH file names, otherwise the first tune that
-isn't empty. Other formats play as a single track. A rendered tune that
+subsongs, AHX and HivelyTracker songs with subsongs, tracker modules with
+several subsongs (libopenmpt's), GoatTracker songs with several subtunes,
+FamiTracker modules with several tracks, and NSF, NSFe, GBS, AY, SAP, HES
+and KSS rips. Each tune plays on its own and can be queued or added to a
+playlist like any track. HES and KSS files don't say how many tunes they
+hold: the first time one is played or its Track Info is opened, SoniqBoom
+plays each of its 256 song slots briefly in the background and lists the
+slots that play for at least a second before falling silent, numbered 1,
+2, 3 … in slot order (a KSS file that kssrender plays also gets each tune's
+length). For an online collection's file this happens only once it has been
+fetched for a play or for its Track Info. A file in the library from before this version gets its tune
+list the same way: when it is next played or its Track Info is opened.
+Playing the file itself starts at its default tune: the start song a SID or
+SNDH file names, otherwise the first tune that isn't empty. Other formats
+play as a single track. A rendered tune that
 holds nothing audible shows "This tune plays only silence" instead of
 playing. In Subsonic apps, album and folder views list a file's other tunes
 as songs of their own, titled "Title (Tune n/N)", up to 60 entries per file;
 with **Skip short tunes** on, tunes known to be shorter are left out.
+
+## Volume leveling across formats
+
+A SID, a tracker module, an SPC rip and a mastered FLAC come out of their
+players at very different volumes. With **Volume leveling** on (the
+equalizer panel on the desktop, **Settings → Playback** on the phone: Per
+track, Per album or Auto; Per album by default), a track with ReplayGain
+tags is levelled by them, and every other track by the loudness SoniqBoom
+measured (EBU R128 integrated loudness and true peak, with ffmpeg): a
+retro tune when its render is first stored in the conversion cache, each
+tune of a file on its own (a tune already in the cache when it is next
+played); a file without ReplayGain tags in your local music folders in the
+background while nothing is rendering, and when the web player is about to
+play it next. A retro tune from a network share or an online collection is
+measured once it has been rendered for a play; music files on a network
+share — also one your computer has mounted as a folder — are not measured.
+Tracks are brought to −18 LUFS, the ReplayGain 2.0 reference, never louder
+than their true peak allows and by at most +12 dB. A tune is measured once —
+again only after a change of the settings it is rendered with (SID chip
+model or filter, the SoundFont …); a file that changes is measured again. Subsonic apps get the same value as
+the track's ReplayGain gain when the file has no tags of its own. Auto uses
+the album gain while an album plays in order and the track gain otherwise;
+a measured track has a track value only, which Per album uses too.
 
 ## Meters and patterns
 
@@ -305,13 +372,13 @@ compiler (`c++`, `clang++` or `g++`) for ST-Sound. A Docker image built with
 `--build-arg SLIM=1` leaves out UADE and sc68, so AHX, the Amiga exotics and
 `.sc68` files don't play there; `install.sh --slim` leaves out ZXTune, so the
 PSF family (other than the Dreamcast rips dsfrender plays), S98 and
-Farbrausch V2 files, MED 2–4 modules and VGM files that use other chips don't
-play.
+Farbrausch V2 files, the ZX Spectrum tracker modules, MED 2–4 modules and VGM
+files that use other chips don't play.
 
 To use a player that isn't on the `PATH`, enter its absolute path under gear
 → **Renderers → Renderer binaries** (`uade123`, `gme`, `adplay`, `psgplay`,
 `sc68`, `zxtune123`, `kssrender`, `dsfrender`, `milkyrender`, `mlrender`, `mdxrender`,
-`gt2reloc`, `sunvoxrender`, `furnace`, `xmprender`);
+`gt2reloc`, `sunvoxrender`, `furnace`, `xmprender`, `sawteethrender`, `midirender`);
 **Save paths** applies them at once. The `sidplayfp`, `fluidsynth` and
 `openmpt123` paths are set in SoniqBoom.conf (`sidplayfp_path`,
 `fluidsynth_path` and `openmpt123_path` in its `renderers` section). When ffmpeg is missing, or the ffmpeg in use lacks the DSD
@@ -321,8 +388,17 @@ Renderer Status shows a notice offering **Download bundled ffmpeg** (or
 ffmpeg into SoniqBoom's data folder and uses it from then on.
 
 A retro tune is rendered by its player when it's played, and a finished
-render is kept in the conversion cache for the next play. SID, MIDI,
-tracker modules, AdLib / OPL, SNDH, PSF, S98, Farbrausch V2, MDX, libgme console chiptunes and UADE
+render is kept in the conversion cache for the next play. Whenever no
+render is running, kept renders are compressed losslessly in the background
+(WavPack, through ffmpeg; each one is decoded and compared before it is
+kept, so it plays back bit for bit the same) to about half their size —
+from a sixth for a C64 SID to three quarters for some AdLib tunes — so the
+cache holds up to about twice as many. The most recently played ones also
+stay uncompressed while there is room. In the web player, and for any
+client playing the WAV as is, a compressed render starts playing while it
+is decompressed; a request for another codec or from a time offset waits
+for the whole decompression, a fraction of a second. SID, MIDI (game MIDI too),
+tracker modules, AdLib / OPL, SNDH, PSF, S98, Farbrausch V2, the ZX Spectrum trackers, MDX, libgme console chiptunes and UADE
 tunes, AHX included, start playing in the web player while their render is
 still running; in Safari, one whose length isn't known yet starts once its
 render has finished. HivelyTracker, YM and SC68 files, and the VGM and

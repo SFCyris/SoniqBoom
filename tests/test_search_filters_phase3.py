@@ -71,7 +71,9 @@ def test_parse_forms(q, want):
     assert search_predicates(q) == want
 
 
-@pytest.mark.parametrize("q", ["bpm:fast", "tunes:many", "chip:sid", "has:lyrics", "has:cover",
+# (``chip:sid`` reads since the chips of the other platforms joined — the
+# sound chip a format is written for; a chip no format names stays text)
+@pytest.mark.parametrize("q", ["bpm:fast", "tunes:many", "chip:z80", "has:lyrics", "has:cover",
                                "has:art", "dup:maybe", "channels:stereo", "chip:6581,foo"])
 def test_unreadable_values_stay_text(q):
     assert search_predicates(q) == {"query": q}

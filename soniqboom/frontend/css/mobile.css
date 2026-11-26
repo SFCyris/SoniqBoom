@@ -1357,6 +1357,22 @@ input, select, textarea { touch-action: manipulation; }
   box-shadow: 0 2px 3px rgba(0,0,0,0.6);
 }
 .m-np-scrubber:disabled { opacity: 0.45; }
+/* The seek surface laid over the slot (nowplaying.js #m-np-seek,
+   seek_gesture.js): the same box as the input, so the whole groove — and the
+   waveform drawn in it — seeks by x alone; vertical swipes still scroll
+   (pan-y).  The input under it is the keyboard's and the screen reader's. */
+.m-np-seek {
+  grid-column: 2; grid-row: 1;
+  position: relative; z-index: 2;
+  height: 44px;
+  margin: -4px 0;
+  touch-action: pan-y;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.m-np-scrubber:disabled + .m-np-seek { cursor: default; }
 
 /* Keys with lamps: play (lit while playing), shuffle / repeat (lit when on) */
 .m-np-transport {
@@ -1531,7 +1547,8 @@ input, select, textarea { touch-action: manipulation; }
   .m-np-transport.m-np-modes { grid-area: modes; }
   .m-np-ann { margin-bottom: 4px; gap: 8px; letter-spacing: 0.1em; }
   .m-np-title { -webkit-line-clamp: 1; font-size: 17px; }
-  .m-np-scrubber { margin: -6px 0; }
+  .m-np-scrubber,
+  .m-np-seek { margin: -6px 0; }
   .m-np-btn,
   .m-np-btn.primary { height: 48px; }
   .m-np-modes .m-np-btn { height: 48px; padding-top: 10px; width: 76px; flex: 0 0 auto; }
@@ -1553,7 +1570,8 @@ input, select, textarea { touch-action: manipulation; }
   .m-np { padding-top: 6px; padding-bottom: 6px; }
   .m-np-deck { padding: 8px 12px; row-gap: 7px; }
   .m-np-ann { display: none; }
-  .m-np-scrubber { margin: -7px 0; }
+  .m-np-scrubber,
+  .m-np-seek { margin: -7px 0; }
   .m-np-btn,
   .m-np-btn.primary,
   .m-np-modes .m-np-btn { height: 44px; }

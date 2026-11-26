@@ -12,7 +12,9 @@
  * track has played AMIGA_VU_SETTLE_S) the meter is an honest FFT spectrum, and
  * the caller asks again on the SID / Amiga ladder.
  *
- *   parseVUMR(buf)                 → {channels, rateHz, frames, pan, samples} | null
+ *   parseVUMR(buf)                 → {channels, rateHz, frames, pan, samples, names} | null
+ *   serverPassTrack(track)         → whether the server builds this track's meters on ask
+ *   vuVoiceLabel(vumr, i, preset)  → a column's label text (a voice name or its number)
  *   createVumrFetcher()            → {fetch(id, subsong, {start}), abort()}
  *   vuEligible(track)              → whether the track gets the per-voice meter
  *   vuKeyOf(track)                 → "<id>:<subsong>"
@@ -22,7 +24,7 @@
  *   vuFallbackText(format, reason, isAdmin) → the spectrum's caption when no voices come
  */
 import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, ATARI_FORMAT_NAMES,
-         PSF_FORMAT_NAMES, isUadeAmigaTrack } from '../utils.js';
+         PSF_FORMAT_NAMES, ADLIB_FORMAT_NAMES, isUadeAmigaTrack } from '../utils.js';
 
 export const VUMR_MAX_CHANNELS = 32;
 
@@ -52,6 +54,18 @@ export const AMIGA_VU_SETTLE_MAX_WAITS = 3600;   // an hour paused in the first 
 // OPL render fine but may have no sidecar, so they fall back to the spectrum.
 const _VU_FORMATS = new Set([...TRACKER_FORMAT_NAMES, 'SID', ...CHIP_FORMAT_NAMES]);
 
+/** Does the server build this track's per-voice meters only when the
+ *  now-playing meter asks (after the track has played a few seconds) — the
+ *  Amiga modules (a second uade pass) and the libgme chiptunes and AdLib /
+ *  OPL tunes (api/voices.py: a pass over the cached render)?  The player
+ *  asks those with ``start: false`` first and then on the Amiga ladder. */
+export function serverPassTrack(track) {
+  const primary = String(track?.format || '').split('/')[0].trim();
+  return isUadeAmigaTrack(track)
+      || (CHIP_FORMAT_NAMES.has(primary) && !TRACKER_FORMAT_NAMES.has(primary))
+      || ADLIB_FORMAT_NAMES.has(primary);
+}
+
 /** Eligibility for the per-voice meter: the static tracker / SID / chip names
  *  plus the families whose names can't live in a static set — the exotic uade
  *  Amiga players (dynamic names; the genre pair is the signal), Atari ST
@@ -75,12 +89,13 @@ export function vuKeyOf(track) {
 //   0..4   "VUMR"
 //   4      version (0x01)
 //   5      channels N (1..32)
-//   6      flags  (reserved)
+//   6      flags  (bit 0: voice names follow the levels)
 //   7      reserved
 //   8..12  sample_rate_hz (uint32 LE)
 //   12..16 frame_count    (uint32 LE)
 //   16..16+N        pan per channel (uint8: 0=center, 1=left, 2=right)
-//   16+N..end       mono amplitude (frames * channels * uint8)
+//   16+N..          mono amplitude (frames * channels * uint8)
+//   then, with flag bit 0: per channel a length byte (≤ 32) + that much UTF-8
 export function parseVUMR(arrayBuf) {
   if (!arrayBuf || arrayBuf.byteLength < 16) return null;
   const dv = new DataView(arrayBuf);
@@ -96,7 +111,48 @@ export function parseVUMR(arrayBuf) {
   if (arrayBuf.byteLength < headerSize + frames * channels) return null;
   const pan     = new Uint8Array(arrayBuf, 16, channels);
   const samples = new Uint8Array(arrayBuf, headerSize, frames * channels);
-  return { channels, rateHz, frames, pan, samples };
+  return { channels, rateHz, frames, pan, samples,
+           names: _vumrNames(arrayBuf, dv.getUint8(6), headerSize + frames * channels, channels) };
+}
+
+// The voice names after the levels (flag bit 0), or null — a damaged block
+// reads as none (the meter then numbers its columns).
+function _vumrNames(buf, flags, pos, channels) {
+  if (!(flags & 1)) return null;
+  const bytes = new Uint8Array(buf);
+  const dec = (typeof TextDecoder === 'function') ? new TextDecoder('utf-8') : null;
+  const out = [];
+  for (let i = 0; i < channels; i++) {
+    if (pos >= bytes.length) return null;
+    const n = bytes[pos];
+    if (n > 32 || pos + 1 + n > bytes.length) return null;
+    const raw = bytes.subarray(pos + 1, pos + 1 + n);
+    out.push(dec ? dec.decode(raw) : String.fromCharCode(...raw));
+    pos += 1 + n;
+  }
+  return out;
+}
+
+/** A meter column's label: the voice's name where the column has room for
+ *  it (``roomy``: "SQ 1"-style short names never wider than 6 characters),
+ *  else its number. */
+export function vuVoiceLabel(vumr, i, preset) {
+  const name = vumr && vumr.names && vumr.names[i];
+  if (preset === 'roomy') return name ? shortVoiceName(name) : `CH:${i + 1}`;
+  return `${i + 1}`;
+}
+
+/** "Square 1" → "SQ1", "Triangle" → "TRI", "DSP 3" → "DSP3", "FM 2" → "FM2",
+ *  "OPL 7 BD" → "BD", "Noise" → "NOI" … — at most 6 characters. */
+export function shortVoiceName(name) {
+  const s = String(name || '').trim();
+  const m = /^OPL\s*\d+\s+(\S+)/i.exec(s);
+  if (m) return m[1].slice(0, 6);
+  const parts = s.split(/\s+/);
+  const num = /^\d+$/.test(parts[parts.length - 1] || '') ? parts.pop() : '';
+  const word = parts.join(' ');
+  const base = /^square$/i.test(word) ? 'SQ' : word.slice(0, 3);
+  return (base.toUpperCase() + num).slice(0, 6);
 }
 
 /** A /vu reader with its own in-flight slot: a new ask aborts the previous one

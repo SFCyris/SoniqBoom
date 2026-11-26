@@ -1710,3 +1710,18 @@ test('adding many tracks at once is adding them one by one, with one queuechange
   all.addAllToQueue([a, x], { auto: true });
   assert.deepEqual(all.ids(), one.ids());
 });
+
+test('clearing the queue mid-play tells every statechange listener it stopped (the Play key showed pause)', async () => {
+  const p = makePlayer({ server: makeServer(50) });
+  p.setQueue(rows(0, 10), 2);
+  await p.settle();
+  p.env.events.length = 0;
+  p.setQueue([], 0);
+  const names = p.env.events.map(([n]) => n);
+  assert.ok(names.includes('queuechange'), 'no queuechange');
+  const st = p.env.events.filter(([n]) => n === 'statechange');
+  assert.equal(st.length, 1, `statechange events: ${JSON.stringify(st)}`);
+  assert.deepEqual(st[0][1], { playing: false });
+  assert.equal(p.queue.length, 0);
+  assert.equal(p.queueIdx, -1);
+});

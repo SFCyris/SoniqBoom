@@ -71,6 +71,27 @@ export function mountSettings(root, ctx) {
               <option value="">Original</option><option value="320">High · 320 kbps</option><option value="192">Normal · 192 kbps</option><option value="128">Low · 128 kbps</option><option value="96">Data saver · 96 kbps</option>
             </select>
           </label>
+          <label class="m-settings-row" for="set-leveling">
+            <span class="label"><span id="set-leveling-name">Volume leveling</span>
+              <small id="set-leveling-hint">Evens out loudness between tracks: by their ReplayGain tags, else by the loudness the server measured (SID, modules, chip tunes, untagged files). Auto: per album while an album plays in order, else per track. This browser only.</small></span>
+            <select id="set-leveling" class="m-settings-select"
+                    aria-labelledby="set-leveling-name" aria-describedby="set-leveling-hint">
+              <option value="off">Off</option><option value="track">Per track</option><option value="album">Per album</option><option value="auto">Auto</option>
+            </select>
+          </label>
+          <label class="m-settings-row" for="set-stereo-width">
+            <span class="label"><span id="set-width-name">Stereo width of retro tunes</span>
+              <small id="set-width-hint">Chip, tracker and Amiga tunes. Headphones: easier on the ears. This browser only.</small></span>
+            <select id="set-stereo-width" class="m-settings-select"
+                    aria-labelledby="set-width-name" aria-describedby="set-width-hint">
+              <option value="">Same as server</option><option value="0">Mono · 0 %</option><option value="25">25 %</option><option value="50">50 %</option><option value="60">Headphones · 60 %</option><option value="75">75 %</option><option value="100">As rendered · 100 %</option><option value="125">Wider · 125 %</option><option value="150">Wider · 150 %</option>
+            </select>
+          </label>
+          <label class="m-settings-row" for="set-endless">
+            <span class="label">Play looping tunes endlessly
+              <small>Tracker, console and Amiga tunes go on through their own loop until you skip (Repeat One does this either way). This browser only.</small></span>
+            <input type="checkbox" id="set-endless">
+          </label>
           <label class="m-settings-row" for="set-shuffle-replay">
             <span class="label">Let shuffle repeat tracks you’ve heard
               <small>Off: each track plays once per shuffle. This browser only; takes effect the next time you turn shuffle on.</small></span>
@@ -114,6 +135,21 @@ export function mountSettings(root, ctx) {
   const shufReplay = root.querySelector('#set-shuffle-replay');
   shufReplay.checked = Player.shuffleReplaysPlayed;
   shufReplay.addEventListener('change', () => Player.setShuffleReplaysPlayed(shufReplay.checked));
+  // Stereo width of retro tunes and endless play (browser-local, as on the
+  // desktop's Settings / Preferences).
+  const widthSel = root.querySelector('#set-stereo-width');
+  const own = Player.stereoWidthOwn;
+  if (own !== null && ![...widthSel.options].some((o) => o.value === String(own))) {
+    const o = document.createElement('option');
+    o.value = String(own); o.textContent = `${own} %`;
+    widthSel.appendChild(o);
+  }
+  widthSel.value = own === null ? '' : String(own);
+  widthSel.addEventListener('change', () =>
+    Player.setStereoWidth(widthSel.value === '' ? null : Number(widthSel.value)));
+  const endless = root.querySelector('#set-endless');
+  endless.checked = Player.endlessPref;
+  endless.addEventListener('change', () => Player.setEndlessPref(endless.checked));
   const quality = root.querySelector('#set-stream-quality');
   quality.value = Player.streamQuality;
   quality.addEventListener('change', () => {
@@ -121,6 +157,10 @@ export function mountSettings(root, ctx) {
     ctx.toast(quality.value ? `Streaming at up to ${quality.value} kbps from the next track.`
                             : 'Streaming the original files from the next track.');
   });
+  // Volume leveling — the same browser-local mode as the desktop equalizer's.
+  const leveling = root.querySelector('#set-leveling');
+  leveling.value = Player.replayGainMode || 'album';
+  leveling.addEventListener('change', () => Player.setReplayGainMode(leveling.value));
   const qsync = root.querySelector('#set-queue-sync');
   const qsyncRow = root.querySelector('#set-queue-sync-row');
   qsync.checked = Player.queueSync;

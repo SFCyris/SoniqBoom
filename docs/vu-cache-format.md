@@ -10,7 +10,7 @@ before the audio was cached, or a tracker backfill written to a slot of its
 own.  It carries pre-computed per-channel volume samples that the frontend
 indexes by playback time to render true per-channel VU bars.
 
-Three pipelines write it, all in the layout below:
+These pipelines write it, all in the layout below:
 
 * **Tracker modules** — ``soniqboom/core/openmpt_vu.py`` reads the module
   through ``libopenmpt`` via a thin ``ctypes`` binding, alongside the
@@ -40,10 +40,38 @@ Three pipelines write it, all in the layout below:
   *Per-voice VU meters for Amiga modules* setting (gear → Renderers →
   Playback preparation) turns it off.  HivelyTracker (``.hvl``) tunes are
   rendered by ``hvl2wav`` and have no sidecar.
+* **Console chiptunes played through libgme** (NSF / NSFe, SPC, GBS,
+  VGM / VGZ, AY, KSS, SAP, GYM, HES) up to 900 s — one channel per libgme
+  voice, named as libgme names it ("Square 1", "DSP 3", "FM 2" …), from one
+  render per voice with only that voice heard, on the cached render's
+  timeline (``soniqboom/core/gme_voices.py``).  A KSS that kssrender plays
+  and a VGM for a chip libgme lacks (played by ZXTune) have none.
+* **AdLib / OPL tunes** up to 900 s — one channel per OPL channel that makes
+  a sound, named "OPL 1" … "OPL 18" (with "BD", "SD/HH" or "TOM/CY" for a
+  channel that played percussion in rhythm mode), from one pass of AdPlug's
+  player through the same Nuked OPL3 core the audio is rendered with, which
+  reads each channel's share of the mix after every sample
+  (``soniqboom/native/oplvoices``).  It needs the ``oplvoices`` tool on the
+  server.
+
+  For both, the pass starts like the Amiga one: when the web player asks
+  for the meters of the track it is playing, once that track has been
+  served for 3 s and its render is cached; it waits a further 4 s, runs at
+  the lowest background priority (a libgme pass gives its slot back after
+  every 20 s of audio), and is dropped when the player stops asking before
+  it starts; once under way it runs on unless the player has not asked for
+  10 minutes (a long Mega Drive VGM can outlast the player's asking: its
+  meters are then there from the next play).
+
+The voice mixer (Track Info → Voices: mute, solo and per-voice scopes for
+SID, libgme and AdLib tunes) takes its voices — names and order — from the
+libgme and AdLib sidecars.  Its renders are temp files of the server's
+render folder, kept while the browser reads them, and never cached.
 
 The web player shows meters only while the visualizations master switch and
 the now-playing switch are on.  With either off, it asks for no sidecar, so
-no Amiga pass starts and the browser renders no SID sidecar except as part of
+no Amiga pass starts and the meter starts no libgme or AdLib pass (the
+Voices tab still asks for one: its voices come from the sidecar) and the browser renders no SID sidecar except as part of
 *Play SID in browser*; the server still renders a SID sidecar when a SID tune
 plays.  These settings are under gear → System → Settings → Visualizations
 (*Enable visualizations*, *Now-playing*, *Play SID in browser*); for accounts
@@ -65,15 +93,20 @@ Offset  Size   Field           Notes
 0       4      Magic           ASCII "VUMR"
 4       1      Version         0x01 for v1
 5       1      Channels (N)    1–32
-6       1      Flags           v1: reserved (0)
+6       1      Flags           bit 0: voice names follow (below); other bits 0
 7       1      Reserved        v1: writers set 0; readers ignore
 8       4      Sample rate Hz  uint32 LE — frames per second (30 from every writer)
 12      4      Frame count F   uint32 LE — total captured frames
 16      N      Pan per channel uint8 × N (see encoding table below)
 16 + N  F*N    Mono amplitude  uint8 × F × N — row-major (frame-major)
+then, with flag bit 0 set:
+        N×     Voice name      uint8 length L (0–32), then L bytes of UTF-8
 ```
 
-**Total file size**: `16 + N + F * N` bytes.
+**Total file size**: `16 + N + F * N` bytes, plus the names when flag bit 0
+is set.  The libgme and AdLib writers set it; the tracker, SID and Amiga
+writers don't (a reader that ignores the flags reads the levels unchanged).
+A damaged names block reads as no names.
 
 For a 4-minute, 8-channel module at 30 Hz:
 `16 + 8 + 7200 * 8 = 57 624 bytes` on disk.  The API response is
@@ -107,6 +140,11 @@ captured.
 * **SID** — every voice is 0 (the SID output is mono).
 * **Amiga** — the Paula channel layout: `1 2 2 1` (channels 0 and 3 left,
   1 and 2 right).
+* **libgme and AdLib** — derived like the tracker's (left / right when one
+  is 1.5 times the other), from each voice's left and right levels summed
+  over the whole tune: libgme its per-frame peaks, AdLib its per-sample
+  magnitudes.  An NES voice is always centre; an SPC, Game Boy or
+  OPL3 voice can be either side.
 
 ---
 
@@ -124,8 +162,9 @@ produced depends on the writer:
   ```
 
   255 = full-scale.
-* **SID and Amiga** — the peak magnitude of each voice within the frame,
-  scaled by the loudest frame of any voice in the whole tune:
+* **SID, Amiga, libgme and AdLib** — the peak magnitude of each voice
+  within the frame (libgme and AdLib: of its louder side), scaled by the
+  loudest frame of any voice in the whole tune:
 
   ```
   byte = min(255, frame_peak * 255 // tune_peak)
@@ -135,7 +174,10 @@ produced depends on the writer:
   is kept.  SID peaks come from 1470-sample windows (1/30 s at 44.1 kHz) of
   the isolated-voice renders on the server, or from the engine's per-voice
   output in the browser.  Amiga peaks come from the high byte of each Paula
-  voice's output.
+  voice's output.  libgme peaks come from 1470-frame windows of each voice's
+  own render (44.1 kHz stereo); AdLib peaks from windows of 1/30 s of each
+  channel's share of the mix at the chip's rate (49 716 Hz, or 44.1 kHz on
+  a server that renders AdLib straight at that rate).
 
 **Row-major layout** means frame `i` starts at offset
 `16 + N + N * i`.  Random access by frame is `O(1)`:
@@ -168,7 +210,8 @@ The frame count follows the audio: a tracker sidecar has one frame per
 1/30 s until the module ends (at most its reported length plus one frame;
 600 s plus one frame when it reports no length); a SID sidecar has one frame
 per 1/30 s of the render; an Amiga sidecar has `floor(length * 30)` frames
-for the rendered length.
+for the rendered length; a libgme or AdLib sidecar has one frame per 1/30 s
+of the cached render, a last partial one included.
 
 ---
 
@@ -226,8 +269,8 @@ also starts the background per-voice pass, unless the request passes
 label under the seek bar:
 
 * **204 without an `X-VU-Unavailable` header** — meters may still arrive
-  (an Amiga pass pending or running, a SID sidecar still rendering).  For
-  SID and Amiga tracks the label reads
+  (an Amiga, libgme or AdLib pass pending or running, a SID sidecar still
+  rendering).  For SID, Amiga, libgme and AdLib tracks the label reads
   `Spectrum — per-voice meters loading…` and the player asks again on a
   retry schedule.
 * **204 with `X-VU-Unavailable`** — no meters will come for this track,
@@ -237,8 +280,8 @@ label under the seek bar:
   | Value         | Meaning                                              | Label |
   |---------------|------------------------------------------------------|-------|
   | `off`         | the per-voice VU setting for Amiga modules is off    | `Spectrum — per-voice meters are turned off (Settings → Renderers)` for an admin, `Spectrum — per-voice meters are turned off on this server` for anyone else |
-  | `unsupported` | this uade build can't produce per-voice data          | `Spectrum — per-voice meters not available on this server` |
-  | `skipped`     | this tune's per-voice pass ran without a result       | `Spectrum — per-voice meters not available for this tune` |
+  | `unsupported` | this uade build can't produce per-voice data; for a libgme or AdLib tune: libgme lacks its voice functions, `oplvoices` isn't installed, or kssrender played the KSS | `Spectrum — per-voice meters not available on this server` |
+  | `skipped`     | this tune's per-voice pass ran without a result (for libgme / AdLib also: the tune is longer than 900 s) | `Spectrum — per-voice meters not available for this tune` |
 
 Other formats show `Spectrum — per-voice meters not available for <format>`
 straight away, and a `loading…` label turns into that one when the player
@@ -252,5 +295,6 @@ stops waiting.
   describes version 1.
 * Readers check the version byte before parsing: the player and the upload
   check reject any version other than 1.
-* The flags byte at offset 6 and the byte at offset 7 are reserved: v1
-  writers set them to 0, and readers ignore them.
+* The flags byte at offset 6 has one defined bit, bit 0 (voice names
+  follow the levels); its other bits and the byte at offset 7 are reserved:
+  v1 writers set them to 0, and readers ignore them.

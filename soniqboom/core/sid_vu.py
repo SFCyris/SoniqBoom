@@ -35,6 +35,18 @@ log = logging.getLogger(__name__)
 VOICE_MUTES: tuple[tuple[int, ...], ...] = ((2, 3), (1, 3), (1, 2))
 
 
+def voice_mutes(chips: int = 1) -> "tuple[tuple[int, ...], ...]":
+    """The ``-u<n>`` mute sets isolating each voice of a tune for ``chips``
+    SID chips (1..3): sidplayfp numbers the voices of chip ``c`` (0-based)
+    ``3c + 1``..``3c + 3``, so voice ``k`` is isolated by muting every other
+    one — 3 passes for one chip (``VOICE_MUTES``), 6 / 9 for a 2SID / 3SID
+    tune (whose meter shows 6 / 9 voices)."""
+    n = 3 * max(1, min(3, int(chips or 1)))
+    if n == 3:
+        return VOICE_MUTES
+    return tuple(tuple(v for v in range(1, n + 1) if v != k) for k in range(1, n + 1))
+
+
 def _read_wav_samples(wav_path: Path) -> "tuple[array.array, int] | tuple[None, None]":
     """Read a mono 16-bit PCM WAV into a signed-short array + its sample rate.
     Returns (None, None) if it can't be read as such.

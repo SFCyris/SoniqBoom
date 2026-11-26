@@ -109,6 +109,43 @@ LIBXMP_VERSION="$(arg LIBXMP_VERSION)"
 fetch "https://github.com/libxmp/libxmp/releases/download/libxmp-${LIBXMP_VERSION}/libxmp-${LIBXMP_VERSION}.tar.gz" \
       "libxmp-${LIBXMP_VERSION}.tar.gz" libxmp "$LIBXMP_VERSION" "$(arg LIBXMP_SHA256)"
 
+# libADLMIDI, libOPNMIDI and libmt32emu (munt) — midirender: their release
+# archives (SHA-256 checked), built unmodified.  The FM banks the build
+# doesn't use and whose terms are unclear are left out of the bundle:
+# libADLMIDI's "grey zone" banks (fm_banks_new/greyzone, the game banks of
+# its legacy fm_banks/ and src/inst_db.cpp, their compiled form — the build
+# compiles src/inst_db_no_grey.cpp), and libOPNMIDI's banks other than its
+# own xg.wopn / gm.wopn (MIT).
+fetch_pruned() {   # fetch_pruned <url> <file> <component> <version> <sha256> <paths left out…>
+    local url="$1" file="$2" comp="$3" ver="$4" sha="$5"; shift 5
+    local dl="$WORK/$file" dir="$WORK/prune-$comp" got
+    curl -sfL --retry 3 --max-time 600 "$url" -o "$dl"
+    got="$(sha256sum "$dl" 2>/dev/null || shasum -a 256 "$dl")"; got="${got%% *}"
+    [ "$got" = "$sha" ] || { echo "$comp: SHA-256 mismatch: got $got, pinned $sha" >&2; exit 1; }
+    mkdir -p "$dir"
+    tar -xzf "$dl" -C "$dir"
+    local top; top="$(ls "$dir")"
+    local p; for p in "$@"; do rm -rf "${dir:?}/$top/$p"; done
+    tar -C "$dir" -czf "$OUT/$file" "$top"
+    rm -rf "$dir" "$dl"
+    record "$file" "$comp" "$ver" "$url (SHA-256 $sha) without: $*"
+}
+ADLMIDI_VERSION="$(arg ADLMIDI_VERSION)"
+fetch_pruned "https://github.com/Wohlstand/libADLMIDI/archive/refs/tags/v${ADLMIDI_VERSION}.tar.gz" \
+      "libADLMIDI-${ADLMIDI_VERSION}.tar.gz" libADLMIDI "$ADLMIDI_VERSION" "$(arg ADLMIDI_SHA256)" \
+      fm_banks fm_banks_new/greyzone src/inst_db.cpp banks.ini
+OPNMIDI_VERSION="$(arg OPNMIDI_VERSION)"
+fetch_pruned "https://github.com/Wohlstand/libOPNMIDI/archive/refs/tags/v${OPNMIDI_VERSION}.tar.gz" \
+      "libOPNMIDI-${OPNMIDI_VERSION}.tar.gz" libOPNMIDI "$OPNMIDI_VERSION" "$(arg OPNMIDI_SHA256)" \
+      fm_banks/Nineko.wopn fm_banks/Nineko-readme.txt fm_banks/Tomsoft.wopn \
+      fm_banks/Tomsoft-readme.txt fm_banks/gems-fmlib-gmize.wopn \
+      fm_banks/gems-fmlib-gmize-readme.txt fm_banks/gm-old.wopn fm_banks/fmmidi.wopn \
+      fm_banks/fmmidi-readme.txt fm_banks/gs-by-papiezak-and-sneakernets.wopn \
+      fm_banks/gs-by-papiezak-and-sneakernets-readme.txt
+MUNT_VERSION="$(arg MUNT_VERSION)"
+fetch "https://github.com/munt/munt/archive/refs/tags/munt_${MUNT_VERSION}.tar.gz" \
+      "munt-${MUNT_VERSION}.tar.gz" munt "$MUNT_VERSION" "$(arg MUNT_SHA256)"
+
 # Furnace (furnace-headless) — the pinned commit with the two submodules the
 # headless build compiles (extern/fmt, extern/adpcm); its demo songs (not
 # under the GPL), instruments and wavetables (not built, no licence stated)

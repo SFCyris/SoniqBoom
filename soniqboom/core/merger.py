@@ -126,6 +126,29 @@ def _apply_entry(state: dict, entry: dict) -> None:
         drop_user_data(state.setdefault("play_stats", {}), state.setdefault("history", {}),
                        entry["uid"])
 
+    # Waveforms and folder-hash lookups (2.3.0: journaled — before, only a
+    # full snapshot saved them).  A version before ignores these records.
+    elif op == "store_waveforms":
+        data = entry.get("data")
+        if isinstance(data, dict):
+            state.setdefault("waveforms", {}).update(data)
+
+    elif op == "forget_waveforms":
+        waveforms = state.get("waveforms")
+        if isinstance(waveforms, dict):
+            for tid in entry.get("ids", []):
+                waveforms.pop(tid, None)
+
+    elif op == "clear_waveforms":
+        waveforms = state.get("waveforms")
+        if isinstance(waveforms, dict):
+            waveforms.clear()
+
+    elif op == "store_hash_lookups":
+        data = entry.get("data")
+        if isinstance(data, dict):
+            state.setdefault("hash_lookups", {}).update(data)
+
 
 def _entry_uid(state: dict, entry: dict) -> str:
     """The user a per-user record (``record_play``, ``push_history``) belongs
@@ -205,7 +228,9 @@ def _do_merge_locked(data_dir: Path) -> int:
     # Load the current snapshot — fall back to backup if the primary is
     # missing or empty (can happen if a previous merge/shutdown wrote an
     # empty state).  Prefer whichever file has more tracks so we never
-    # regress from a populated snapshot to an empty one.
+    # regress from a populated snapshot to an empty one — except a primary
+    # emptied on purpose (``persistence.emptied_on_purpose``: the library's
+    # own deletes left no track), which is the library as it is.
     state: dict = {}
     for src in (snapshot_path, backup_path):
         candidate = _p._try_load_json(src)
@@ -217,8 +242,8 @@ def _do_merge_locked(data_dir: Path) -> int:
         curr_tracks = len(state.get("tracks", {}))
         if cand_tracks >= curr_tracks:
             state = candidate
-            if cand_tracks > 0:
-                break  # found a populated snapshot, use it
+            if cand_tracks > 0 or (src == snapshot_path and _p.emptied_on_purpose(candidate)):
+                break  # found a populated snapshot (or one emptied on purpose), use it
 
     # Only a snapshot of this database version takes the records: an older
     # one is converted (with a backup first) by the server's next start

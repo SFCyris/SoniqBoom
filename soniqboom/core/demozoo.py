@@ -64,7 +64,9 @@ _PARTY_RELEASES = "public.parties_party_releases"             # party↔producti
 _PLATFORM = "public.platforms_platform"                       # platform id→name ("Amiga OCS/ECS")
 _PROD_PLATFORMS = "public.productions_production_platforms"   # M2M production↔platform
 _PROD_LINK = "public.productions_productionlink"              # production↔(link type, parameter)
-_DETAIL_TABLES = (_REL_LINK, _PARTY_RELEASES, _PLATFORM, _PROD_PLATFORMS, _PROD_LINK)
+_PARTY_SERIES = "public.parties_partyseries"                  # party series id→name ("Revision")
+_DETAIL_TABLES = (_REL_LINK, _PARTY_RELEASES, _PLATFORM, _PROD_PLATFORMS, _PROD_LINK,
+                  _PARTY_SERIES)
 # The columns of the SCENE tab's own export tables and the profile columns it
 # reads (a missing one is logged; the production / party columns shared with
 # the enrichment are read as before).
@@ -75,10 +77,15 @@ _DETAIL_COLUMNS = {
     _PLATFORM: ("id", "name"),
     _PROD_PLATFORMS: ("production_id", "platform_id"),
     _PROD_LINK: ("production_id", "link_class", "parameter", "is_download_link"),
+    _PARTY: ("start_date_date", "end_date_date", "party_series_id"),
+    _PARTY_SERIES: ("id", "name"),
 }
 # The index's layout (sqlite ``user_version``): an index of an older layout
 # lacks the SCENE tab's details and is built again once (``needs_rebuild``).
-INDEX_SCHEMA = 2
+# 3: the musicians' names for the composer identities (``scener_name``, real
+# names in ``scener_detail``) and the parties' dates and series
+# (``party_date`` — "On this day", upcoming parties).
+INDEX_SCHEMA = 3
 # The live API's disk cache of earlier versions (glob patterns in the index's
 # folder): removed with a new index.
 OLD_CACHE_FILES = ("scener_*.json", "prod_*.json")
@@ -578,6 +585,7 @@ def _parse_dump(path: Path, details: "dict | None" = None):
     prod_plats: dict[str, list[str]] = {}           # music production id → [platform id]
     prod_links: list[tuple[str, str, str, bool]] = []   # (music production, type, parameter, download)
     prod_date: dict[str, tuple[str, str]] = {}      # production id → (release date, precision)
+    party_info: dict[str, tuple] = {}               # party id → (start date, end date, series id)
     seen_tables: set[str] = set()
     seen_cols: dict[str, set[str]] = {}
     cur: str | None = None
@@ -631,6 +639,21 @@ def _parse_dump(path: Path, details: "dict | None" = None):
                     si = idx.get("start_date_date")
                     if si is not None:
                         party_year[parts[ii]] = _year_of(_unesc(parts[si]))
+                    if want_details:
+                        ei, ri = idx.get("end_date_date"), idx.get("party_series_id")
+
+                        def _day(ci, pc):
+                            # (a date known to the month or the year only is
+                            # no day: "On this day" needs the day)
+                            if ci is None:
+                                return ""
+                            p = idx.get(pc)
+                            if p is not None and (_unesc(parts[p]) or "d") != "d":
+                                return ""
+                            return _unesc(parts[ci]) or ""
+                        party_info[parts[ii]] = (
+                            _day(si, "start_date_precision"), _day(ei, "end_date_precision"),
+                            _unesc(parts[ri]) if ri is not None else None)
             elif cur == _COMPETITION:
                 ii, pi = idx.get("id"), idx.get("party_id")
                 if ii is not None and pi is not None:
@@ -923,7 +946,8 @@ def _parse_dump(path: Path, details: "dict | None" = None):
             prod_plats=prod_plats, plat_name=plat_name, party_rel=party_rel,
             party_name=party_name, party_year=party_year, placed_in=placed_in,
             comp_party=comp_party, comp_name=comp_name, place_of=place_of,
-            comp_ranking=comp_ranking, prod_links=prod_links))
+            comp_ranking=comp_ranking, prod_links=prod_links, party_info=party_info,
+            series=rows.get(_PARTY_SERIES) or []))
     return unique, ambig, prod_years, prod_soundtrack, music_games, music_uses
 
 
@@ -931,16 +955,24 @@ def _details_from_dump(*, rel, nick_rel, nicks, nick_variants, memberships, rel_
                        prod_nicks, prod_title, prod_super, prod_date, prod_types,
                        type_name, prod_plats, plat_name, party_rel, party_name,
                        party_year, placed_in, comp_party, comp_name, place_of,
-                       comp_ranking, prod_links) -> dict:
+                       comp_ranking, prod_links, party_info=None, series=()) -> dict:
     """The SCENE tab's rows, keyed by Demozoo id (``refresh_index`` writes
     them; ``scener_details`` / ``scener_productions`` / ``production_detail``
     read them):
 
     * ``sceners``: ``[(releaser_id, name, aliases_json, groups_json,
-      variants_json, notes, location)]`` for every person — the nicks, the
-      groups (current ones first), the nicks' abbreviations and other spellings
-      ("PM"), the profile's notes (as plain text, ``_plain_notes``: converted
-      once here) and location ("Finland");
+      variants_json, notes, location, real_name)]`` for every person — the
+      nicks, the groups (current ones first), the nicks' abbreviations and
+      other spellings ("PM"), the profile's notes (as plain text,
+      ``_plain_notes``: converted once here), location ("Finland") and real
+      name (first name + surname, "" when not recorded);
+    * ``names``: ``[(key, releaser_id, kind)]`` — every name of every
+      releaser by its ``composers.index_keys``, ``kind`` "nick" (a nick or the
+      releaser's name), "real" (a person's real name), "variant" (a nick's
+      abbreviation or other spelling) or "group" (any name of a group): the
+      composer identities' Demozoo evidence (``identity_rows``);
+    * ``party_cal``: ``[(party_id, name, series_id, series, start, end)]``
+      — every party's dates (``YYYY-MM-DD`` as the export has them) and series;
     * ``scener_links``: ``[(releaser_id, link type, parameter)]``;
     * ``prods``: ``[(id, title, release date, year, types, platforms_json)]``
       (``types``: the type names, comma-separated)
@@ -981,6 +1013,10 @@ def _details_from_dump(*, rel, nick_rel, nicks, nick_variants, memberships, rel_
             continue
         cur = (m.get("is_current") or "t") in ("t", "true", True, "1")
         groups[m.get("member_id")][0 if cur else 1].append(g["name"])
+    def _real(r) -> str:
+        return " ".join(p.strip() for p in (r.get("first_name"), r.get("surname"))
+                        if isinstance(p, str) and p.strip())
+
     sceners = []
     for rid, r in rel.items():
         i = _int(rid)
@@ -991,7 +1027,35 @@ def _details_from_dump(*, rel, nick_rel, nicks, nick_variants, memberships, rel_
         gs += sorted(set(before) - set(gs), key=str.casefold)
         sceners.append((i, r.get("name") or "", json.dumps(aliases.get(rid, [])),
                         json.dumps(gs), json.dumps(variants.get(rid, [])),
-                        _plain_notes(r.get("notes")), (r.get("location") or "").strip()))
+                        _plain_notes(r.get("notes")), (r.get("location") or "").strip(),
+                        _real(r)))
+    from soniqboom.core.composers import index_keys
+    name_rows: set = set()
+
+    def _name(rid, nm, kind) -> None:
+        i = _int(rid)
+        if i is None or not isinstance(nm, str) or not nm.strip():
+            return
+        k = "group" if _isgroup(rel.get(rid)) else kind
+        for key in index_keys(nm):
+            name_rows.add((key, i, k))
+    for rid, r in rel.items():
+        _name(rid, r.get("name"), "nick")
+        if not _isgroup(r):
+            _name(rid, _real(r), "real")
+    for n in nicks:
+        _name(n.get("releaser_id"), n.get("name"), "nick")
+        _name(n.get("releaser_id"), n.get("abbreviation"), "variant")
+    for v in nick_variants:
+        _name(nick_rel.get(v.get("nick_id")), v.get("name"), "variant")
+    series_name = {s.get("id"): (s.get("name") or "").strip() for s in series}
+    party_cal = []
+    for pid, (start, end, sid) in (party_info or {}).items():
+        i = _int(pid)
+        if i is None:
+            continue
+        party_cal.append((i, party_name.get(pid, ""), _int(sid), series_name.get(sid, ""),
+                          start or "", end or ""))
     scener_links = [(i, k, v) for rid, k, v in rel_links if (i := _int(rid)) is not None]
 
     prods, authors, keep = [], [], set()
@@ -1026,15 +1090,20 @@ def _details_from_dump(*, rel, nick_rel, nicks, nick_variants, memberships, rel_
                              party_name.get(a, ""), party_year.get(a)))
     links = [(int(pid), k, v, 1 if dl else 0) for pid, k, v, dl in prod_links if pid in keep]
     return {"sceners": sceners, "scener_links": scener_links, "prods": prods,
-            "authors": authors, "parties": parties, "placings": placings, "links": links}
+            "authors": authors, "parties": parties, "placings": placings, "links": links,
+            "names": sorted(name_rows), "party_cal": party_cal}
 
 
 def _write_details(con: sqlite3.Connection, d: dict) -> None:
     """The SCENE tab's tables (``_details_from_dump``), written anew."""
     spec = (
         ("scener_detail", "releaser_id INTEGER PRIMARY KEY, name TEXT, aliases TEXT, "
-                          "groups TEXT, variants TEXT, notes TEXT, location TEXT",
+                          "groups TEXT, variants TEXT, notes TEXT, location TEXT, "
+                          "real_name TEXT",
          "sceners", None),
+        ("scener_name", "key TEXT, releaser_id INTEGER, kind TEXT", "names", "key"),
+        ("party_date", "id INTEGER PRIMARY KEY, name TEXT, series_id INTEGER, series TEXT, "
+                       "start_date TEXT, end_date TEXT", "party_cal", None),
         ("scener_link", "releaser_id INTEGER, cls TEXT, param TEXT",
          "scener_links", "releaser_id"),
         ("music_prod", "id INTEGER PRIMARY KEY, title TEXT, date TEXT, year INTEGER, "
@@ -1052,7 +1121,10 @@ def _write_details(con: sqlite3.Connection, d: dict) -> None:
         con.execute(f"CREATE TABLE {table} ({cols})")
         rows = d.get(key) or []
         if rows:
-            marks = ",".join("?" * len(rows[0]))
+            # (a row of an earlier layout lacks the columns added since: NULL)
+            n = cols.count(",") + 1
+            rows = [r if len(r) >= n else (*r, *([None] * (n - len(r)))) for r in rows]
+            marks = ",".join("?" * n)
             con.executemany(f"INSERT OR IGNORE INTO {table} VALUES ({marks})", rows)
         if ix:
             con.execute(f"CREATE INDEX ix_{table} ON {table}({ix})")
@@ -1761,8 +1833,9 @@ def scener_details(releaser_id: object) -> dict | None:
     if con is None:
         return None
     try:
-        row = con.execute("SELECT name, aliases, groups, variants, notes, location "
-                          "FROM scener_detail "
+        real = ", real_name" if _has_column(con, "scener_detail", "real_name") else ", ''"
+        row = con.execute("SELECT name, aliases, groups, variants, notes, location" + real +
+                          " FROM scener_detail "
                           "WHERE releaser_id = ?", (rid,)).fetchone()
         if row is None:
             return None
@@ -1772,12 +1845,159 @@ def scener_details(releaser_id: object) -> dict | None:
                 "groups": json.loads(row[2] or "[]"),
                 "variants": json.loads(row[3] or "[]"),
                 "notes": row[4] or "", "location": row[5] or "", "links": links,
+                "real_name": row[6] or "",
                 "demozoo_url": f"https://demozoo.org/sceners/{rid}/"}
     except Exception:                                   # noqa: BLE001 — the offline card stays
         log.debug("Demozoo scener %s details failed", rid, exc_info=True)
         return None
     finally:
         con.close()
+
+
+def identity_rows(keys) -> dict:
+    """``{key: [(releaser_id, kind)]}`` of the names (``scener_name``, keys
+    as ``composers.index_keys`` makes them) — the composer identities'
+    Demozoo evidence; {} for an index without the table (an older layout,
+    none) — the identities then join no spellings by Demozoo."""
+    con = _detail_con()
+    if con is None:
+        return {}
+    out: dict = {}
+    try:
+        if not _has_table(con, "scener_name"):
+            return {}
+        ks = list(dict.fromkeys(k for k in keys if k))
+        for i in range(0, len(ks), 500):
+            part = ks[i:i + 500]
+            marks = ",".join("?" * len(part))
+            for key, rid, kind in con.execute(
+                    f"SELECT key, releaser_id, kind FROM scener_name WHERE key IN ({marks})",
+                    part):
+                if rid is not None:
+                    out.setdefault(key, []).append((int(rid), kind))
+        return out
+    except Exception:                                   # noqa: BLE001
+        log.debug("Demozoo identity rows failed", exc_info=True)
+        return {}
+    finally:
+        con.close()
+
+
+def identity_details(releaser_ids) -> dict:
+    """``{releaser_id: {name, real_name, aliases, variants, groups}}`` of the
+    people (``scener_detail``) — the composer identities' names; {} without
+    the details."""
+    con = _detail_con()
+    if con is None:
+        return {}
+    out: dict = {}
+    try:
+        if not _has_table(con, "scener_detail"):
+            return {}
+        real = ", real_name" if _has_column(con, "scener_detail", "real_name") else ", ''"
+        rids = sorted({int(r) for r in releaser_ids if r is not None})
+        for i in range(0, len(rids), 500):
+            part = rids[i:i + 500]
+            marks = ",".join("?" * len(part))
+            for rid, name, aliases, variants, groups, rn in con.execute(
+                    "SELECT releaser_id, name, aliases, variants, groups" + real +
+                    f" FROM scener_detail WHERE releaser_id IN ({marks})", part):
+                out[int(rid)] = {"name": name or "", "real_name": rn or "",
+                                 "aliases": json.loads(aliases or "[]"),
+                                 "variants": json.loads(variants or "[]"),
+                                 "groups": json.loads(groups or "[]")}
+        return out
+    except Exception:                                   # noqa: BLE001
+        log.debug("Demozoo identity details failed", exc_info=True)
+        return {}
+    finally:
+        con.close()
+
+
+def scener_placings(releaser_id: object) -> list[dict] | None:
+    """Every competition placing of a person's music productions —
+    ``[{title, rank, place, competition, party, year, url, party_url}]``,
+    newest first, best place first within a party; None without the
+    details."""
+    try:
+        rid = int(releaser_id)
+    except (TypeError, ValueError):
+        return None
+    con = _detail_con()
+    if con is None:
+        return None
+    try:
+        rows = con.execute(
+            "SELECT p.id, p.title, pl.ranking, pl.competition, pl.party_id, pl.party, pl.year "
+            "FROM prod_author a JOIN music_prod p ON p.id = a.prod_id "
+            "JOIN prod_placing pl ON pl.prod_id = p.id WHERE a.releaser_id = ?",
+            (rid,)).fetchall()
+        out = []
+        for pid, title, rank, comp, party_id, party, year in rows:
+            out.append({"title": title or "", "rank": rank or "",
+                        "place": _place(None, rank), "competition": comp or "",
+                        "party": party or "", "year": year,
+                        "url": f"https://demozoo.org/productions/{pid}/",
+                        "party_url": f"https://demozoo.org/parties/{party_id}/" if party_id else ""})
+        out.sort(key=lambda r: (-(r["year"] or 0), r["party"].casefold(),
+                                r["place"] if r["place"] is not None else 1 << 20,
+                                r["title"].casefold()))
+        return out
+    except Exception:                                   # noqa: BLE001
+        log.debug("Demozoo placings of %s failed", rid, exc_info=True)
+        return None
+    finally:
+        con.close()
+
+
+_cal_memo: tuple | None = None
+
+
+def party_calendar() -> list[dict] | None:
+    """Every party with its dates and series — ``[{id, name, series_id,
+    series, start, end}]`` (``start`` / ``end``: ``datetime.date`` or None) —
+    from the index (memoised per index file); None for an index without the
+    dates (an older layout: Settings offers the refresh)."""
+    global _cal_memo
+    sig = _index_sig()
+    if sig is None:
+        return None
+    if _cal_memo is not None and _cal_memo[0] == sig:
+        return _cal_memo[1]
+    con = _detail_con()
+    if con is None:
+        return None
+    try:
+        if not _has_table(con, "party_date"):
+            return None
+        out = []
+        for pid, name, sid, series, start, end in con.execute(
+                "SELECT id, name, series_id, series, start_date, end_date FROM party_date"):
+            out.append({"id": pid, "name": name or "", "series_id": sid,
+                        "series": series or "", "start": _date_of(start),
+                        "end": _date_of(end)})
+    except Exception:                                   # noqa: BLE001
+        log.debug("Demozoo party calendar failed", exc_info=True)
+        return None
+    finally:
+        con.close()
+    _cal_memo = (sig, out)
+    return out
+
+
+def _date_of(v: object):
+    """``"2019-04-19"`` → that ``date``; anything else (a year alone, a
+    month) → None."""
+    import datetime
+    if not isinstance(v, str):
+        return None
+    m = re.match(r"^\s*(\d{4})-(\d{2})-(\d{2})", v)
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
 
 
 async def fetch_scener_details(releaser_id: int) -> dict | None:

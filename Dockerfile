@@ -294,6 +294,43 @@ RUN set -eux; \
       || echo "NOTE: sawteethrender build failed — Sawteeth songs don't play." ; \
     strip --strip-unneeded /out/bin/sawteethrender 2>/dev/null || true
 
+# oplvoices — the per-channel meters and the voice mixer of AdLib / OPL tunes
+# (soniqboom/native/oplvoices, AGPL-3.0-or-later): AdPlug's player through its
+# Nuked OPL3 core, built against Debian's libadplug (LGPL-2.1-or-later — the
+# runtime library adplay installs below).  Best-effort: without it AdLib
+# tunes still play, with the spectrum meter and no voice mixer.
+RUN set -eux; \
+    { apt-get update && apt-get install -y --no-install-recommends libadplug-dev libbinio-dev \
+      && sh /src/native/oplvoices/build.sh /out/bin; } \
+      || echo "NOTE: oplvoices build failed — AdLib tunes play without per-channel meters." ; \
+    rm -rf /var/lib/apt/lists/*; \
+    strip --strip-unneeded /out/bin/oplvoices 2>/dev/null || true
+
+# midirender — MIDI-family songs on an OPL3 or OPN2 FM synth or an MT-32, and
+# the game MIDI formats (XMI, DMX MUS, HMI / HMP, GMF, KLM;
+# soniqboom/native/midirender): libADLMIDI and libOPNMIDI (LGPL / GPL-3.0-or-
+# later parts; libADLMIDI without its "grey zone" banks) and libmt32emu
+# (munt, LGPL-2.1-or-later) from their pinned release archives (SHA-256
+# checked), built unmodified as static libraries with CMake.  No MT-32 ROMs
+# are included: a user points Settings → Renderers → MIDI synths at their own.
+ARG ADLMIDI_VERSION=1.6.2.1
+ARG ADLMIDI_SHA256=e01aec7b2bc284476eedab77a8b6e177c5beda2bc2f4545166339badfc0464c5
+ARG OPNMIDI_VERSION=1.6.2
+ARG OPNMIDI_SHA256=59bc4e9a88d57fa810b499932b829cd80cb88fce100bab9e3da82158edd5550d
+ARG MUNT_VERSION=2_8_4
+ARG MUNT_SHA256=75f29ed4b56c830e71005ce2d3ffc0b6b19a89ca8e3119054fa0d315b8bcc384
+RUN set -eux; \
+    for i in 1 2 3; do \
+      ADLMIDI_VERSION="$ADLMIDI_VERSION" ADLMIDI_SHA256="$ADLMIDI_SHA256" \
+      OPNMIDI_VERSION="$OPNMIDI_VERSION" OPNMIDI_SHA256="$OPNMIDI_SHA256" \
+      MUNT_VERSION="$MUNT_VERSION" MUNT_SHA256="$MUNT_SHA256" \
+      LICENSE_DIR=/out/share/doc/third-party \
+        sh /src/native/midirender/build.sh /out/bin && break; \
+      sleep 5; done; \
+    [ -x /out/bin/midirender ] \
+      || echo "NOTE: midirender build failed — XMI / MUS / HMI songs and the OPL3 / OPN2 / MT-32 MIDI synths don't play." ; \
+    strip --strip-unneeded /out/bin/midirender 2>/dev/null || true
+
 # zxtune123 — PSF console-music family (PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF),
 # S98 FM dumps and Farbrausch V2 songs.
 # Official prebuilt; fetch the arch that matches the build — BOTH x86_64 and
@@ -496,6 +533,9 @@ RUN set -eu; \
          /out/bin/furnace-headless /out/share/doc/third-party/furnace/LICENSE \
          /out/bin/xmprender /out/share/doc/third-party/libxmp/libxmp-LICENSE \
          /out/bin/sawteethrender /out/share/doc/third-party/sawteethrender/NostalgicPlayer-LICENSE \
+         /out/bin/midirender /out/share/doc/third-party/libadlmidi/LICENSE \
+         /out/share/doc/third-party/libadlmidi/NOTICE /out/share/doc/third-party/libopnmidi/LICENSE \
+         /out/share/doc/third-party/libopnmidi/NOTICE /out/share/doc/third-party/munt/COPYING.LESSER.txt \
          /out/bin/mdxrender /out/share/doc/third-party/portable_mdx/portable_mdx-readme.md \
          /out/share/doc/third-party/portable_mdx/Apache-2.0 \
          /out/bin/sidplayfp /out/lib/libsidplayfp.so /out/lib/libresidfp.so \
@@ -592,7 +632,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Renderers built in the builder stage: psgplay/zxtune123/ym2wav/hvl2wav/uade123/
 # sidplayfp/openmpt123/kssrender/dsfrender/milkyrender/mlrender/mdxrender/gt2reloc/
-# sunvoxrender/furnace-headless/xmprender/sawteethrender onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
+# sunvoxrender/furnace-headless/xmprender/sawteethrender/midirender onto PATH (the app finds ym2wav/hvl2wav via shutil.which —
 # no runtime compiler); libsidplayfp / libresidfp / libstilview into /usr/local/lib,
 # libopenmpt into /usr/local/lib/<multiarch>;
 # uade's libzakalwe/bencodetools .so + its eagleplayer/score data into /usr/local;
@@ -623,14 +663,16 @@ RUN --mount=type=bind,source=scripts/openmpt_selftest.py,target=/tmp/openmpt_sel
     || { [ "$ALLOW_MISSING_RENDERERS" = "1" ] \
          && echo "    (ALLOW_MISSING_RENDERERS=1 — shipping anyway)" >&2; }
 
-# ── Gate: AdLib, KSS, DSF, DSIK, Musicline, MDX, GoatTracker, FamiTracker, libxmp, Sawteeth
+# ── Gate: AdLib, KSS, DSF, DSIK, Musicline, MDX, GoatTracker, FamiTracker, libxmp, Sawteeth, MIDI
 # A synthesized IMF through adplay, a synthesized KSS through kssrender, a
 # synthesized Dreamcast DSF through dsfrender, a synthesized DSIK v1 module
 # through milkyrender, a synthesized Musicline Editor module through
 # mlrender, a synthesized MDX song through mdxrender, a synthesized
 # GoatTracker song through gt2reloc → sidplayfp, a synthesized FamiTracker
 # module through furnace, a synthesized ProTracker module through
-# xmprender and a synthesized Sawteeth song through sawteethrender must each
+# xmprender, a synthesized Sawteeth song through sawteethrender and a
+# synthesized MIDI file and DMX MUS song through midirender (OPL3 and OPN2;
+# MT-32 must be compiled in — no ROMs, so not rendered) must each
 # come out audible — a renderer that starts but can't
 # read its format fails the build.  sunvoxrender must start (a
 # SunVox example project is rendered in the builder's gate).

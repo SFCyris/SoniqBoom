@@ -19,6 +19,9 @@ import { healthOf, healthBadge, reportedLine, foundLine, canReport, mark as heal
 import { mountSignalChain }    from './viz/signalchain.js';
 import { vizGroupEnabled }     from './viz/engine.js';
 import { onUiStyleChange, getUiStyle } from './ui_style.js';
+import { csdbSectionHtml, csdbHint } from './csdb_view.js';
+import { artIntent } from './art_intent.js';
+import { mountVoicesTab } from './voices/voices_tab.js';
 
 // ── Chapters (E-18) ────────────────────────────────────────────────────────
 
@@ -197,6 +200,9 @@ const metaPane    = document.getElementById('ti-meta-pane');
 const lyricsPane  = document.getElementById('ti-lyrics-pane');
 const lyricsState = document.getElementById('ti-lyrics-state');
 const scenePane   = document.getElementById('ti-scene-pane');
+// The Voices tab (voices/voices_tab.js: mute / solo / scopes of chip voices).
+const tabVoices   = document.getElementById('ti-tab-voices');
+const voicesPane  = document.getElementById('ti-voices-pane');
 const sceneBody   = document.getElementById('ti-scene-body');
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -416,6 +422,34 @@ async function _loadArtistAbout(track, { wikiOnly = false } = {}) {
 // re-fetch / skeleton flash.
 let _sceneCache = {};   // track_id → payload | 'loading' | 'error'
 
+// The Scene tab's "Composer page" key: the page opens in the library (Back
+// returns to the list), Track Info closes.
+function _openComposerFrom(e) {
+  const b = e.target.closest('button[data-composer]');
+  if (!b) return;
+  const name = b.dataset.composer;
+  close();
+  document.dispatchEvent(new CustomEvent('sb:open-composer', { detail: { name } }));
+}
+sceneBody?.addEventListener('click', _openComposerFrom);
+document.getElementById('ti-artist')?.addEventListener('click', _openComposerFrom);
+
+// The INFO tab's Artist row gets the same key (the scene payload is read for
+// every retro track, the INFO tab showing or not) — still on this track.
+function _applySceneComposer(track, info, reqTrackId) {
+  const c = info && info.composer;
+  if (!(c && c.name) || _queue[_idx]?.id !== reqTrackId) return;
+  const el = document.getElementById('ti-artist');
+  if (!el || el.querySelector('button[data-composer]')) return;
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'ti-scene-chip ti-composer-page';
+  b.dataset.composer = c.name;
+  b.title = `${c.count} tunes in your library`;
+  b.textContent = 'Composer page \u25b8';
+  el.append(' ', b);
+}
+
 /** Render a resolved scene payload (or an empty-state marker) into the pane. */
 function _renderScene(track, info) {
   if (!sceneBody || !track) return;
@@ -438,13 +472,19 @@ function _renderScene(track, info) {
     return rows.length ? `<div class="ti-scene-block ti-scene-baseline">${rows.join('')}</div>` : '';
   };
   const empty = (msg) => `<div class="ti-scene-empty">${esc(msg)}</div>`;
+  // The musician's composer page (every tune of his in the library, every
+  // spelling of his name) — when the library knows him (``info.composer``).
+  const cp = info && info.composer && info.composer.name
+    ? `<button type="button" class="ti-scene-chip ti-composer-page" data-composer="${esc(info.composer.name)}"`
+      + ` title="${esc(info.composer.count)} tunes in your library">Composer page ▸</button>` : '';
 
   if (!info || !info.found || !info.artist) {
     const msg = info && info.__noartist ? 'No composer name to look up on Demozoo.'
       : info && info.__net             ? 'Couldn’t reach the scene database.'
       : artist                          ? `No demoscene entry found for “${artist}”.`
       :                                   'No demoscene entry found for this track.';
-    sceneBody.innerHTML = baseline() + empty(msg);
+    sceneBody.innerHTML = (cp ? `<div class="ti-scene-chips">${cp}</div>` : '') + baseline() + empty(msg) + _CSDB_HOST;
+    _mountCsdb(track, info);
     return;
   }
 
@@ -468,7 +508,7 @@ function _renderScene(track, info) {
   const aliases = (a.aliases || []).filter(n => n && !seen.has(String(n).toLowerCase()));
   if (aliases.length) ab += `<div class="ti-scene-aka">aka ${esc(aliases.slice(0, 6).join(', '))}</div>`;
   // (a link's ``label`` is its site — "Bandcamp", "Discogs" — from the index)
-  const aChips = [chip(a.url, 'Demozoo')]
+  const aChips = [cp, chip(a.url, 'Demozoo')]
     .concat((a.links || []).slice(0, 20).map(l => chip(l && l.url, (l && l.label) || hostOf(l && l.url))))
     .filter(Boolean).join('');
   if (aChips) ab += `<div class="ti-scene-chips">${aChips}</div>`;
@@ -508,6 +548,7 @@ function _renderScene(track, info) {
     rb += `</div>`;
     parts.push(rb);
   }
+  parts.push(_CSDB_HOST);          // CSDb (a SID): the releases that use the tune
 
   // ── Discography ──
   if (disco.length) {
@@ -528,6 +569,56 @@ function _renderScene(track, info) {
 
   parts.push(baseline());
   sceneBody.innerHTML = parts.join('');
+  _mountCsdb(track, info);
+}
+
+// ── CSDb section (SID tunes; core/csdb.py, js/csdb_view.js) ───────────────────
+// Asked when Track Info shows a SID — after the Scene card, whose matched
+// Demozoo production may name the tune's CSDb id (the hint) — once per track
+// per page (cached); the server asks CSDb at most once per tune not known yet.
+// No confident answer, the lookup switched off or CSDb unreachable: the host
+// stays empty and nothing shows.
+const _CSDB_HOST = '<div class="ti-csdb-host"></div>';
+let _csdbCache = {};   // track_id → payload | 'loading'
+
+function _paintCsdb(track, data) {
+  if (!sceneBody || _queue[_idx]?.id !== track.id) return;
+  const host = sceneBody.querySelector('.ti-csdb-host');
+  if (!host) return;
+  host.innerHTML = csdbSectionHtml(data);
+  const img = host.querySelector('.ti-csdb-shot');
+  if (img) {
+    // painted on load (never waits on decode()); a missing picture just goes
+    const show = () => img.classList.add('loaded');
+    if (img.complete && img.naturalWidth > 0) show();
+    else {
+      img.addEventListener('load', show, { once: true });
+      img.addEventListener('error', () => img.remove(), { once: true });
+    }
+  }
+}
+
+async function _mountCsdb(track, info) {
+  if (!track || !track.id || track.format !== 'SID') return;
+  const id = track.id;
+  const cached = _csdbCache[id];
+  if (cached === 'loading') return;
+  if (cached) { _paintCsdb(track, cached); return; }
+  _csdbCache[id] = 'loading';
+  let data = null;
+  try {
+    let q = `/api/scene/csdb?track_id=${encodeURIComponent(id)}`;
+    const hint = csdbHint(info);
+    if (hint) q += `&sid=${hint}`;
+    const r = await fetch(q, { credentials: 'same-origin' });
+    data = r.ok ? await r.json() : null;
+  } catch (_) { data = null; }
+  // Kept for the page: a section, or "CSDb's tune is another one".  Any other
+  // answer (off, unreachable, no id known yet — the Scene card's hint may
+  // still come) is asked again at the next open.
+  if (data && (data.found === true || data.reason === 'no_match')) _csdbCache[id] = data;
+  else delete _csdbCache[id];
+  if (data) _paintCsdb(track, data);
 }
 
 /** Reflect a matched production's canonical release year into the INFO Year row
@@ -576,6 +667,7 @@ async function _loadScene(track) {
   if (cached && cached !== 'error') {                  // resolved payload → instant
     _renderScene(track, cached);
     _applySceneYear(track, cached, reqTrackId);
+    _applySceneComposer(track, cached, reqTrackId);
     return;
   }
 
@@ -608,6 +700,7 @@ async function _loadScene(track) {
     if (_queue[_idx]?.id === reqTrackId) {
       _renderScene(track, info);
       _applySceneYear(track, info, reqTrackId);
+      _applySceneComposer(track, info, reqTrackId);
     }
   } catch (e) {
     if (e && e.name === 'AbortError') {
@@ -908,6 +1001,7 @@ let _shown = null;
 function _render(track) {
   if (!track) return;
   _shown = { ...track };
+  artIntent(track);                // its game's box cover, when IGDB is set up (art_intent.js)
 
   // ── Artwork ──
   artImg.src = '';
@@ -1182,7 +1276,7 @@ function _render(track) {
   // visual lie).
   try {
     overlay.dispatchEvent(new CustomEvent('trackinfo:render', {
-      detail: { trackId: track?.id || null }
+      detail: { trackId: track?.id || null, track: track || null }
     }));
   } catch (_) {}
 }
@@ -2341,6 +2435,13 @@ function _switchTab(tab) {
     scenePane.classList.toggle('active', tab === 'scene');
     scenePane.classList.toggle('hidden', tab !== 'scene');
   }
+  if (tabVoices && voicesPane) {
+    tabVoices.classList.toggle('active', tab === 'voices');
+    tabVoices.setAttribute('aria-selected', tab === 'voices' ? 'true' : 'false');
+    voicesPane.classList.toggle('active', tab === 'voices');
+    voicesPane.classList.toggle('hidden', tab !== 'voices');
+  }
+  try { overlay.dispatchEvent(new CustomEvent('trackinfo:tab', { detail: { tab } })); } catch (_) {}
   if (tab === 'lyrics') _loadLyrics(_queue[_idx]);
   else if (tab === 'scene') _loadScene(_queue[_idx]);
   else if (_subRevealPending) _revealPlayingSub();
@@ -2349,6 +2450,10 @@ function _switchTab(tab) {
 tabInfo.addEventListener('click',   () => _switchTab('info'));
 tabLyrics.addEventListener('click', () => _switchTab('lyrics'));
 if (tabScene) tabScene.addEventListener('click', () => _switchTab('scene'));
+if (tabVoices && voicesPane) {
+  tabVoices.addEventListener('click', () => _switchTab('voices'));
+  mountVoicesTab({ overlay, tabBtn: tabVoices, pane: voicesPane, tabInfo });
+}
 
 // ── Lyrics loading ────────────────────────────────────────────────────────────
 function _setLyricsState(html) {

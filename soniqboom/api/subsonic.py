@@ -58,8 +58,10 @@ from fastapi.routing import APIRoute
 
 from soniqboom import __version__
 from soniqboom.core import folder_album as _fa
+from soniqboom.core import loudness as _loudness
 from soniqboom.core import subsonic_index as _sx
 from soniqboom.core import store as _store_mod
+from soniqboom.core.search_values import QUERY_MAX_LEN as _QUERY_MAX_LEN
 from soniqboom.core.store import _SPLIT_RE, track_genres
 from soniqboom.core.store import get_store as _library_store
 from soniqboom.core.subsonic_state import get_state as _get_state
@@ -1154,10 +1156,25 @@ _SONG_META: dict[str, tuple] = {}     # id → (rev, gen, folder album or None)
 _SONG_HEAD: dict[str, dict] = {}      # id → keys before the caller's own
 _SONG_TAIL: dict[str, dict] = {}      # id → keys after them
 _SONG_SRC: dict[str, dict] = {}       # id → the track dict it was built from
-# ~2 KB an entry (~200 MB at the cap, measured), plus — for an entry whose
-# track was since replaced and never listed again — the old track dict it
-# pins until the memo is next cleared.
+# ~2 KB an entry (~200 MB at 100k, measured; ~2.0 KB again for 2.3.0's
+# synthetic 50k), plus — for an entry whose track was since replaced and
+# never listed again — the old track dict it pins until the memo is next
+# cleared.  The cap is the larger of _SONG_MEMO_MAX and the library's size
+# plus 10 % (``_song_memo_cap``): a fixed 100k cap on a 506k-track library was
+# cleared every 100k songs a full sync listed, so a re-sync never hit it
+# (cold 18.5 µs a song, warm 9.1 µs — measured on 50k songs), at a cost of
+# ~1 GB of memory at 506k tracks.
 _SONG_MEMO_MAX = 100_000
+
+
+def _song_memo_cap(store) -> int:
+    """The song memo's size limit for ``store``: room for every track it
+    holds (+10 % for entries of replaced tracks), at least _SONG_MEMO_MAX."""
+    try:
+        n = int(store.track_count())
+    except Exception:                    # noqa: BLE001 — a store without it
+        n = 0
+    return max(_SONG_MEMO_MAX, n + n // 10)
 
 
 def _song_memo_clear() -> None:
@@ -1382,6 +1399,12 @@ def _song_static(t: dict, ctx: _SongCtx | None) -> tuple[dict, dict, tuple | Non
                           _fin(t.get("replaygain_album_gain"), 2),
                           _fin(t.get("replaygain_track_peak"), 6),
                           _fin(t.get("replaygain_album_peak"), 6))
+    if t.get("loudness") and tail["replayGain"][0] is None and tail["replayGain"][1] is None:
+        # No ReplayGain tags: the loudness measured for the tune the bare id
+        # plays (core/loudness — a render, an untagged file) as its track gain.
+        measured = _loudness.subsonic_replay_gain(t)
+        if measured is not None:
+            tail["replayGain"] = (measured[0], None, measured[1], None)
     return out, tail, folder_album
 
 
@@ -1471,7 +1494,8 @@ def _track_to_song(t: dict, ctx: _SongCtx | None = None) -> dict:
             # Only the store's own dict is kept — a copy (a smart playlist's
             # search results) would just displace it.
             if ctx.store.get_track(tid) is t:
-                if len(_SONG_META) >= _SONG_MEMO_MAX:
+                if (len(_SONG_META) >= _SONG_MEMO_MAX
+                        and len(_SONG_META) >= _song_memo_cap(ctx.store)):
                     _song_memo_clear()
                 _SONG_META[tid] = (rev, ctx.memo_gen, folder_album)
                 _SONG_HEAD[tid] = out
@@ -1542,6 +1566,15 @@ def _tune_child(song: dict, t: dict, n: int, ctx: _SongCtx | None) -> dict:
     c["id"] = f"{t['id']}~{n}"
     c["title"] = f"{song.get('title') or ''} (Tune {_sx.wire_tune(t, n) + 1}/{cnt})".lstrip()
     c["duration"] = _safe_int(_sx.wire_length(t, n), round_=True)
+    if t.get("loudness") and not _loudness.has_tag_gain(t):
+        # (each tune its own measured loudness — none: no track gain at all,
+        # never the default tune's)
+        measured = _loudness.subsonic_replay_gain(t, n)
+        rg = {k: v for k, v in (c.get("replayGain") or {}).items()
+              if k not in ("trackGain", "trackPeak")}
+        if measured is not None:
+            rg["trackGain"], rg["trackPeak"] = measured
+        c["replayGain"] = rg
     c.pop("bookmarkPosition", None)
     bm = ctx.marks.get(c["id"]) if ctx is not None else None
     if bm:
@@ -1583,6 +1616,37 @@ async def _songs_with_tunes(tracks: list[dict], ctx: _SongCtx) -> list[dict]:
             await asyncio.sleep(_sx._YIELD_SEC)
             t0 = clock()
         out.extend(_with_tunes(tr, _track_to_song(tr, ctx), ctx))
+    return out
+
+
+async def _sliced_map(items, fn) -> list:
+    """``[fn(x) for x in items]`` without the Nones, yielding to the event
+    loop after every ~6 ms slice like ``_songs_with_tunes`` — for listings
+    that may be tens of thousands long (getStarred / getStarred2,
+    getPlaylist).  ``items`` must be a list the caller holds (a snapshot).
+    The cyclic GC is paused within each slice, never across an await (the
+    catalogue build's ``_sx._gc_paused``): the songs are tens of thousands of
+    small acyclic dicts, and unpaused they tripped repeated full collections
+    inside the slices (60-140 ms stalls at 50,000 songs)."""
+    out: list = []
+    clock = time.perf_counter
+    it = iter(items)
+    done = False
+    while not done:
+        t0 = clock()
+        with _sx._gc_paused():
+            n = 0
+            for x in it:
+                r = fn(x)
+                if r is not None:
+                    out.append(r)
+                n += 1
+                if not n % _MAP_CHECK and clock() - t0 >= _sx._SLICE_SEC:
+                    break
+            else:
+                done = True
+        if not done:
+            await asyncio.sleep(_sx._YIELD_SEC)
     return out
 
 
@@ -1878,9 +1942,10 @@ class _NeedScrypt(Exception):
     """``p=`` needs the scrypt check: ``_wrap`` runs it off the event loop
     and re-runs the handler with the verified user (``_PREAUTH``)."""
 
-    def __init__(self, username: str, plain: str) -> None:
+    def __init__(self, username: str, plain: str, client: str | None = None) -> None:
         self.username = username
         self.plain = plain
+        self.client = client              # (the lockout's client key)
 
 
 # True while the current handler run may raise ``_NeedScrypt`` (``_wrap``'s
@@ -1912,10 +1977,87 @@ def _p_authenticate(store):
     return getattr(store, "authenticate_subsonic_password", None) or store.authenticate
 
 
-async def _scrypt_authenticate(username: str, plain: str) -> User | None:
+# One client address holds at most this many off-loop scrypt checks (running
+# or queued for the 2 slots); more are refused at once (a wrong password):
+# a flood of ``p=`` guesses with made-up names from one address used to queue
+# the owner's first check after a restart behind all of them.
+_SCRYPT_PER_CLIENT = 2
+_scrypt_inflight: dict[str, int] = {}
+
+
+@contextlib.asynccontextmanager
+async def _scrypt_turn(client: str | None):
+    """A slot of the scrypt gate for ``client``: yields False (nothing
+    checked) when the client already has _SCRYPT_PER_CLIENT checks in
+    flight, else True once a slot is free."""
+    key = client or "?"
+    if _scrypt_inflight.get(key, 0) >= _SCRYPT_PER_CLIENT:
+        yield False
+        return
+    _scrypt_inflight[key] = _scrypt_inflight.get(key, 0) + 1
+    try:
+        async with _scrypt_semaphore():
+            yield True
+    finally:
+        n = _scrypt_inflight.get(key, 1) - 1
+        if n > 0:
+            _scrypt_inflight[key] = n
+        else:
+            _scrypt_inflight.pop(key, None)
+
+
+# (client, user name, password digest) → the check already running for it:
+# an app that sends the same ``p=`` on several requests at once — the first
+# ones after a restart, before the O(1) cache knows the password — gets ONE
+# scrypt check for all of them, never "too many in flight".
+_SCRYPT_SINGLE: dict[tuple, "asyncio.Future"] = {}
+_SCRYPT_AGAIN = object()        # (the shared check ended without an answer)
+
+
+async def _single_flight_scrypt(client: str | None, username: str, plain: str,
+                                check) -> "User | None":
+    """``check()`` (a gated scrypt check of ``username`` / ``plain`` for
+    ``client``), shared by every identical check running at the same time."""
+    key = (client or "?", (username or "").lower(),
+           hashlib.sha256((plain or "").encode("utf-8", "surrogatepass")).digest())
+    fut = _SCRYPT_SINGLE.get(key)
+    if fut is not None and fut.get_loop() is asyncio.get_running_loop():
+        res = await asyncio.shield(fut)
+        if res is not _SCRYPT_AGAIN:
+            return res
+        return await check()              # (the shared check was cancelled / failed)
+    fut = asyncio.get_running_loop().create_future()
+    _SCRYPT_SINGLE[key] = fut
+    res = _SCRYPT_AGAIN
+    try:
+        res = await check()
+        return res
+    finally:
+        if _SCRYPT_SINGLE.get(key) is fut:
+            del _SCRYPT_SINGLE[key]
+        if not fut.done():
+            fut.set_result(res)
+
+
+async def _scrypt_authenticate(username: str, plain: str,
+                               client: str | None = None) -> User | None:
+    """The ``p=`` scrypt check off the loop, behind the gate, counted
+    against ``client`` (the request's, as ``_resolve_user`` bound it);
+    identical checks running at once share one (``_single_flight_scrypt``)."""
+    from soniqboom.core.users import _REQUEST_CLIENT
     store = get_user_store()
-    async with _scrypt_semaphore():
-        return await asyncio.to_thread(_p_authenticate(store), username, plain)
+
+    async def check():
+        async with _scrypt_turn(client) as ok:
+            if not ok:
+                return None
+            tok = _REQUEST_CLIENT.set(client) if client else None
+            try:
+                return await asyncio.to_thread(_p_authenticate(store), username, plain)
+            finally:
+                if tok is not None:
+                    _REQUEST_CLIENT.reset(tok)
+    return await _single_flight_scrypt(client, username, plain, check)
 
 
 def _pw_equal(a: str, b: str) -> bool:
@@ -1960,6 +2102,24 @@ def _resolve_user(
         except Exception:
             pass
 
+    if not u:
+        return None
+    # The lockout counts per client address (core/users.py): a stranger's
+    # guesses lock out only the stranger, not the owner's apps.  Bound for
+    # this resolution only.
+    from soniqboom.core.users import _REQUEST_CLIENT, request_client_key
+    client = request_client_key(request)
+    tok = _REQUEST_CLIENT.set(client)
+    try:
+        return _resolve_credentials(store, u, p, s, t, client)
+    finally:
+        _REQUEST_CLIENT.reset(tok)
+
+
+def _resolve_credentials(store, u: str, p: str | None, s: str | None, t: str | None,
+                         client: str) -> User | None:
+    """``_resolve_user``'s ``p=`` / token checks for ``u``, with ``client``
+    bound as the lockout's client."""
     is_locked = getattr(store, "is_locked", None)
 
     # 3. Subsonic password mode (?p=password or ?p=enc:hex).
@@ -1971,17 +2131,19 @@ def _resolve_user(
         cand = store.get_by_username(u) if hasattr(store, "get_by_username") else None
         if cand is not None and not (is_locked and (is_locked(u) or is_locked(u, "p"))):
             if cand.subsonic_password and _pw_equal(plain, cand.subsonic_password):
+                _note_signed_in(store, u)
                 return cand
             cached = getattr(store, "check_cached_password", None)
             if cached is not None and cached(u, plain) is not None:
+                _note_signed_in(store, u)
                 return cand
         if _SCRYPT_OFFLOAD.get():
-            raise _NeedScrypt(u, plain)
+            raise _NeedScrypt(u, plain, client)
         return _p_authenticate(store)(u, plain)
 
     # 4. Subsonic token mode (?s=salt&t=md5(password+salt)).
     if u and s is not None and t is not None:
-        if is_locked and is_locked(u, "token"):
+        if not _token_check_allowed(store, u):
             return None
         cand = store.get_by_username(u) if hasattr(store, "get_by_username") else None
         if cand and cand.subsonic_password:
@@ -1989,12 +2151,39 @@ def _resolve_user(
                 (cand.subsonic_password + s).encode("utf-8")
             ).hexdigest()
             if _pw_equal(expected, t.lower()):
+                _note_signed_in(store, u)
                 return cand
         note = getattr(store, "note_failed_attempt", None)
         if note:
             note(u, "token")
         return None
     return None
+
+
+def _bind_auth_client(request) -> None:
+    """Make ``request``'s client the lockout's client for the rest of this
+    request's task (``users.bind_request_client``)."""
+    from soniqboom.core.users import bind_request_client
+    bind_request_client(request)
+
+
+def _token_check_allowed(store, u: str) -> bool:
+    """May this request's client have a token for ``u`` checked now (not
+    locked out of the "token" scope, not held back by the account-wide
+    slow-down — ``UserStore.token_check_allowed``)?"""
+    gate = getattr(store, "token_check_allowed", None)
+    if gate is not None:
+        return bool(gate(u))
+    is_locked = getattr(store, "is_locked", None)
+    return not (is_locked and is_locked(u, "token"))
+
+
+def _note_signed_in(store, u: str) -> None:
+    """The request's client proved a credential of ``u``
+    (``UserStore.note_signed_in``: the account-wide slow-down spares it)."""
+    note = getattr(store, "note_signed_in", None)
+    if note is not None:
+        note(u)
 
 
 def _decode_password(p: str) -> str:
@@ -2178,7 +2367,7 @@ def _wrap(handler):
                 try:
                     return await handler(*args, **kwargs)
                 except _NeedScrypt as need:
-                    user = await _scrypt_authenticate(need.username, need.plain)
+                    user = await _scrypt_authenticate(need.username, need.plain, need.client)
                     if user is None:
                         return _err(40, "Wrong username or password.", fmt=fmt)
                     tokens.append((_PREAUTH, _PREAUTH.set(
@@ -2634,9 +2823,13 @@ def _json_spliced(payload: dict, root_key: str, list_key: str) -> bytes:
     its own, its values unchanged."""
     inner = payload[root_key]
     items = inner[list_key]
-    head = _ok({**payload, root_key: {**inner, list_key: _SPLICE}}, fmt="json").body
+    # (a marker no name can hold: a playlist or album named like a fixed
+    # marker had its name replaced by the list)
+    import secrets
+    marker = f"{_SPLICE}{secrets.token_hex(12)}"
+    head = _ok({**payload, root_key: {**inner, list_key: marker}}, fmt="json").body
     body = b"[" + b",".join([_json_bytes(it) for it in items]) + b"]"
-    return head.replace(_json_bytes(_SPLICE), body, 1)
+    return head.replace(_json_bytes(marker), body, 1)
 
 
 async def _cached_render(cat: _sx.Catalogue, slot: tuple, tag: Any, fmt: str, build,
@@ -3219,7 +3412,7 @@ def _ranked_albums(store, cat: _sx.Catalogue, kind: str, *, uid: str) -> list[_s
 @_wrap
 async def search3(
     request: Request,
-    query: str = Query("", alias="query"),
+    query: str = Query("", alias="query", max_length=_QUERY_MAX_LEN),
     artistCount: int = Query(20, ge=0),
     albumCount:  int = Query(20, ge=0),
     songCount:   int = Query(20, ge=0),
@@ -4822,8 +5015,11 @@ async def _online_cover_art(store, track_id: str, bucket: str, large_ph: bool) -
     from soniqboom.api.art import online_cover_for
     data, may_come = await online_cover_for(track_id, bucket)
     if data:
+        # (a retro track's generated cover while a better one may still come:
+        # kept only as long as the placeholder would be)
+        age = _PLACEHOLDER_SHORT_MAX_AGE if may_come else 3600
         return Response(content=data, media_type="image/jpeg",
-                        headers={"Cache-Control": "private, max-age=3600"})
+                        headers={"Cache-Control": f"private, max-age={age}"})
     ttl = _PLACEHOLDER_SHORT_MAX_AGE if may_come else _placeholder_ttl(store, track_id)
     return _placeholder_art(ttl, large=large_ph)
 
@@ -5271,6 +5467,11 @@ async def scrobble(
         track = store.get_track(tid)
         if track:
             _note_now_playing(user, tid, c, from_scrobble=True, subsong=sub)
+            try:                            # (a game's box cover is looked up on play)
+                from soniqboom.core import igdb_cover
+                await igdb_cover.on_intent(track, tid)
+            except Exception:                   # noqa: BLE001
+                pass
             try:
                 from soniqboom.core.scrobble import submit_now_playing
                 await submit_now_playing(user, track)
@@ -5303,6 +5504,19 @@ def _playlist_tracks(store, pl: dict) -> list[tuple[dict, int]]:
         if tr:
             out.append((tr, n if 0 < n < _safe_int(tr.get("subsongs")) else 0))
     return out
+
+
+def _playlist_pair(store, e) -> tuple[dict, int] | None:
+    """``_playlist_tracks``' ``(track, wire)`` for ONE entry, None when it no
+    longer resolves — for a caller that maps the entries in slices."""
+    if isinstance(e, dict):
+        tid, n = e.get("id"), _safe_int(e.get("subsong"))
+    else:
+        tid, n = e, 0
+    tr = store.get_track(tid)
+    if not tr:
+        return None
+    return tr, (n if 0 < n < _safe_int(tr.get("subsongs")) else 0)
 
 
 def _tune_duration(t: dict, n: int) -> int:
@@ -5426,13 +5640,17 @@ async def get_playlist(
         entry_tracks = [r.model_dump() if hasattr(r, "model_dump") else r for r in _results]
         from soniqboom.core.catalogue_view import hidden_ids
         _hid = hidden_ids(store)
-        entries = [_track_to_song(t_, ctx) for t_ in entry_tracks
-                   if t_ and t_.get("id") not in _hid]
+        entries = await _sliced_map(
+            entry_tracks, lambda t_: _track_to_song(t_, ctx)
+            if t_ and t_.get("id") not in _hid else None)
     else:
-        # Entries pinned to one tune ({id, subsong}) come back as tune ids.
-        entries = []
-        for tr, n in _playlist_tracks(store, pl):
-            entries.append(_tune_child(_track_to_song(tr, ctx), tr, n, ctx))
+        # Entries pinned to one tune ({id, subsong}) come back as tune ids —
+        # mapped in time slices (a 50,000-entry playlist held the event loop
+        # for ~0.9 s) and, as JSON, serialised off the loop (``splice``).
+        def _entry(e):
+            hit = _playlist_pair(store, e)
+            return None if hit is None else _tune_child(_track_to_song(hit[0], ctx), *hit, ctx)
+        entries = await _sliced_map(list(pl.get("track_ids") or ()), _entry)
     return await _ok_async({
         "playlist": {
             "id":        pl["id"],
@@ -5445,7 +5663,7 @@ async def get_playlist(
             "changed":   _iso_req(pl.get("updated_at"), pl.get("created_at")),
             "entry":     entries,
         },
-    }, fmt=f, n_hint=len(entries))
+    }, fmt=f, n_hint=len(entries), splice=("playlist", "entry"))
 
 
 @_route("/createPlaylist")
@@ -5630,15 +5848,19 @@ async def get_starred(
         return sorted(m.items(), key=lambda kv: -_ts_num(kv[1]))
 
     # Stars are stored by id and resolved lazily: an id whose track / album /
-    # artist no longer exists is skipped, never an error.  O(#starred).
+    # artist no longer exists is skipped, never an error.  O(#starred), mapped
+    # in time slices (``_sliced_map``: up to 50,000 stars a kind held the
+    # event loop for 0.9–1.6 s) and serialised off the loop.
     # ``musicFolderId``: only what has music in that scan root.
     root = _folder_hash(store, musicFolderId)
     ctx = _song_ctx(store, user)
-    songs = []
-    for tid, _ts in _newest_first(state.starred(uid, "song")):
-        tr = store.get_track(tid)
+
+    def _song(kv):
+        tr = store.get_track(kv[0])
         if tr and (not root or tr.get("scan_root_hash") == root):
-            songs.append(_track_to_song(tr, ctx))
+            return _track_to_song(tr, ctx)
+        return None
+    songs = await _sliced_map(_newest_first(state.starred(uid, "song")), _song)
     st_albums = state.starred(uid, "album")
     albums = []
     if st_albums:
@@ -5647,10 +5869,13 @@ async def get_starred(
         in_root = _folder_view(store, cat, root)[0] if root else None
         mapper = _album_id3 if is_v2 else _album_child
         rt_albums = state.ratings(uid, "album")
-        for aid, _ts in _newest_first(st_albums):
-            e = _resolve_album_entry(store, aid, cat)
+
+        def _album(kv):
+            e = _resolve_album_entry(store, kv[0], cat)
             if e is not None and (in_root is None or e.id in in_root):
-                albums.append(mapper(e, st_albums, rt_albums))
+                return mapper(e, st_albums, rt_albums)
+            return None
+        albums = await _sliced_map(_newest_first(st_albums), _album)
     st_artists = state.starred(uid, "artist")
     artists = []
     if st_artists:
@@ -5659,18 +5884,23 @@ async def get_starred(
         await _prepare_folder_view(store, cat, root)
         in_root = _folder_view(store, cat, root)[1] if root else None
         rt_artists = state.ratings(uid, "artist")
-        for arid, ts in _newest_first(st_artists):
+
+        def _artist(kv):
+            arid, ts = kv
             low = union.by_id.get(arid)
             if low is None or (in_root is not None and low not in in_root):
-                continue
+                return None
             row = {"id": arid, "name": union.display[low],
                    "albumCount": cat.album_count(low),
                    "coverArt": arid, "starred": _iso(ts)}
             if rt_artists.get(arid):
                 row["userRating"] = rt_artists[arid]
-            artists.append(row)
+            return row
+        artists = await _sliced_map(_newest_first(st_artists), _artist)
+    # (JSON: serialised off the loop when the songs are many — ``splice``)
     return await _ok_async({key: {"artist": artists, "album": albums, "song": songs}}, fmt=f,
-                           n_hint=len(songs) + len(albums) + len(artists))
+                           n_hint=len(songs) + len(albums) + len(artists),
+                           splice=(key, "song"))
 
 
 @_route("/getGenres")
@@ -8093,8 +8323,14 @@ async def _account_auth_with_hash(request, sb_session, u, p, s, t) -> tuple[User
                                  "(u + p) — token auth can't be used for this; or use "
                                  "the SoniqBoom web UI.")
     store = get_user_store()
-    # scrypt off the event loop, as the web UI's change-password does.
-    hit = await asyncio.to_thread(store.authenticate_with_hash, u, _decode_password(p))
+    from soniqboom.core.users import bind_request_client
+    client = bind_request_client(request)
+    # scrypt off the event loop, as the web UI's change-password does — behind
+    # the same per-client gate as ``p=``.
+    hit = None
+    async with _scrypt_turn(client) as ok:
+        if ok:
+            hit = await asyncio.to_thread(store.authenticate_with_hash, u, _decode_password(p))
     if hit is None or not hit[0].enabled:
         raise _SubsonicError(40, "Wrong username or password (account changes need the "
                                  "main login password).")
@@ -8393,10 +8629,10 @@ async def get_avatar(
 @_wrap
 async def search_v1(
     request: Request,
-    artist: str | None = None,
-    album: str | None = None,
-    title: str | None = None,
-    any: str | None = None,
+    artist: str | None = Query(None, max_length=_QUERY_MAX_LEN),
+    album: str | None = Query(None, max_length=_QUERY_MAX_LEN),
+    title: str | None = Query(None, max_length=_QUERY_MAX_LEN),
+    any: str | None = Query(None, max_length=_QUERY_MAX_LEN),
     count: int = Query(20, ge=0),
     offset: int = Query(0, ge=0),
     newerThan: int | None = None,

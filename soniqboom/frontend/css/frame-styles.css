@@ -128,6 +128,82 @@
   box-shadow: var(--fr-lamp-glow);
 }
 :root[data-ui-style="retro"] .scene-tab-count { color: inherit; opacity: 0.7; letter-spacing: 0; }
+/* (the panel's keys: pressed like a Scene key, its lamp amber — engaged) */
+:root[data-ui-style="retro"] .scene-tab[aria-pressed="true"] {
+  color: var(--fr-key-text);
+  border-color: var(--fr-key-edge);
+  background: var(--fr-key-bg);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.5);
+}
+:root[data-ui-style="retro"] .scene-tab[aria-pressed="true"]::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fr-lamp);
+  box-shadow: var(--fr-lamp-glow);
+}
+
+/* The panel over a list (a composer's page, the compo winners, On this day):
+   a plain plate with engraved labels; its links are hardware keys */
+:root[data-ui-style="retro"] #scene-panel {
+  background:
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #202226, #191b1e);
+  border-bottom-color: #050506;
+  box-shadow: inset 0 -1px 0 rgba(255,255,255,0.04);
+}
+:root[data-theme="light"][data-ui-style="retro"] #scene-panel {
+  background:
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.18) 0 1px, transparent 1px 3px),
+    linear-gradient(180deg, #e6e8eb, #d6d9dd);
+  border-bottom-color: #8c9096;
+}
+:root[data-ui-style="retro"] #scene-panel .scp-name {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+:root[data-ui-style="retro"] #scene-panel .scp-k {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  opacity: 1;
+}
+:root[data-ui-style="retro"] #scene-panel .scp-link {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 10.5px;
+  color: var(--fr-key-text);
+  background: var(--fr-key-bg);
+  border: 1px solid var(--fr-key-edge);
+  border-radius: 4px;
+  box-shadow: var(--fr-key-shadow);
+}
+:root[data-ui-style="retro"] #scene-panel .scp-link:hover { background: var(--fr-key-bg-hover); color: var(--fr-key-text); }
+:root[data-ui-style="retro"] #scene-panel .scp-count b { font-family: var(--fr-face); }
+:root[data-ui-style="retro"] #scene-panel .scp-place { color: var(--fr-lamp); font-family: var(--fr-face); font-weight: 700; }
+:root[data-ui-style="retro"] #scene-panel .scp-party,
+:root[data-ui-style="retro"] #scene-panel .scp-input { border-radius: 4px; border-color: var(--fr-key-edge); }
+:root[data-ui-style="retro"] #scene-panel .scp-photo img { border-radius: 2px; box-shadow: 0 0 0 1px var(--fr-key-edge); }
+
+/* The Genres view's "Show all N genres" key: a hardware key like the Scene keys */
+:root[data-ui-style="retro"] .group-filter-toggle {
+  font-family: var(--fr-face);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 11px;
+  color: var(--fr-key-text);
+  background: var(--fr-key-bg);
+  border: 1px solid var(--fr-key-edge);
+  border-radius: 4px;
+  box-shadow: var(--fr-key-shadow);
+}
+:root[data-ui-style="retro"] .group-filter-toggle:hover { background: var(--fr-key-bg-hover); }
+:root[data-ui-style="retro"] .group-filter-toggle:active { box-shadow: inset 0 2px 3px rgba(0,0,0,0.5); transform: translateY(1px); }
 
 /* The folder tree's chosen folder: plain text with its lamp just left of it
    (in the node's margin, before the chevron) */

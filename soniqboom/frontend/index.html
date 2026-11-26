@@ -137,15 +137,15 @@
       } catch (_) { /* private mode — fall back to default dark */ }
     })();
   </script>
-  <link rel="stylesheet" href="/assets/css/app.css?v=146">
+  <link rel="stylesheet" href="/assets/css/app.css?v=148">
   <link rel="stylesheet" href="/assets/css/stations-styles.css?v=5">
   <link rel="stylesheet" href="/assets/css/playlist-styles.css?v=2">
-  <link rel="stylesheet" href="/assets/css/player-styles.css?v=6">
+  <link rel="stylesheet" href="/assets/css/player-styles.css?v=8">
   <link rel="stylesheet" href="/assets/css/queue-styles.css?v=2">
-  <link rel="stylesheet" href="/assets/css/trackinfo-styles.css?v=6">
+  <link rel="stylesheet" href="/assets/css/trackinfo-styles.css?v=8">
   <link rel="stylesheet" href="/assets/css/lyrics-styles.css?v=2">
   <link rel="stylesheet" href="/assets/css/visualizer-styles.css?v=4">
-  <link rel="stylesheet" href="/assets/css/frame-styles.css?v=4">
+  <link rel="stylesheet" href="/assets/css/frame-styles.css?v=6">
 
   <!-- Critical-path JS modulepreload.  Tells the browser to fetch + parse
        these alongside the HTML/CSS so they're already in cache by the
@@ -233,6 +233,14 @@
              folded keys (app.js). -->
         <button id="btn-more" type="button" title="More" aria-label="More"
                 aria-haspopup="menu" aria-expanded="false" aria-controls="hdr-more-menu">&#8943;</button>
+        <!-- The Retro hi-fi / Modern switch (app.js, js/ui_style.js — the same
+             choice as Settings › Appearance › Style).  The icon shows the
+             style in use: a needle meter for Retro hi-fi, a flat panel with a
+             waveform for Modern; its name says what a press switches to. -->
+        <button id="btn-ui-style" type="button" title="Style" aria-label="Style">
+          <svg class="ui-style-ico ui-style-ico-retro" width="18" height="16" viewBox="0 0 18 16" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1.2" y="1.7" width="15.6" height="12.6" rx="1.6"/><path d="M4 10.4a5 5 0 0 1 10 0"/><path d="M5.4 7.2l.6.6M9 5.4v.9M12.6 7.2l-.6.6"/><path d="M9 11.6l2.6-4.3" stroke-width="1.5"/><circle cx="9" cy="11.6" r=".9" fill="currentColor" stroke="none"/></svg>
+          <svg class="ui-style-ico ui-style-ico-modern" width="18" height="16" viewBox="0 0 18 16" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1.2" y="2.2" width="15.6" height="11.6" rx="3.4"/><path d="M4 8h1.2l1.2-2.6 1.7 5.2 1.7-5.2 1.7 5.2 1.2-2.6H14"/></svg>
+        </button>
         <button id="btn-admin" title="Settings" aria-label="Settings"><span class="btn-admin-gear" aria-hidden="true">&#9881;</span></button>
       </div>
       <div id="hdr-more-menu" class="hdr-more-menu" role="menu" aria-label="More" hidden>
@@ -241,6 +249,7 @@
         <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-welcome"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M6.3 6.2a1.8 1.8 0 1 1 2.5 1.7c-.5.2-.8.6-.8 1.1v.5"/><path d="M8 11.6v.1"/></svg></span>Welcome &amp; tips</button>
         <a role="menuitem" class="hdr-more-item" href="/manual/" target="_blank" rel="noopener"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5c2-1 4-1 6 .5 2-1.5 4-1.5 6-.5v9.5c-2-1-4-1-6 .5-2-1.5-4-1.5-6-.5z"/><path d="M8 4v9.5"/></svg></span>User guide</a>
         <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-links"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.2"/><path d="M1.8 8h12.4M8 1.8c-2.2 2.4-2.2 10 0 12.4M8 1.8c2.2 2.4 2.2 10 0 12.4"/></svg></span>Find music</button>
+        <button type="button" role="menuitem" class="hdr-more-item" data-press="btn-ui-style" id="hdr-more-style"><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 18 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1.2" y="1.7" width="15.6" height="12.6" rx="1.6"/><path d="M4 10.4a5 5 0 0 1 10 0"/><path d="M9 11.6l2.6-4.3" stroke-width="1.5"/></svg></span><span id="hdr-more-style-label">Style</span></button>
         <button type="button" role="menuitem" class="hdr-more-item" data-press="user-chip-logout" id="hdr-more-logout" hidden><span class="hdr-more-ico" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2.5H3a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3"/><path d="M10 5l3 3-3 3M13 8H6"/></svg></span>Sign out</button>
       </div>
     </header>
@@ -256,6 +265,7 @@
           <h3>Library</h3>
           <ul id="nav-library">
             <li data-view="all"          class="active" tabindex="0" role="button" aria-current="page">All Tracks</li>
+            <li data-view="folders"      tabindex="0" role="button" title="Browse your music folders — the folder tree, in the main pane">Folders</li>
             <li data-view="artists"      tabindex="0" role="button">Artists</li>
             <li data-view="album_artists" tabindex="0" role="button">Album Artists</li>
             <li data-view="albums"       tabindex="0" role="button">Albums</li>
@@ -275,6 +285,9 @@
         <section id="section-folders">
           <h3 class="section-hdr-collapsible">
             <span>Folders</span>
+            <button id="btn-folders-open" class="btn-section-open" type="button"
+                    title="Open Folders in the main pane"
+                    aria-label="Open the Folders view in the main pane"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="1.5" width="10" height="9" rx="1"/><path d="M4 1.5v9"/><path d="M6 4.5h3M6 6.5h3"/></svg></button>
             <button id="btn-folders-toggle" class="btn-section-toggle"
                     title="Collapse/Expand" aria-label="Collapse or expand Folders section"
                     aria-expanded="true">&#9660;</button>
@@ -369,6 +382,11 @@
           <button id="btn-grid-toggle" class="btn-grid-toggle" hidden
                   aria-label="Toggle grid view">&#8862;</button>
         </div>
+
+        <!-- The panel over a list that has one (library.js _scenePanel*): a
+             composer's page, the compo winners' filters, "On this day",
+             the composers a search names. -->
+        <section id="scene-panel" class="scene-panel" hidden aria-label="About this list"></section>
 
         <div id="album-grid" hidden></div>
 
@@ -534,6 +552,8 @@
           <canvas id="waveform-canvas" aria-hidden="true"></canvas>
           <input id="seek-bar" type="range" min="0" max="100" value="0" step="0.1"
                  aria-label="Seek position">
+          <!-- The waveform's rectangle as one seek target (app.js / app.css) -->
+          <div id="waveform-hit" aria-hidden="true"></div>
           <span id="time-dur">0:00</span>
           <!-- Radio mode only: a live stream has no seekable position, so the
                seek row is replaced by a LIVE badge + a now-playing ticker. -->
@@ -1035,6 +1055,11 @@
                 <span class="renderer-name">Sawteeth (sawteethrender)</span>
                 <span class="renderer-version" id="renderer-version-sawteethrender"></span>
               </div>
+              <div class="renderer-item" id="renderer-midirender">
+                <span class="renderer-icon" id="renderer-icon-midirender">&#8943;</span>
+                <span class="renderer-name">OPL3 / OPN2 / MT-32 MIDI (midirender)</span>
+                <span class="renderer-version" id="renderer-version-midirender"></span>
+              </div>
             </div>
             <!-- ffmpeg-incomplete banner — populated by _renderFfmpegBanner
                  in admin.js when the running ffmpeg is missing required
@@ -1256,6 +1281,158 @@
             <div id="admin-sidfid-msg" class="admin-msg" style="display:none"></div>
           </div>
 
+          <!-- Amiga resampler, stereo width, loops and endings (core/render_options.py) -->
+          <div class="admin-section admin-render-options">
+            <h3>&#128257; Amiga, stereo &amp; endings</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              How retro tunes are rendered and how they end.  Changes apply from
+              the next play of each tune, with no restart — tunes rendered with
+              other settings are rendered again.  The stereo width is applied while
+              a tune plays, so its render stays the reference.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-amiga-resampler">Amiga resampler
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="libopenmpt's emulation of the Amiga's Paula sound chip, with the filter of an Amiga 500 or 1200, for ProTracker and the other Amiga module formats (other formats are not changed). Auto lets libopenmpt pick the filter by the format. Off: libopenmpt's normal interpolation. The emulation takes about ten times the CPU to render a module; playback still starts at once, and a changed setting renders each module again on its next play.">&#9432;</span>
+              </label>
+              <select id="setting-amiga-resampler">
+                <option value="auto">Auto (A500 or A1200 by format)</option>
+                <option value="a500">Amiga 500</option>
+                <option value="a1200">Amiga 1200</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-stereo-width">Stereo width of retro tunes
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="Narrows (or widens) the stereo of chip, tracker and Amiga tunes, applied while they play: Amiga tunes are hard-panned left and right, which is tiring on headphones. Applies to Subsonic apps, DLNA and casting (on the converted stream they get), and to every browser that keeps its own setting at &ldquo;Same as server&rdquo;. 100 % is the tune as rendered.">&#9432;</span>
+              </label>
+              <select id="setting-stereo-width">
+                <option value="0">Mono (0 %)</option>
+                <option value="25">25 %</option>
+                <option value="50">50 %</option>
+                <option value="60">Headphones (60 %)</option>
+                <option value="75">75 %</option>
+                <option value="100">As rendered (100 %)</option>
+                <option value="125">Wider (125 %)</option>
+                <option value="150">Wider (150 %)</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-tracker-loops">Tracker modules: play the song
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="How many times a module (ProTracker, ScreamTracker, FastTracker, Impulse Tracker, …) plays before it fades out, as libopenmpt plays it. Once is the default: the song ends where it would start over, with a 0.1 s fade.">&#9432;</span>
+              </label>
+              <select id="setting-tracker-loops">
+                <option value="0">Once (default)</option>
+                <option value="2">Twice</option>
+                <option value="3">3 times</option>
+                <option value="4">4 times</option>
+                <option value="8">8 times</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-tracker-fade">Tracker modules: fade-out</label>
+              <select id="setting-tracker-fade">
+                <option value="-1">Default (0.1 s)</option>
+                <option value="2">2 s</option>
+                <option value="5">5 s</option>
+                <option value="8">8 s</option>
+                <option value="10">10 s</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-chip-loops">Console tunes: play the loop
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="How many times a console tune that states its loop plays it (VGM, VGZ, KSS) before it fades out. Default: a VGM twice, a KSS once. A tune that states its length (SPC, NSFe, SAP, …) keeps that length; a VGM without a loop ends where its music ends.">&#9432;</span>
+              </label>
+              <select id="setting-chip-loops">
+                <option value="0">Default</option>
+                <option value="1">Once</option>
+                <option value="2">Twice</option>
+                <option value="3">3 times</option>
+                <option value="4">4 times</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-chip-fade">Console tunes: fade-out
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="The fade at the end of a console tune (libgme, KSS). An NSFe that states its own fade keeps it.">&#9432;</span>
+              </label>
+              <select id="setting-chip-fade">
+                <option value="-1">Default (8 s)</option>
+                <option value="0">None</option>
+                <option value="2">2 s</option>
+                <option value="4">4 s</option>
+                <option value="12">12 s</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-sid-fade">SID tunes: fade-out
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="A fade over the last seconds of a C64 tune's length (HVSC's song length stays the length).">&#9432;</span>
+              </label>
+              <select id="setting-sid-fade">
+                <option value="0">None (default)</option>
+                <option value="2">2 s</option>
+                <option value="4">4 s</option>
+                <option value="8">8 s</option>
+              </select>
+            </div>
+            <div class="admin-io-row" style="margin-top:12px">
+              <button id="btn-save-render-options">Save</button>
+            </div>
+            <div id="admin-render-options-msg" class="admin-msg" style="display:none"></div>
+          <!-- MIDI synths (FluidSynth / midirender) -->
+          <div class="admin-section admin-midi-synths">
+            <h3>&#127929; MIDI synths</h3>
+            <p class="admin-hint" style="margin-bottom:12px">
+              The synthesizer MIDI music plays on.  Standard MIDI files
+              (.mid, .kar, .rmi) play on the SoundFont unless you choose an
+              FM chip or an MT-32 here; the game formats (XMI, DMX MUS,
+              HMI / HMP, GMF) play on an OPL3 with the instruments their
+              sound library used, or on OPN2 FM or an MT-32.  Changes apply
+              from the next play — songs are rendered again on the new synth.
+            </p>
+            <div class="admin-setting">
+              <label for="setting-midi-synth">Standard MIDI files
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="SoundFont: FluidSynth with the SoundFont chosen below. OPL3: an AdLib / Sound Blaster FM chip (Nuked OPL3). OPN2: the Mega Drive's FM chip (Nuked OPN2). MT-32: a Roland MT-32 with your own ROMs.">&#9432;</span>
+              </label>
+              <select id="setting-midi-synth">
+                <option value="soundfont">SoundFont (FluidSynth)</option>
+                <option value="opl3">OPL3 FM</option>
+                <option value="opn2">OPN2 FM</option>
+                <option value="mt32">Roland MT-32</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-game-midi-synth">Game MIDI (XMI, MUS, HMI, GMF)</label>
+              <select id="setting-game-midi-synth">
+                <option value="opl3">OPL3 FM (the sound library&rsquo;s bank)</option>
+                <option value="opn2">OPN2 FM</option>
+                <option value="mt32">Roland MT-32</option>
+              </select>
+            </div>
+            <div class="admin-setting">
+              <label for="setting-mt32-rom-dir">MT-32 ROM folder
+                <span class="setting-info" tabindex="0" role="img" aria-label="Info"
+                      data-tip="A folder on the server holding your MT-32 or CM-32L control ROM and PCM ROM images (any file names). SoniqBoom includes no ROMs.">&#9432;</span>
+              </label>
+              <input id="setting-mt32-rom-dir" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="not set"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
+            <p id="mt32-rom-state" class="admin-hint mt32-rom-state" role="status"
+               aria-live="polite" style="margin:4px 0 0">MT-32 ROMs not set.</p>
+            <div class="admin-io-row" style="margin-top:12px">
+              <button id="btn-check-mt32" type="button" class="btn-secondary">Check ROM folder</button>
+              <button id="btn-save-midi-synths" type="button">Save MIDI synths</button>
+            </div>
+            <div id="admin-midisynth-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
           <!-- Renderer binary paths -->
           <div class="admin-section">
             <h3>&#128736;&#65039; Renderer binaries</h3>
@@ -1376,6 +1553,13 @@
                      placeholder="auto-discover"
                      style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
             </div>
+            <div class="admin-setting">
+              <label for="setting-path-midirender">midirender (OPL3 / OPN2 / MT-32 MIDI)</label>
+              <input id="setting-path-midirender" type="text"
+                     autocapitalize="off" autocorrect="off" spellcheck="false"
+                     placeholder="auto-discover"
+                     style="font-family:ui-monospace,SF Mono,Menlo,monospace;font-size:12px">
+            </div>
             <div class="admin-io-row" style="margin-top:12px">
               <button id="btn-save-renderer-paths">Save paths</button>
             </div>
@@ -1479,13 +1663,21 @@
           <div class="admin-section">
             <h3>&#9881;&#65039; Settings</h3>
             <p class="admin-section-hint" style="font-size:12px;color:var(--text2);margin:0 0 10px">
-              Crossfade, streaming quality, preload buffer, “Converting…” notice delay, “Let shuffle repeat tracks you’ve heard” and theme are saved in <strong>this browser only</strong>.
+              Crossfade, stereo width, endless play, streaming quality, preload buffer, “Converting…” notice delay, “Let shuffle repeat tracks you’ve heard” and theme are saved in <strong>this browser only</strong>.
               Everything else here is a server setting and applies to every user.
             </p>
             <div class="admin-settings-grid" id="admin-settings-grid">
               <div class="admin-setting">
                 <label for="setting-crossfade">Crossfade (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Overlap between tracks during transition">&#9432;</span></label>
                 <input id="setting-crossfade" type="number" min="0" max="12" step="0.5" value="0">
+              </div>
+              <div class="admin-setting">
+                <label for="setting-stereo-width-own">Stereo width of retro tunes <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Narrows (or widens) the stereo of chip, tracker and Amiga tunes as this browser plays them — Headphones takes the edge off hard-panned Amiga tunes. Same as server: the server's setting (Renderers). Saved in this browser.">&#9432;</span></label>
+                <select id="setting-stereo-width-own"><option value="">Same as server</option><option value="0">Mono (0 %)</option><option value="25">25 %</option><option value="50">50 %</option><option value="60">Headphones (60 %)</option><option value="75">75 %</option><option value="100">As rendered (100 %)</option><option value="125">Wider (125 %)</option><option value="150">Wider (150 %)</option></select>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-endless">Play looping tunes endlessly <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Tracker modules, console tunes and Amiga tunes go on through their own loop, without a fade, until you skip to the next track. Repeat-One does this for the tune it repeats either way. SID tunes repeat from their start. Saved in this browser.">&#9432;</span></label>
+                <input id="setting-endless" type="checkbox">
               </div>
               <div class="admin-setting">
                 <label for="setting-stream-quality">Streaming quality <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Lower uses less data — handy on mobile data. Music files above the chosen rate are converted; files at or below it, retro tunes and internet radio play as they are. From the next track. Saved in this browser.">&#9432;</span></label>
@@ -1564,6 +1756,14 @@
               <div class="admin-setting">
                 <label for="setting-online-cover-lookup">Look up missing covers online <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="For a track with no embedded picture and no folder art, the album cover is looked up on MusicBrainz (Cover Art Archive) &mdash; and on Discogs when a token is saved &mdash; by the tagged artist and album, or artist and title when there is no album. A cover is shown only on an exact match. Covers are kept in SoniqBoom&rsquo;s image cache; your music files and folders are not changed. Chip and tracker music and online collections are not looked up.">&#9432;</span></label>
                 <input id="setting-online-cover-lookup" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-generated-covers">Draw covers for retro music <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="A chip, tracker or console tune with no embedded picture, no folder art and no game box cover gets a cover drawn in its platform&rsquo;s style (a C64 screen, Amiga copper bars, a cartridge, a disc &hellip;) with its game or album, or title, and composer. Drawn by SoniqBoom on this server &mdash; nothing is looked up. Off shows the format icon instead.">&#9432;</span></label>
+                <input id="setting-generated-covers" type="checkbox" checked>
+              </div>
+              <div class="admin-setting">
+                <label for="setting-csdb-lookup">Show CSDb data for SID tunes <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="When Track Info opens for a C64 SID tune, the releases that use it (with group, year, party placing and rating) and a screenshot are asked from CSDb, the C64 Scene Database, at csdb.dk &mdash; only for a tune whose CSDb entry is known from the Demozoo index, once per tune, and kept for two weeks.">&#9432;</span></label>
+                <input id="setting-csdb-lookup" type="checkbox" checked>
               </div>
               <div class="admin-setting">
                 <label for="setting-sid-duration">SID duration (seconds) <span class="setting-info" tabindex="0" role="img" aria-label="Info" data-tip="Fallback play length used only when HVSC has no entry for the tune. Tunes with HVSC data play their exact length instead.">&#9432;</span></label>
@@ -2013,6 +2213,42 @@
               <button id="btn-discogs-remove" class="btn-secondary">Remove token</button>
             </div>
             <div id="md-discogs-msg" class="admin-msg" style="display:none"></div>
+          </div>
+
+          <!-- IGDB (game box covers for retro tracks) -->
+          <div class="admin-section" id="md-igdb-section">
+            <h3>&#127918; IGDB game covers</h3>
+            <p class="admin-hint" style="margin-bottom:8px">
+              With your own Twitch application, the box cover of a retro track&rsquo;s
+              game is looked up on IGDB when you play the track or open its Track Info
+              (never for a list row), by the game name SoniqBoom found for it, and shown
+              only on an exact match on the track&rsquo;s platform. Register an application
+              while signed in to Twitch, on its developer console
+              (dev.twitch.tv/console/apps), and paste its client id and a client secret.
+              IGDB allows non-commercial use under the Twitch Developer Service Agreement.
+            </p>
+            <div id="md-igdb-status" class="admin-hint" style="margin-bottom:8px"
+                 role="status" aria-live="polite">Status: &mdash;</div>
+            <div class="admin-setting">
+              <label for="setting-igdb-client-id">Client id</label>
+              <input id="setting-igdb-client-id" class="admin-token-input" type="text"
+                     autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                     data-1p-ignore data-lpignore="true" data-bwignore="true"
+                     maxlength="64" placeholder="Paste the client id">
+            </div>
+            <div class="admin-setting">
+              <label for="setting-igdb-client-secret">Client secret</label>
+              <input id="setting-igdb-client-secret" class="admin-token-input" type="password"
+                     autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                     data-1p-ignore data-lpignore="true" data-bwignore="true"
+                     maxlength="64" placeholder="Paste a client secret">
+            </div>
+            <div class="admin-io-row" style="gap:8px;flex-wrap:wrap">
+              <button id="btn-igdb-save">Save</button>
+              <button id="btn-igdb-test" class="btn-secondary">Test</button>
+              <button id="btn-igdb-remove" class="btn-secondary">Remove</button>
+            </div>
+            <div id="md-igdb-msg" class="admin-msg" style="display:none"></div>
           </div>
 
           <!-- HVSC (SID song-lengths + STIL) -->
@@ -2471,10 +2707,11 @@
         </div>
         <div class="eq-leveling">
           <label class="eq-rg-label" for="eq-rg">Volume leveling</label>
-          <select id="eq-rg" title="ReplayGain — even out loudness across tracks using the track's gain tags">
+          <select id="eq-rg" title="Even out loudness across tracks: by their ReplayGain tags, else by the loudness the server measured (SID, modules, chip tunes, untagged files). Auto: per album while an album plays in order, else per track">
             <option value="off">Off</option>
             <option value="track">Per track</option>
             <option value="album">Per album</option>
+            <option value="auto">Auto</option>
           </select>
         </div>
       </div>
@@ -2529,6 +2766,10 @@
                  trackinfo._loadScene from /api/artist/scene (Demozoo). -->
             <button id="ti-tab-scene" class="ti-tab-btn" hidden
                     role="tab" aria-controls="ti-scene-pane" aria-selected="false">Scene</button>
+            <!-- Voices tab: the chip voices of the playing tune — mute, solo
+                 and scopes (js/voices/voices_tab.js). -->
+            <button id="ti-tab-voices" class="ti-tab-btn" hidden
+                    role="tab" aria-controls="ti-voices-pane" aria-selected="false">Voices</button>
           </div>
 
           <!-- Metadata pane -->
@@ -2678,6 +2919,9 @@
             <div id="ti-scene-body" class="ti-scene-body"></div>
           </div>
 
+          <!-- Voices pane (js/voices/voices_tab.js) -->
+          <div id="ti-voices-pane" class="ti-voices-pane hidden"></div>
+
         </div>
       </div>
 
@@ -2822,7 +3066,7 @@
                       ZX Spectrum AY-3-8910 chiptunes plus demoscene
                       classics.
                     </span>
-                    <span class="archive-fmt">.ay</span>
+                    <span class="archive-fmt">.pt3 / .pt2 / .stc / .asc / .sqt / .ay / &hellip;</span>
                   </span>
                 </a>
               </li>
@@ -2994,7 +3238,7 @@
        destination produces silence (the analyser still receives data,
        so visualizers keep twitching — but no sound hits the speakers). -->
   <audio id="audio-el" preload="none" crossorigin="anonymous"></audio>
-  <script type="module" src="/assets/js/app.js?v=195"></script>
+  <script type="module" src="/assets/js/app.js?v=198"></script>
   <!-- Cast picker is intentionally a plain script (not a module) — it
        wires itself on DOMContentLoaded and exposes ``SoniqBoomCastPicker``
        on window for tests + the dev console.  Loading it as a sibling

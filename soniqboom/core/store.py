@@ -501,7 +501,10 @@ _INDEXED_FIELDS = (_TOKEN_FIELDS | _AGG_FIELDS
 # library-wide cache on normal browsing; ``default_subsong`` (a multi-tune
 # file's probed default tune) on its first play.
 _SEQ_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "default_subsong",
-                                "duration_rev"))
+                                "duration_rev",
+                                # measured loudness (core/loudness): read by the
+                                # player and the Subsonic song (per-track rev)
+                                "loudness", "loudness_source", "loudness_v"))
 
 # Fields a browse surface reads besides the indexed ones: the duplicate
 # stand-in pick (``duplicates.primary_sort_key`` — ``bitrate``) and the
@@ -527,6 +530,7 @@ _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     "defect", "defect_detail", "defect_renderer", "defect_at", "defect_evidence",
     # tune data of SID / libgme / PSF files (the start pass, HVSC, repair)
     "subsongs", "subsong_base", "start_subsong", "tune_lengths", "fade_s", "tune_fades",
+    "tune_slots",
     "hvsc_lengths", "stil", "sid_md5", "sid_model",
     # enrichment join keys and provenance (the values they set are indexed)
     "file_md5", "scene_path", "scene_use", "scene_party", "scene_compo", "scene_place",
@@ -539,6 +543,10 @@ _BROWSE_EXEMPT_FIELDS = _SEQ_EXEMPT_FIELDS | frozenset((
     "replaygain_album_peak", "is_lossless", "sample_rate", "channels", "bit_depth",
     "format_score", "instruments", "patterns", "label", "comment", "isrc",
     "total_tracks", "total_discs",
+    # a moved file's identity (core/track_moves) and a missing folder's mark —
+    # what that mark changes is the availability state (``_absent_ids``,
+    # core/availability: its own token), not what a list holds
+    "content_key", "absent_since",
 ))
 
 # Inputs of the duplicate grouping (``duplicates.group_key_for`` + the primary
@@ -575,7 +583,11 @@ _ENRICH_EXEMPT_FIELDS = frozenset(("cover_art", "mtime", "file_size", "duplicate
                                    "duration_rev",
                                    # the derived-genre pass's own output: no
                                    # pass reads it (core/genre_derive.py)
-                                   "genre_derived"))
+                                   "genre_derived",
+                                   # (no pass reads these: core/track_moves)
+                                   "content_key", "absent_since",
+                                   # (nor these: core/loudness)
+                                   "loudness", "loudness_source", "loudness_v"))
 _ENRICH_LOG_MAX = 100_000
 
 # Fields the Subsonic catalogue (core/subsonic_index.py) groups/sorts/counts on
@@ -738,6 +750,25 @@ _SHARED_LIST_FIELDS = ("genre", "genre_derived", "songdb_fields", "user_edited",
 # are out of the library (``modland_catalog._park_user_refs``).
 PARKED_PLAYLIST_IDS = "catalogue_parked_playlist_ids"
 
+# Store config key ``LIBRARY_EMPTIED`` (defined in ``core/persistence``, which
+# the merger process reads it with): the library was emptied by its own
+# deletions (the user removed every folder, every file was deleted) —
+# ``{"at": epoch seconds}``.  Set by the delete that leaves no track, removed
+# by the next track added.  A start or a merge that finds an empty
+# ``library.json`` takes it as it is while it carries this mark, and falls back
+# to ``library.json.bak`` only without it (a snapshot written empty by mistake
+# — ``persistence.load_snapshot``).
+from soniqboom.core.persistence import LIBRARY_EMPTIED  # noqa: E402
+
+# Track field: when a scan first found the track's folder gone or empty while
+# its scan root still listed files (``scanner._settle_orphans`` — an unmounted
+# drive inside a library folder, a NAS subfolder that is down).  The track
+# stays in the library, listed as unavailable (``core.availability``), until
+# its file is listed again (the field is set to None) or the absence outlasts
+# ``scanner.ABSENT_GRACE_S`` (then it is deleted like any removed file).
+ABSENT_FIELD = "absent_since"
+_ABSENT_FIELDS = frozenset((ABSENT_FIELD,))
+
 
 def _entry_tid(e):
     return e.get("id") if isinstance(e, dict) else e
@@ -829,6 +860,8 @@ INDEX_ATTRS = (
     # tracks that can't be played (``skip_rules.cant_play``).
     "_nonprimary_ids", "_untagged_artist", "_untagged_album_artist",
     "_untagged_album", "_untagged_genre", "_tag_year", "_cant_play_ids",
+    # The tracks whose folder is missing for now (``ABSENT_FIELD``).
+    "_absent_ids",
     # Track / disc number → ids (the ``track:`` / ``disc:`` operators).
     "_tag_track_number", "_tag_disc_number",
     # The search box's other operators (``_SEARCH_INDEXES``; kept beside the
@@ -836,6 +869,7 @@ INDEX_ATTRS = (
     "_tag_party", "_tag_status", "_tag_composer", "_words_title", "_tag_lossless",
     "_tag_bitdepth", "_tag_samplerate", "_tag_bitrate", "_tag_tunes", "_tag_chip",
     "_tag_channels", "_tag_has", "_tag_folder", "_tag_foldername", "_path_text",
+    "_tag_compo", "_tag_place",
 )
 
 
@@ -980,11 +1014,47 @@ def _tunes_keys(t: dict) -> list:
     return [n] if isinstance(n, int) and not isinstance(n, bool) and n >= 2 else []
 
 
+# ``chip:`` — the sound chip a retro format's music is written for, by the
+# format's platform (``genre_derive.platform_genre``; a chip the platform is
+# known by) or the format itself.  Formats of several possible chips (VGM,
+# KSS, S98, the PC trackers) name none.
+_PLATFORM_CHIP = {
+    "SID": "sid", "Amiga": "paula", "Atari ST": "ym2149", "ZX Spectrum": "ay",
+    "Atari 8-bit": "pokey", "SNES": "spc700", "NES": "2a03", "Game Boy": "gameboy",
+    "PC Engine": "huc6280", "Mega Drive": "ym2612", "X68000": "ym2151", "AdLib": "opl",
+    "PlayStation": "spu", "Saturn": "scsp", "Dreamcast": "aica",
+}
+_FORMAT_CHIP = {"MGSDRV": "ay"}             # (MSX's PSG — an AY-3-8910)
+_chip_memo: dict = {}
+
+
+def format_chip(fmt) -> str | None:
+    """The ``chip:`` key of a format (``sid``, ``paula``, ``ym2149``, ``ay``,
+    ``opl``, ``pokey``, ``spc700``, ``2a03`` …), or None."""
+    if not isinstance(fmt, str) or not fmt:
+        return None
+    hit = _chip_memo.get(fmt, _MISSING)
+    if hit is _MISSING:
+        hit = _FORMAT_CHIP.get(fmt)
+        if hit is None:
+            from soniqboom.core.genre_derive import platform_genre
+            hit = _PLATFORM_CHIP.get(platform_genre(fmt) or "")
+        _chip_memo[fmt] = hit
+    return hit
+
+
+_MISSING = object()
+
+
 def _chip_keys(t: dict) -> list:
-    """The ``chip:`` keys of a SID tune: its SID model(s) (``sid_model``
+    """The ``chip:`` keys of a track: the chip its format is written for
+    (``format_chip``) and, for a SID tune, its SID model(s) (``sid_model``
     "6581", "8580", "6581/8580") and ``2sid`` / ``3sid`` for a file with two /
     three chips (``channels``)."""
     out = []
+    c = format_chip(t.get("format"))
+    if c:
+        out.append(c)
     m = t.get("sid_model")
     if isinstance(m, str):
         out.extend(p.strip().lower() for p in m.split("/") if p.strip())
@@ -1054,6 +1124,10 @@ _SEARCH_INDEXES: tuple = (
     ("_tag_chip", frozenset(("sid_model", "channels", "format")), _chip_keys),
     ("_tag_channels", frozenset(("channels",)), lambda t: _sx_int(t.get("channels"))),
     ("_tag_has", frozenset(("stil", "game")), _has_keys),
+    # ``compo:`` / ``place:`` — the party competition a tune entered and its
+    # place in it (the Demozoo apply's ``scene_compo`` / ``scene_place``)
+    ("_tag_compo", frozenset(("scene_compo",)), lambda t: _lower_key(t.get("scene_compo"))),
+    ("_tag_place", frozenset(("scene_place",)), lambda t: _sx_int(t.get("scene_place"))),
 )
 _SEARCH_INDEX_ATTRS = tuple(a for a, _f, _k in _SEARCH_INDEXES) + (
     "_tag_folder", "_tag_foldername", "_path_text")
@@ -1076,6 +1150,8 @@ SEARCH_PREDICATES = frozenset((
     "samplerate_min", "samplerate_max", "bitrate_min", "bitrate_max", "source",
     "phrase", "bpm_min", "bpm_max", "tunes_min", "tunes_max", "chip", "dup",
     "channels_min", "channels_max", "has",
+    # a party competition's place / name (``place:`` / ``compo:``)
+    "place_min", "place_max", "compo_match",
     # the scene browse views' drill-downs (exact names — ``aggregate_facet``)
     "composer_is", "party_is", "game_is", "platform",
     # one competition of a party (with ``party_is``: the compo link)
@@ -1091,7 +1167,20 @@ FACETS = {"composer": "composer_is", "party": "party_is", "game": "game_is",
           "platform": "platform"}
 # (each view, the track field it reads — ``_facet_touch``)
 _FACET_FIELDS = (("composer", "composer"), ("party", "scene_party"), ("game", "game"),
-                 ("platform", "format"))
+                 ("platform", "format"),
+                 # (the composer identities — core/composers.py — read the
+                 # artist, the format, the path and the scene group too)
+                 ("composer", "artist"), ("composer", "format"), ("composer", "path"),
+                 ("composer", "scene_group"))
+
+
+def _running_loop():
+    """The event loop running on this thread, or None."""
+    try:
+        import asyncio
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 def _check_predicates(more: dict) -> None:
@@ -1461,6 +1550,8 @@ def _carry_enrichment(old: dict, new: dict) -> None:
     from soniqboom.core import unplayable as _unplayable
     _unplayable.carry(old, new)
     _carry_default_tune(old, new)
+    _carry_tune_list(old, new)
+    _carry_loudness(old, new)
     new.update(game_follow(new))                # the game follows the carried album
 
 
@@ -1472,6 +1563,49 @@ def same_file_version(old: dict, new: dict) -> bool:
     return (old.get("file_size") == new.get("file_size")
             and not any(old.get(h) and new.get(h) and old[h] != new[h]
                         for h in ("file_md5", "sid_md5")))
+
+
+def _carry_tune_list(old: dict, new: dict) -> None:
+    """A HES / KSS file's tune list (``subsongs``, ``tune_slots``,
+    ``tune_lengths``, ``default_subsong`` — found by playing its song slots,
+    ``stream._hes_kss_tune_list``; no extract produces it) carried onto a
+    fresh extract of the SAME file (``same_file_version``)."""
+    p = str(new.get("path") or old.get("path") or "").lower()
+    if not p.endswith((".hes", ".kss")) or not same_file_version(old, new):
+        return
+    if new.get("subsongs") or new.get("tune_slots") is not None:
+        return
+    for f in ("subsongs", "tune_slots", "tune_lengths", "default_subsong"):
+        if old.get(f) is not None:
+            new[f] = old[f]
+
+
+def _carry_loudness(old: dict, new: dict) -> None:
+    """Measured loudness (``core/loudness``: no extract produces it) carried
+    onto a fresh extract of the SAME file (``same_file_version``) that still
+    carries no ReplayGain of its own — a changed file is measured again, and
+    tags that appeared win.  Tunes past the fresh extract's tune count are
+    dropped (another tune list)."""
+    m = old.get("loudness")
+    if not isinstance(m, dict) or not m or new.get("loudness") or not same_file_version(old, new):
+        return
+    if any(new.get(f) is not None for f in ("replaygain_track_gain", "replaygain_album_gain")):
+        return
+    n = new.get("subsongs")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 1:
+        m = {k: v for k, v in m.items() if not k.isdigit() or int(k) < n}
+    elif not _header_tune_format(new):
+        m = {k: v for k, v in m.items() if k == "0"}
+    if m:
+        new["loudness"] = dict(m)
+        new["loudness_source"] = old.get("loudness_source") or "analysed"
+        if old.get("loudness_v"):
+            new["loudness_v"] = old["loudness_v"]
+
+
+def _header_tune_format(t: dict) -> bool:
+    """A SID / SNDH record: its tune keys are wires, valid without a count."""
+    return str(t.get("format") or "").split("/")[0].strip().upper() in ("SID", "SNDH")
 
 
 def _carry_default_tune(old: dict, new: dict) -> None:
@@ -1826,6 +1960,11 @@ class TrackStore:
         self._cant_play_ids: set[str] = set()
         self._cant_play_gen: int = 0
         self._on_cant_play_changed: Callable[[], None] | None = None
+        # The tracks whose folder is missing for now (``ABSENT_FIELD`` set):
+        # listed as unavailable by ``core.availability``.  ``_absent_gen``
+        # moves whenever the set may have changed (never reset).
+        self._absent_ids: set[str] = set()
+        self._absent_gen: int = 0
         # The search box's own indexes (``_SEARCH_INDEXES``): key → ids, plus
         # the folder text → ids (``folder:``) and id → whole path text
         # (``path:``).  ``_search_seq`` moves with every change to them (and
@@ -1881,6 +2020,9 @@ class TrackStore:
         # view's counter (``_facet_touch``)
         self._facet_memo: dict[str, tuple[tuple, Any]] = {}
         self._facet_gen: dict[str, int] = {}
+        # Tracks deleted since the composer identities were built (id → the
+        # composer counter then): ``composer_sets`` leaves them out.
+        self._composer_gone: dict[str, int] = {}
         # ``primary_swap`` memo: (the unplayable set, the swap or None, {group
         # key: (its primaries, their stand-in)}), and the groups written since
         # it was built (``_swap_touch``; None: build it all again).
@@ -2231,9 +2373,10 @@ class TrackStore:
         self._word_fresh.clear()
         self._word_gone.clear()
         self._word_list_full = self._word_list_dirty
-        # (an index swap installs another ``_cant_play_ids`` and other search
-        # indexes)
+        # (an index swap installs another ``_cant_play_ids``, ``_absent_ids``
+        # and other search indexes)
         self._cant_play_gen += 1
+        self._absent_gen += 1
         self._search_seq += 1
         self._sx_memo.clear()
 
@@ -2326,6 +2469,9 @@ class TrackStore:
         if _cant_play(t):
             self._cant_play_ids.add(tid)
             self._cant_play_moved()
+        if t.get(ABSENT_FIELD):
+            self._absent_ids.add(tid)
+            self._absent_gen += 1
         if not self._sx_skip:
             self._sx_index(tid, t)
 
@@ -2437,6 +2583,9 @@ class TrackStore:
         if tid in self._cant_play_ids:
             self._cant_play_ids.discard(tid)
             self._cant_play_moved()
+        if tid in self._absent_ids:
+            self._absent_ids.discard(tid)
+            self._absent_gen += 1
         self._sx_unindex(tid, t)
 
         if not self._batch_mode:
@@ -2980,6 +3129,14 @@ class TrackStore:
             elif tid in ids:
                 ids.discard(tid)
                 self._cant_play_moved()
+        if not _ABSENT_FIELDS.isdisjoint(changed):
+            if t.get(ABSENT_FIELD):
+                if tid not in self._absent_ids:
+                    self._absent_ids.add(tid)
+                    self._absent_gen += 1
+            elif tid in self._absent_ids:
+                self._absent_ids.discard(tid)
+                self._absent_gen += 1
         # Counted once the fields are written: whatever a per-track memo built
         # from ``t`` before is keyed to the old count.
         self._track_rev[tid] = self._track_rev.get(tid, 0) + 1
@@ -3079,6 +3236,7 @@ class TrackStore:
         self._rating_seq += 1
         self._twin_gen += 1
         self._facet_memo.clear()
+        self._composer_gone = {}
         self._agg_cache.clear()
         self._agg_x_cache.clear()
         self._primary_swap_memo = None
@@ -3187,6 +3345,8 @@ class TrackStore:
         self._tag_disc_number.clear()
         self._cant_play_ids.clear()
         self._cant_play_gen += 1
+        self._absent_ids.clear()
+        self._absent_gen += 1
         for attr in _SEARCH_INDEX_ATTRS:
             getattr(self, attr).clear()
         self._search_seq += 1
@@ -3398,6 +3558,8 @@ class TrackStore:
         self._browse_seq += 1
         self._upserts_since_freeze += 1
         self._aof("upsert_track", id=tid, data=track)
+        if not old:
+            self._note_filled()
 
     def upsert_tracks_batch(self, tracks: list[dict]) -> int:
         watch = self._write_watch
@@ -3427,6 +3589,8 @@ class TrackStore:
         # the same result — the carry is idempotent (a stamped record re-upserted
         # already has year_source set, so the guard below is a no-op on replay).
         self._aof("batch_upsert_tracks", count=len(tracks), data=tracks)
+        if tracks:
+            self._note_filled()
         return len(tracks)
 
     # ── Batch mode: defer O(n) sorted-list operations ───────────────
@@ -3606,6 +3770,8 @@ class TrackStore:
         self._catalog_seq += 1
         self._browse_seq += 1
         self._aof("delete_tracks", ids=[track_id])
+        if not self._tracks:
+            self._note_emptied()
         return True
 
     def delete_track_ids(self, track_ids: list[str]) -> int:
@@ -3630,10 +3796,24 @@ class TrackStore:
             self._catalog_seq += 1
             self._browse_seq += 1
             self._aof("delete_tracks", ids=ids)
+            if not self._tracks:
+                self._note_emptied()
         return deleted
 
     def track_count(self) -> int:
         return len(self._tracks)
+
+    def _note_emptied(self) -> None:
+        """The deletes just made left no track: record that the library is
+        empty on purpose (``LIBRARY_EMPTIED``, journaled after the deletes) —
+        a start then loads the empty ``library.json`` instead of falling back
+        to the ``.bak`` holding the library from before."""
+        self.set_config(LIBRARY_EMPTIED, {"at": int(time.time())})
+
+    def _note_filled(self) -> None:
+        """A track was added: the library is no longer empty on purpose."""
+        if LIBRARY_EMPTIED in self._config:
+            self.delete_config(LIBRARY_EMPTIED)
 
     # ── Duplicate-relevant change tracking ───────────────────────────────
 
@@ -3685,6 +3865,12 @@ class TrackStore:
                 b = new.get(field, a) if partial else new.get(field)
             if a != b:
                 gen[facet] = gen.get(facet, 0) + 1
+        if new is None and old is not None and old.get("id"):
+            # (a deleted track: left out of the composer sets until the next
+            # build — ``composer_sets`` — stamped with the composer counter)
+            self._composer_gone[old["id"]] = gen.get("composer", 0)
+        elif old is None and new is not None and self._composer_gone:
+            self._composer_gone.pop(new.get("id"), None)      # (back again)
 
     def _twin_touch(self, old: "dict | None", new: "dict | None") -> None:
         """Move ``_twin_gen`` when the write of a track from ``old`` to ``new``
@@ -5066,10 +5252,24 @@ class TrackStore:
         v = get("group_match")
         if v is not None:
             yield self._word_hits("_tag_scene_group", v), False
-        for name, attr in (("party", "_tag_party"), ("composer_match", "_tag_composer")):
-            v = get(name)
-            if v is not None:
-                yield self._sx_word_hits(attr, v), False
+        v = get("party")
+        if v is not None:
+            yield self._sx_word_hits("_tag_party", v), False
+        v = get("composer_match")
+        if v is not None:
+            # (the composer tag — and every scene musician known by a name
+            # the value starts a word of: ``composer:hubbard`` finds the
+            # SIDs whose artist field credits him, under any spelling)
+            hits = self._sx_word_hits("_tag_composer", v) | self.composer_index().word_hits(v)
+            if self._composer_gone:
+                hits.difference_update(self._composer_gone)   # (deleted since it was built)
+            yield hits, False
+        v = get("compo_match")
+        if v is not None:
+            yield self._sx_word_hits("_tag_compo", v), False
+        lo, hi = get("place_min"), get("place_max")
+        if lo is not None or hi is not None:
+            yield _ordinal_hits(self._tag_place, lo, hi), lo is not None and lo == hi
         v = get("folder")
         if v is not None:
             yield self._folder_hits(v), False
@@ -5118,7 +5318,13 @@ class TrackStore:
         if v is not None:
             yes = str(v).lower() == "yes"
             yield self._dup_ids(yes), yes
-        for name, facet in (("composer_is", "composer"), ("party_is", "party"),
+        v = get("composer_is")
+        if v is not None:
+            # (the musician's list key — or any name he is known by)
+            ident = self.composer_index().find(str(v))
+            hit = self.composer_sets().get(ident.key) if ident is not None else None
+            yield (hit[1] if hit is not None else set()), True
+        for name, facet in (("party_is", "party"),
                             ("game_is", "game"), ("platform", "platform")):
             v = get(name)
             if v is not None:
@@ -5433,8 +5639,9 @@ class TrackStore:
         items = [preds, *(dict(e) for e in (preds.get("negate") or ()))]
         for group in preds.get("anyof") or ():
             items.extend(dict(e) for e in group)
-        rating = plays = length = rel = sx = src = False
+        rating = plays = length = rel = sx = src = comp = False
         for d in items:
+            comp = comp or d.get("composer_match") is not None or d.get("composer_is") is not None
             rating = rating or d.get("rating_min") is not None or d.get("rating_max") is not None
             plays = plays or any(d.get(k) is not None for k in ("plays_min", "plays_max", "played"))
             length = length or d.get("length_min") is not None or d.get("length_max") is not None
@@ -5442,12 +5649,19 @@ class TrackStore:
                 search_values.is_relative(d.get("played"))
             sx = sx or any(d.get(k) is not None for k in _SX_PREDICATES)
             src = src or d.get("source") is not None
+        reg = _catalogue.generation() if src else None
+        if comp:
+            # (the composer identities follow the Demozoo index file and a
+            # rebuild that lands without a write — beside the registry, so the
+            # key keeps its six entries)
+            from soniqboom.core import composers
+            reg = (reg, composers.generation(self), composers.version_of(self))
         return (self._rating_seq if rating else None,
                 self._play_seq if plays else None,
                 self._duration_seq if length else None,
                 int(time.time() // 60) if rel else None,
                 self._search_seq if sx else None,
-                _catalogue.generation() if src else None)
+                reg)
 
     def _paginate_excluding(self, limit: int, offset: int, exclude, *,
                             filter_duplicates: bool = False,
@@ -6323,11 +6537,104 @@ class TrackStore:
             return self._agg_x_set(cache_key, exclude, results, swap)
         return self._agg_cache_set(cache_key, results)
 
+    def _composer_stamp(self) -> tuple:
+        """What the composer identities were built from: their fields' write
+        counter (``_facet_touch``), the indexes they read (a rebuild replaces
+        them), the online collections' registry and the Demozoo index file."""
+        from soniqboom.core import composers
+        return (self._facet_gen.get("composer", 0), id(self._tag_composer),
+                id(self._tag_artist), id(self._tag_format), id(self._tag_scene_group),
+                _catalogue.generation(), composers.generation(self))
+
+    def composer_index(self):
+        """The scene musicians' identities (``core/composers.ComposerIndex``).
+
+        Built off the event loop (``composer_index_async``: a snapshot in
+        short slices on the loop, the rest in a worker thread); every HTTP
+        entry point awaits that first (``data.search_indexes_for``, the
+        library lists).  Here — a synchronous reader — the newest one built is
+        served, also when a write made it stale (a rebuild is started in the
+        background, the next await gets the fresh one); only with none built
+        yet, or no event loop running (scripts, tests), is it built here.
+        The search indexes a start builds are finished first (it reads
+        ``_tag_composer``)."""
+        from soniqboom.core import composers
+        if self._sx_todo is not None:
+            self._sx_ensure()
+        stamp = self._composer_stamp()
+        memo = self._facet_memo.get("composer:index")
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        loop = _running_loop()
+        if memo is not None and loop is not None:
+            composers.rebuild_soon(self, loop)
+            return memo[1]
+        idx = composers.build(self)
+        self._composer_install(stamp, idx)
+        return idx
+
+    def _composer_install(self, stamp: tuple, idx) -> None:
+        if self._memo_ok():
+            self._facet_memo["composer:index"] = (stamp, idx)
+            # (deleted before its snapshot: not in it — the rest still count)
+            g = stamp[0]
+            self._composer_gone = {t: k for t, k in self._composer_gone.items() if k > g}
+
+    def composer_sets(self) -> dict:
+        """The Scene → Composers sets (``ComposerIndex.facet_sets``) — while
+        the index is stale (a rebuild on its way), without the tracks deleted
+        since it was built, so the rows, the counts and the drills agree
+        (one object per index and write: the rows' memo names it)."""
+        idx = self.composer_index()
+        sets = idx.facet_sets()
+        gone = self._composer_gone
+        if not gone or self.composer_index_fresh():
+            return sets
+        stamp = (idx.version, len(gone), self._mutation_seq)
+        memo = self._facet_memo.get("composer:live")
+        if memo is not None and memo[0] == stamp:
+            return memo[1]
+        # (only the musicians who had a deleted track: a set test each)
+        out = dict(sets)
+        for k, (n, ids) in sets.items():
+            if not ids.isdisjoint(gone):
+                out[k] = (n, ids.difference(gone))
+        if self._memo_ok():
+            self._facet_memo["composer:live"] = (stamp, out)
+        return out
+
+    def composer_index_fresh(self) -> bool:
+        memo = self._facet_memo.get("composer:index")
+        return memo is not None and memo[0] == self._composer_stamp()
+
+    async def composer_index_async(self, *, cold: bool = True):
+        """The identities as the library is now — rebuilt off the loop when
+        a write made them stale (``composers.rebuild``: one at a time; on a
+        big library the index built before serves until the new one is in).
+        ``cold=False``: with none built yet on a library of more than
+        ``composers.COLD_AWAIT_TRACKS`` tracks, None at once (the caller
+        serves without: the counts say "not known yet", the Artists view lists
+        its tags unfolded) while the first build runs.  The search indexes a
+        start builds are awaited first."""
+        from soniqboom.core import composers
+        if self._sx_todo is not None:
+            if not cold:
+                return None
+            await self.search_indexes_ready()
+        memo = self._facet_memo.get("composer:index")
+        if memo is not None and memo[0] == self._composer_stamp():
+            return memo[1]
+        if memo is None and not cold and len(self._tracks) > composers.COLD_AWAIT_TRACKS:
+            composers.rebuild_soon(self, _running_loop())
+            return None
+        return await composers.rebuild(self)
+
     def _facet_sets(self, facet: str) -> dict:
         """``{key: (display name, ids)}`` of a scene browse view (``FACETS``):
 
-        * ``composer`` — ``_tag_composer``'s single names (a "A • B" credit
-          counts under A and under B, as the Artists view lists them);
+        * ``composer`` — the scene musicians (``composer_index``: one row per
+          musician, every spelling of the name folded in; a "A • B" / "A & B"
+          credit counts under A and under B);
         * ``party`` — ``_tag_party`` (the Demozoo party a tune was released at);
         * ``game`` — each track's own ``game`` (not its aliases, which
           ``_tag_game`` also holds — a game is listed once);
@@ -6340,9 +6647,11 @@ class TrackStore:
         or its index is rebuilt; the search indexes a start builds are
         finished first.  A row's name: its tracks' most common spelling (of a
         few of them — ``_display_name``)."""
-        if facet in ("composer", "party") and self._sx_todo is not None:
+        if facet == "composer":
+            return self.composer_sets()
+        if facet == "party" and self._sx_todo is not None:
             self._sx_ensure()
-        base = {"composer": self._tag_composer, "party": self._tag_party,
+        base = {"party": self._tag_party,
                 "game": self._tag_game, "platform": self._tag_format}.get(facet)
         # (the index object too: a rebuild replaces it — and the live sets
         # ``composer`` / ``party`` hand out with it)
@@ -6351,11 +6660,11 @@ class TrackStore:
         if memo is not None and memo[0] == stamp:
             return memo[1]
         out: dict = {}
-        if facet in ("composer", "party"):
+        if facet == "party":
             idx = base
-            field = "composer" if facet == "composer" else "scene_party"
+            field = "scene_party"
             for key, tids in idx.items():
-                if not tids or (facet == "composer" and NAME_SEP in key):
+                if not tids:
                     continue
                 fk = _facet_key(key)
                 spellings: Counter = Counter()
@@ -6619,26 +6928,37 @@ class TrackStore:
         off-thread while a scan stores new waveforms concurrently)."""
         return dict(self._waveforms)
 
+    # Every waveform write is journaled (ops ``store_waveforms`` /
+    # ``forget_waveforms`` / ``clear_waveforms``): the merger folds them into
+    # ``library.json`` like any other record, so a restart whose stop skipped
+    # the full snapshot (a lean AOF, ``main._snapshot_skippable``) keeps them.
+
     def store_waveform(self, track_id: str, amplitudes: list[float]) -> None:
         self._waveforms[track_id] = amplitudes
+        self._aof("store_waveforms", data={track_id: amplitudes})
 
     def store_waveforms_batch(self, mapping: dict[str, list[float]]) -> None:
+        if not mapping:
+            return
         self._waveforms.update(mapping)
+        self._aof("store_waveforms", data=dict(mapping))
 
     def waveform_exists_batch(self, track_ids: list[str]) -> dict[str, bool]:
         return {tid: tid in self._waveforms for tid in track_ids}
 
     def forget_waveforms(self, track_ids) -> int:
         """Drop the stored waveforms of these tracks (their files changed)."""
-        n = 0
-        for tid in track_ids or ():
-            if self._waveforms.pop(tid, None) is not None:
-                n += 1
-        return n
+        gone = [tid for tid in dict.fromkeys(track_ids or ())
+                if self._waveforms.pop(tid, None) is not None]
+        if gone:
+            self._aof("forget_waveforms", ids=gone)
+        return len(gone)
 
     def clear_waveforms(self) -> int:
         n = len(self._waveforms)
         self._waveforms.clear()
+        if n:
+            self._aof("clear_waveforms")
         return n
 
     # ── Ratings ──────────────────────────────────────────────────────────
@@ -7108,18 +7428,43 @@ class TrackStore:
 
     # ── Hash lookups ─────────────────────────────────────────────────────
 
+    # A lookup that is new (or names another value) is journaled (op
+    # ``store_hash_lookups``) — a restart keeps what a folder hash names (the
+    # Subsonic folder albums' names, the folder tree's) — and moves
+    # ``_catalog_seq``: a folder album named while its hash was unknown
+    # ("Folder 02ab9b") gets its name at the catalogue's next build, so the
+    # lists (search3, getAlbumList2) and getAlbum read the same name.  One that
+    # is already stored writes nothing.
+
     def store_hash_lookup(self, value: str) -> str:
         h = hashlib.sha256(value.encode()).hexdigest()[:16]
-        self._hash_lookups[h] = value
+        if self._hash_lookups.get(h) != value:
+            self._hash_lookups[h] = value
+            self._hash_lookups_added({h: value})
         return h
 
     def store_hash_lookups_batch(self, values: list[str]) -> dict[str, str]:
         result = {}
         for v in values:
-            h = hashlib.sha256(v.encode()).hexdigest()[:16]
-            self._hash_lookups[h] = v
-            result[v] = h
+            result[v] = hashlib.sha256(v.encode()).hexdigest()[:16]
+        self.put_hash_lookups({h: v for v, h in result.items()})
         return result
+
+    def put_hash_lookups(self, by_hash: dict[str, str]) -> int:
+        """Store already-computed lookups ``{hash: value}`` (``data.
+        store_hash_lookups_batch`` hashes off the loop); returns how many were
+        new.  On the event loop (it journals)."""
+        lookups = self._hash_lookups
+        new = {h: v for h, v in (by_hash or {}).items()
+               if isinstance(h, str) and isinstance(v, str) and lookups.get(h) != v}
+        if new:
+            lookups.update(new)
+            self._hash_lookups_added(new)
+        return len(new)
+
+    def _hash_lookups_added(self, new: dict[str, str]) -> None:
+        self._catalog_seq += 1
+        self._aof("store_hash_lookups", data=new)
 
     def resolve_hash(self, h: str) -> str | None:
         return self._hash_lookups.get(h)

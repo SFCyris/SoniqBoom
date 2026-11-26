@@ -325,6 +325,7 @@ from soniqboom.core.data import (
     record_play, get_play_stats, get_play_stats_batch, get_all_play_stats,
     ft_search, ft_search_dicts,
 )
+from soniqboom.core import search_values
 from soniqboom.core.metadata import extract_lyrics
 from soniqboom.models.track import TrackMeta
 from soniqboom.api.users import listener_uid as _listener_uid
@@ -499,9 +500,13 @@ def _meta_types(annotation) -> "tuple[frozenset, frozenset, frozenset | None]":
         elif a is float:
             kept.add(float)
             to_float.add(int)
-        elif typing.get_origin(a) is list and typing.get_args(a) in ((str,), (float,)):
+        elif typing.get_origin(a) is list and typing.get_args(a) in ((str,), (float,), (int,)):
             kept.add(list)
             elements = frozenset(typing.get_args(a))
+        elif typing.get_origin(a) is dict and typing.get_args(a) == (str, list[float]):
+            # (``loudness``: tune key → [LUFS, peaks] — ``_FLOAT_LIST_MAPS``)
+            kept.add(dict)
+            elements = frozenset({dict})
         else:
             return frozenset(), frozenset(), None
     return frozenset(kept), frozenset(to_float), elements
@@ -511,6 +516,16 @@ _META_SPEC = {n: _meta_types(f.annotation) for n, f in TrackMeta.model_fields.it
 _FLOAT_ONLY = frozenset({float})
 _STR_LISTS = tuple(n for n, (_k, _f, el) in _META_SPEC.items() if el == {str})
 _FLOAT_LISTS = tuple(n for n, (_k, _f, el) in _META_SPEC.items() if el == _FLOAT_ONLY)
+_INT_ONLY = frozenset({int})
+_INT_LISTS = tuple(n for n, (_k, _f, el) in _META_SPEC.items() if el == _INT_ONLY)
+_FLOAT_LIST_MAPS = tuple(n for n, (_k, _f, el) in _META_SPEC.items() if el == {dict})
+# every optional field's default, in field order (``public_track`` merges a
+# stored row missing some over it); the fields whose default is a factory
+# (a list) get a fresh one per row
+_META_DEFAULTS = {n: f.get_default(call_default_factory=True)
+                  for n, f in TrackMeta.model_fields.items() if not f.is_required()}
+_META_FACTORIES = frozenset(n for n, f in TrackMeta.model_fields.items()
+                            if f.default_factory is not None)
 
 
 class _Absent:
@@ -582,8 +597,23 @@ def public_track(d: dict | None) -> dict | None:
     for name in _FLOAT_LISTS:
         if (v := d.get(name)) and not set(map(type, v)) <= _FLOAT_ONLY:
             return _model_shaped(d)
+    for name in _INT_LISTS:
+        if (v := d.get(name)) and not set(map(type, v)) <= _INT_ONLY:
+            return _model_shaped(d)
+    for name in _FLOAT_LIST_MAPS:
+        if v := d.get(name):
+            for k, e in v.items():
+                if type(k) is not str or type(e) is not list or not set(map(type, e)) <= _FLOAT_ONLY:
+                    return _model_shaped(d)
     to_fix, missing = plan
-    if missing or len(d) != len(_META_NAMES):    # → a field to fill, or a stray key
+    if missing and len(d) == len(_META_NAMES) - len(missing):
+        # (fields to fill, no stray key: the stored values over the defaults —
+        # a fresh object for each mutable default)
+        out = dict(_META_DEFAULTS)
+        out.update(d)
+        for name in _META_FACTORIES.intersection(missing):
+            out[name] = TrackMeta.model_fields[name].get_default(call_default_factory=True)
+    elif missing or len(d) != len(_META_NAMES):    # → a field to fill, or a stray key
         fields = TrackMeta.model_fields
         out = {name: d[name] if name in d
                else fields[name].get_default(call_default_factory=True)
@@ -1303,7 +1333,8 @@ async def shuffled_tracks(
     seed: int = Query(..., description="Shuffle seed — same seed ⇒ same order."),
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
-    q: str | None = Query(None, description="Search-box query (same syntax as /api/search)."),
+    q: str | None = Query(None, max_length=search_values.QUERY_MAX_LEN,
+                          description="Search-box query (same syntax as /api/search)."),
     artist: str | None = None,
     album_artist: str | None = None,
     album: str | None = None,
@@ -1707,11 +1738,20 @@ async def get_track_extended(track_id: str, request: Request):
     _stream.catalogue_read_for_info(
         track_id, track, (request.client.host if request.client else "") or "?")
     if not track.subsongs:
-        # A libgme rip scanned before tune counts were read (plain local file).
+        # A record scanned before its tunes were counted (a libgme rip, a
+        # tracker module's subsongs, a GoatTracker / FamiTracker song's
+        # tunes; HES / KSS probed in the background) — a plain local file.
         p = str(track.path or "")
+        from soniqboom.api import stream as _stream
         if p and "::" not in p and not is_remote_path(p):
-            from soniqboom.api import stream as _stream
-            track = await _stream._gme_backfill_tune_count(track_id, track, Path(p))
+            track = await _stream.tune_list_backfill(track_id, track, Path(p))
+        elif p and "::" not in p:
+            # An online collection's tune: only once its Track Info / play
+            # fetched it (``catalogue_read_for_info``; the page asks again
+            # when the read lands) — its local copy.
+            local = await asyncio.to_thread(_catalogue_copy, p)
+            if local is not None:
+                track = await _stream.tune_list_backfill(track_id, track, local)
     default_track = await _default_track(track_id, track)
     default_tune, default_pending = await _default_tune(track_id, track, default_track)
 
@@ -1766,6 +1806,18 @@ async def get_track_extended(track_id: str, request: Request):
         "defect_at": getattr(track, "defect_at", None),
     }
     return result
+
+
+def _catalogue_copy(p: str) -> "Path | None":
+    """The local copy of the online collection's file ``p`` already in the
+    remote cache, or None (never fetched here).  Blocking (a stat)."""
+    try:
+        from soniqboom.core import catalogue
+        from soniqboom.core.remote_cache import get_cache
+        sp = catalogue._split(p) if catalogue.is_catalogue_path(p) else None
+        return get_cache().get_cached(sp[0], "/" + sp[1]) if sp else None
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
 def _renderer_key(track_id: str, track) -> "str | None":
@@ -2103,8 +2155,12 @@ async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, 
         # only here — i.e. only when the web now-playing meter asks for the
         # track that is actually playing.  It runs in the background; this
         # request 404s and the player's poll picks the sidecar up later.
+        from soniqboom.api import voices as _voices
         if start is not False:
             _stream.request_uade_vu(track_id, subsong)
+            # libgme / AdLib meters: a pass over the cached render, started
+            # the same way (``api/voices.py``).
+            _voices.request_chip_vu(track_id, subsong)
         # Lazy-backfill path.  Only attempt for known tracker formats
         # (we don't want to spin up libopenmpt against a 10 GB FLAC).
         sidecar = await _try_backfill_vu_sidecar(track, track_id, subsong)
@@ -2123,6 +2179,9 @@ async def get_vu_sidecar(track_id: str, subsong: int | None = Query(None, ge=0, 
                 or _stream._ck(track_id, "uade", subsong=subsong) in _stream._UADE_VU_WANTED):
             return _no_content({"X-VU-Unavailable": reason})
         skipped = _stream.uade_vu_skipped_reason(track_id, subsong)
+        if skipped is None:
+            from soniqboom.api import voices as _voices
+            skipped = _voices.chip_vu_skipped_reason(track_id, subsong)
         if skipped is not None:
             return _no_content({"X-VU-Unavailable": skipped})
         return _no_content()
@@ -2290,6 +2349,11 @@ async def upload_vu_sidecar(
         raise HTTPException(404, "Track not found")
     if not _is_sid_format(track):
         raise HTTPException(415, "Not a C64 SID track")
+    # A tune for two or three SID chips: the server's meter shows every chip's
+    # voices (6 / 9, ``sid_vu.voice_mutes``); the WASM core meters one chip.
+    from soniqboom.api import stream as _stream
+    if _stream.sid_chips(track) >= 2:
+        raise HTTPException(409, "a multi-SID tune's meter is made on the server")
 
     # (5) SERVER-derived destination slot.
     wav_path = get_sid_wav_path_for_upload(track_id, subsong)
@@ -2412,6 +2476,11 @@ async def upload_sid_audio(
     # (4) fidelity gate — refuse warming a slot the WASM can't reproduce.
     if not sid_warm_eligible():
         raise HTTPException(409, "server SID fidelity is non-default — cannot cache-warm")
+    # … nor a tune for two or three SID chips: the server renders it in stereo
+    # (``stream.sid_stereo``), the WASM core in mono.
+    if _stream.sid_stereo(track):
+        raise HTTPException(409, "a multi-SID tune renders in stereo on the server "
+                                 "— cannot cache-warm")
 
     # (5) Bound RAM + concurrency (A2): require Content-Length (reject chunked so
     # we can't be forced to buffer an unbounded body), cap the size, gate
@@ -3099,6 +3168,7 @@ def _source_unreachable(path_str: str) -> bool:
 
 async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str,
                                           *, sid_duration: int | None = None,
+                                          sid_variant: str | None = None,
                                           dreamcast: bool = False,
                                           subsong: int = 0,
                                           uade_base: int = 0,
@@ -3121,7 +3191,9 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     flight: the waveform is ready the moment the finished render is cached.
 
     ``sid_duration`` (SID only) MUST match the stream path's per-tune length
-    so the waveform reads the already-rendered stream WAV.  ``subsong`` picks
+    so the waveform reads the already-rendered stream WAV, and
+    ``sid_variant`` its key variant ("st": a 2SID / 3SID tune's stereo
+    render — ``stream._sid_key_variant``).  ``subsong`` picks
     that tune's render (the stream path keys every tune separately);
     ``uade_base`` is an Amiga module's subsong base, part of its key;
     ``uade_named`` is ``stream._render_ident``'s verdict (a verified Amiga
@@ -3145,9 +3217,9 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     if ext in _SID_EXTS:
         cands = [("sid", None, sid_duration), ("uade", None, None)]
     elif ext in _MIDI_EXTS:
-        from soniqboom.config import active_soundfont_async
-        sf = await active_soundfont_async()
-        cands = [("midi", str(sf) if sf else "", None)]
+        # (the synth it plays on now is the key's variant — ``midi_variant``)
+        from soniqboom.api.stream import midi_variant_async
+        cands = [("midi", await midi_variant_async(path_str), None)]
     elif ext in _HVL_EXTS:
         cands = [("hvl", None, None)]
     elif ext in _UADE_EXTS or uade_named:
@@ -3178,10 +3250,18 @@ async def _waveform_from_conversion_cache(track_id: str, path_str: str, ext: str
     psf_vars = (await _psf_variants_known(
         ext, path_str, not (is_remote_path(path_str) or "::" in path_str))
         if any(c[0] == "psf" for c in cands) else (None,))
+    # (a GoatTracker song / FamiTracker module with several tunes: per tune)
+    from soniqboom.api.stream import _psf_tuned
+    from soniqboom.core.store import get_store as _gs
+    tuned = any(c[0] == "psf" for c in cands) and _psf_tuned(ext, _gs().get_track(track_id))
     keys = [uade_cache_key(track_id, subsong, uade_base) if fmt == "uade" else
-            _cache_key(track_id, fmt, subsong if fmt not in ("midi", "psf", "ym") else 0,
+            _cache_key(track_id, fmt,
+                       subsong if fmt not in ("midi", "psf", "ym") or (fmt == "psf" and tuned)
+                       else 0,
                        sf, duration=dur,
-                       variant=(_gme_variant(ext) if fmt == "gme" else var))
+                       variant=(_gme_variant(ext) if fmt == "gme"
+                                else sid_variant if fmt == "sid" else var),
+                       tuned=fmt == "psf" and tuned)
             for fmt, sf, dur in cands
             for var in (psf_vars if fmt == "psf" else (None,))]
 
@@ -3413,9 +3493,10 @@ async def get_track_waveform(track_id: str, response: Response,
         # render (see _sid_target_duration).  Other converted formats render
         # full-length by nature and need no duration hint.
         _sid_dur = _sid_target_duration(track, subsong) if ext in _SID_EXTS else None
-        from soniqboom.api.stream import _uade_base_known
+        from soniqboom.api.stream import _sid_key_variant, _uade_base_known
         wav_path = await _waveform_from_conversion_cache(
             track_id, path_str, ext, sid_duration=_sid_dur, dreamcast=_dreamcast,
+            sid_variant=_sid_key_variant(track) if ext in _SID_EXTS else None,
             subsong=tune_index(track_id, track, wire),
             uade_base=_uade_base_known(track_id, track) or 0,
             uade_named=_uade_named,

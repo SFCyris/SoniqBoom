@@ -109,7 +109,9 @@ def _safe_header_filename(raw: str) -> str:
 
 async def _authorize_cast(token: str, request: Request, *, bind: bool = True):
     """Token signature + replay check + user re-auth + track lookup — shared by
-    GET and HEAD.  GET binds the link to the first IP that plays it; HEAD
+    GET and HEAD.  GET binds the link to the first IP that plays it (not a
+    DLNA Media Server link, which any LAN device may Browse for —
+    ``cast_tokens.replay_ok``); HEAD
     (``bind=False``) is refused for another IP once bound but never binds
     itself — a DLNA control point probing the link must not lock the TV's
     GET out.  Returns ``(claims, track, track_id)``; raises 404 / 410."""
@@ -360,7 +362,9 @@ async def cast_stream(
             ck = _ck(
                 track_id=track_id, format_type="transcoded",
                 codec=target_codec, target_rate=target_sample_rate,
-                variant=_gain_variant(gain) or None,
+                variant=(_gain_variant(gain)
+                         + (_width_variant(_cast_width(track_id, src_ext))
+                            if _rendered_ext(src_ext) else "")) or None,
             )
             cached_path = await get_cached(ck)
         except Exception:
@@ -579,7 +583,7 @@ async def cast_stream(
         # We wrap the whole setup in try/except so any early-raise after
         # the ZIP pin (above) releases the pin instead of leaking it —
         # QA-1 P0 flagged the gap between pin and the response generator's
-        # finally block.  The cast_render import + the ``is_rendered_format``
+        # finally block.  The cast_render import + the ``is_rendered_source``
         # probe live INSIDE the try (not before it) so even an ImportError on
         # a broken install releases the pin via the ``except BaseException``
         # handler rather than leaking the extracted member until restart.
@@ -596,10 +600,12 @@ async def cast_stream(
         live_feed = None
         try:
             from soniqboom.core.cast_render import (
-                prepare_source_for_stream, prepare_live_source, is_rendered_format,
+                prepare_source_for_stream, prepare_live_source, is_rendered_source,
             )
             target_subsong = int(claims.get("sn") or 0)
-            was_rendered = is_rendered_format(_ext_for(track.path, track))
+            # (by suffix, by an Amiga prefix-form name, or — a .dsf — by the
+            # local file's magic: every family the web player renders)
+            was_rendered = await is_rendered_source(track.path, track, path_obj)
             if was_rendered:
                 try:
                     # ALWAYS the RESOLVED LOCAL path — path_obj has already
@@ -663,10 +669,13 @@ async def cast_stream(
                 render_gain_ = 1.0
                 if was_rendered and live_feed is None:
                     render_gain_ = await _render_gain_async(path_obj)
+                # A retro tune's stereo width (``render_options``), on the
+                # stream to the renderer — keyed like the gain.
+                width_ = _cast_width(track_id, src_ext) if was_rendered else 100
                 ck = _ck(
                     track_id=track_id, format_type="transcoded",
                     codec=target_codec, target_rate=target_sample_rate,
-                    variant=_gain_variant(render_gain_) or None,
+                    variant=(_gain_variant(render_gain_) + _width_variant(width_)) or None,
                 )
                 cache_sink = _ccp(ck, "transcoded")
             except Exception:
@@ -722,6 +731,7 @@ async def cast_stream(
                 on_first_byte=_mark_first_byte,
                 src_feed=live_feed,
                 gain=render_gain_,
+                width=width_ if ck is not None else 100,
             )
 
             # Count bytes for telemetry without buffering — wrap the generator.
@@ -801,6 +811,29 @@ async def cast_stream(
 # A divergent inline copy previously omitted .psid, most tracker extensions,
 # the SID duration, and the live MIDI soundfont, so those keys never matched
 # and the pins silently no-op'd.
+
+
+def _rendered_ext(src_ext: str) -> bool:
+    """``cast_render.is_rendered_format`` (late import)."""
+    from soniqboom.core.cast_render import is_rendered_format
+    return is_rendered_format(src_ext)
+
+
+def _width_variant(width: int) -> str:
+    """``render_options.width_variant`` (late import)."""
+    from soniqboom.core.render_options import width_variant
+    return width_variant(width)
+
+
+def _cast_width(track_id: str, src_ext: str) -> int:
+    """The stereo width a cast of rendered ``track_id`` (suffix ``src_ext``)
+    goes out at: the setting (``render_options.stereo_width``), except 100
+    for a single-chip SID, whose render is mono."""
+    from soniqboom.core.render_options import stereo_width
+    from soniqboom.api.stream import _SID_EXTS, sid_stereo_by_id
+    if src_ext in _SID_EXTS and not sid_stereo_by_id(track_id):
+        return 100
+    return stereo_width()
 
 
 async def _cached_render_gain(track_id: str, src_ext: str, subsong: int) -> float:

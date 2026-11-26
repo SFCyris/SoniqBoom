@@ -69,8 +69,15 @@ def _mod(path: Path, rows: int = 64, tail: bytes = b"") -> Path:
 
 
 def _cli_duration(path: Path) -> "float | None":
+    # Since 2.3.0 each subsong of a module with several is a tune of its own
+    # and the record's duration is its FIRST subsong's (tests/test_every_tune.py):
+    # the CLI's length of subsong 0 then, else of the module as it plays.
     out = subprocess.run(["openmpt123", "--info", str(path)], capture_output=True,
                          text=True, timeout=30).stdout
+    n = re.search(r"Subsongs\.*:\s*(\d+)", out)
+    if n and int(n.group(1)) > 1:
+        out = subprocess.run(["openmpt123", "--info", "--subsong", "0", str(path)],
+                             capture_output=True, text=True, timeout=30).stdout
     m = re.search(r"Duration\.*:\s*(?:(\d+):)?(\d+):(\d+\.\d+)", out)
     if not m:
         return None

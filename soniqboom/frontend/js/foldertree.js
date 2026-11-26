@@ -385,10 +385,7 @@ function _within(p, base) {
  */
 async function reveal(path) {
   if (!path) return false;
-  if (wrap.style.display === 'none') {         // (the Folders section collapsed)
-    wrap.style.display = '';
-    toggle.classList.remove('collapsed');
-  }
+  if (wrap.style.display === 'none') _setSectionOpen(true);   // (the Folders section collapsed)
   let li = [...treeEl.querySelectorAll(':scope > li.tree-root')]
     .filter((x) => _within(path, x.dataset.path))
     .sort((a, b) => b.dataset.path.length - a.dataset.path.length)[0];
@@ -415,11 +412,15 @@ async function reveal(path) {
   return true;
 }
 
-// Collapse/expand whole folders section
+// Collapse/expand whole folders section (aria-expanded follows, so a screen
+// reader hears the state the ▼ shows)
+function _setSectionOpen(open) {
+  wrap.style.display = open ? '' : 'none';
+  toggle.classList.toggle('collapsed', !open);
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
 toggle.addEventListener('click', () => {
-  const collapsed = wrap.style.display === 'none';
-  wrap.style.display = collapsed ? '' : 'none';
-  toggle.classList.toggle('collapsed', !collapsed);
+  _setSectionOpen(wrap.style.display === 'none');
 });
 
 // ── Scan indicator — pulse root folders while a scan is active ────────────────

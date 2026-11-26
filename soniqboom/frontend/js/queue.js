@@ -24,10 +24,11 @@
  * Exports: Queue singleton with toggle, refresh, open, close.
  */
 import { Player } from './player.js';
-import { artPlaceholderEmoji, subsongWireToTune, subsongStartOf } from './utils.js';
+import { artPlaceholderEmoji, subsongWireToTune, subsongStartOf, Toast } from './utils.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
 import { healthBadgeHTML, skipWord, skipReasonOf } from './health.js';
 import { createVirtualList } from './vlist.js';
+import { confirmKeyAction, confirmInitialFocus } from './confirm_keys.js';
 import { onUiStyleChange } from './ui_style.js';
 import { vizGroupEnabled } from './viz/engine.js';
 import { fmtShort, fmtFamily, fmtTotal, counterDigits } from './playlist/hero.js';
@@ -85,54 +86,30 @@ _paintOffer();
 //
 // Clicking ``Clear`` while the queue has ≥5 tracks pops a styled confirm
 // modal — small queues clear silently because the user can rebuild them
-// trivially.  After a successful clear we show a 5-second undo toast that
-// restores the previous queue and play position from a swap variable.
+// trivially.  After a successful clear we offer a 5-second Undo that restores
+// the previous queue and play position.
 const CLEAR_CONFIRM_MIN  = 5;
 const UNDO_WINDOW_MS     = 5000;
-let _undoQueue   = null;          // Player.snapshotQueue() from the last clear
-let _undoTimer   = null;
+// The last clear's "Cleared N tracks · Undo" offer (refresh() forgets it once closed)
 let _undoToast   = null;
-let _restoring   = false;         // Undo is putting the old queue back right now
 
-function _renderUndoToast(count) {
-  // Lightweight inline toast — we avoid utils' Toast for this because it
-  // doesn't expose an action button.  Positioning matches Toast (bottom-
-  // right) so it co-locates with the rest of the notification stack.
-  const el = document.createElement('div');
-  el.className = 'queue-undo-toast';
-  el.style.cssText = (
-    'position:fixed;right:18px;bottom:18px;z-index:100001;'
-    + 'background:var(--bg3,#222);color:var(--text1,#eee);'
-    + 'border:1px solid var(--border-bright,#444);border-radius:8px;'
-    + 'padding:10px 14px;display:flex;align-items:center;gap:12px;'
-    + 'font-size:13px;box-shadow:var(--glass-shadow,0 4px 12px rgba(0,0,0,.4));'
-  );
-  el.innerHTML = `
-    <span>Cleared ${count} track${count === 1 ? '' : 's'}.</span>
-    <button type="button" class="queue-undo-btn"
-            style="background:transparent;border:1px solid currentColor;color:inherit;
-                   padding:3px 10px;border-radius:5px;cursor:pointer;font:inherit">
-      Undo
-    </button>`;
-  el.querySelector('.queue-undo-btn').addEventListener('click', () => {
-    _applyUndo();
-  });
-  document.body.appendChild(el);
-  return el;
+// The shared offer toast (Toast.action), docked above the player bar with the
+// other toasts — it was a toast of its own, bottom-right, on the volume slider
+// for its 5 s.  It is announced, and stays up while it is pointed at or focused;
+// its Undo holds the snapshot, so Undo works for as long as the offer shows.
+// (Undo forgets the offer first, so the restore's 'queuechange' can't withdraw it.)
+function _offerUndo(count, snap) {
+  _dismissUndoToast();
+  _undoToast = Toast.action(`Cleared ${count} track${count === 1 ? '' : 's'}.`, 'Undo', () => {
+    _undoToast = null;
+    try { Player.restoreQueue(snap); } catch (e) { console.error('Queue undo failed', e); }   // (Toast swallows errors)
+    refresh();
+  }, UNDO_WINDOW_MS);
 }
 
 function _dismissUndoToast() {
-  if (_undoTimer) { clearTimeout(_undoTimer); _undoTimer = null; }
-  if (_undoToast) { _undoToast.remove(); _undoToast = null; }
-}
-
-function _applyUndo() {
-  if (!_undoQueue) { _dismissUndoToast(); return; }
-  _restoring = true;
-  try { Player.restoreQueue(_undoQueue); } finally { _restoring = false; }
-  _undoQueue = null;
-  _dismissUndoToast();
-  refresh();
+  if (_undoToast) Toast.dismiss(_undoToast);
+  _undoToast = null;
 }
 
 function _showClearConfirm(count) {
@@ -160,13 +137,20 @@ function _showClearConfirm(count) {
       setTimeout(() => backdrop.remove(), 150);
       resolve(value);
     }
-    btnOk.focus();
+    // (confirm_keys.js, as the playlist and Settings confirms: a destructive
+    // confirm opens on Cancel, and Enter / Space answer for the focused
+    // button only — a stray Enter never clears the queue)
+    confirmInitialFocus(true, btnOk, btnCan).focus();
     btnOk.addEventListener('click',  () => finish(true));
     btnCan.addEventListener('click', () => finish(false));
     backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish(false); });
     dialog.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') finish(false);
-      if (e.key === 'Enter')  finish(true);
+      const act = confirmKeyAction(e.key, document.activeElement, btnOk, btnCan);
+      e.stopPropagation();                     // (the page's shortcuts must not act behind it)
+      if (act === null) return;
+      e.preventDefault();                      // (no native click on top of ours)
+      if (act === 'ok') finish(true);
+      else if (act === 'cancel') finish(false);
     });
   });
 }
@@ -182,16 +166,12 @@ document.getElementById('btn-queue-clear').addEventListener('click', async () =>
 
   // Snapshot for undo BEFORE we clear — the queue plus its source / shuffle
   // state, so Undo brings back exactly what was there.
-  _undoQueue = Player.snapshotQueue();
+  const count = q.length;
+  const snap = Player.snapshotQueue();
 
   Player.setQueue([], 0);
 
-  _dismissUndoToast();
-  _undoToast = _renderUndoToast(q.length);
-  _undoTimer = setTimeout(() => {
-    _undoQueue = null;
-    _dismissUndoToast();
-  }, UNDO_WINDOW_MS);
+  _offerUndo(count, snap);
 });
 
 // A subsong entry's wire index (0-based), or null for the file's default tune.
@@ -451,7 +431,8 @@ function refresh() {
   // A queue the listener started AFTER clearing makes "Undo" a trap: it would
   // replace what is playing now with the old queue.
   // (Rows Radio Mode appends on its own are not "a new queue the listener started".)
-  if (_undoQueue && q.length && !_restoring && Player.autoAhead < q.length) { _undoQueue = null; _dismissUndoToast(); }
+  if (_undoToast && !_undoToast.isConnected) _undoToast = null;   // (closed — timed out, ×, Escape — with its snapshot)
+  if (_undoToast && q.length && Player.autoAhead < q.length) _dismissUndoToast();
 
   // The panel is closed most of the time, and 'queuechange' fires on every
   // track change and every page the queue reads on: open() renders.

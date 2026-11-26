@@ -129,6 +129,20 @@ async def _resolve_and_cap_art(track_id: str) -> bytes | None:
     return await asyncio.to_thread(_downscale_art, raw)
 
 
+def _art_key(track_id: str) -> str:
+    """The now-playing cover's cache key: the track, plus the generated cover's
+    own key for a retro track (``gen_cover.spec_for`` — what it prints), so an
+    edit or an in-place change that alters that cover is a miss, never the old
+    picture until a restart."""
+    try:
+        from soniqboom.core import gen_cover
+        from soniqboom.core.store import get_store
+        spec = gen_cover.spec_for(get_store().get_track(track_id))
+    except Exception:                     # noqa: BLE001 — art is best-effort
+        spec = None
+    return f"{track_id}|g{spec.key[:12]}" if spec is not None else track_id
+
+
 def forget_artwork() -> None:
     """Forget the covers kept for now-playing frames — which cover a track
     gets has changed (the online-cover setting)."""
@@ -148,10 +162,11 @@ async def _airplay_artwork_bytes(track_id: str) -> bytes | None:
     genuine "no art") is cached (negative cache suppresses re-probing tagless
     tracks on every skip).
     """
+    key = _art_key(track_id)
     async with _art_cache_lock:
-        if track_id in _art_cache:
-            _art_cache.move_to_end(track_id)
-            return _art_cache[track_id]
+        if key in _art_cache:
+            _art_cache.move_to_end(key)
+            return _art_cache[key]
 
     try:
         art = await asyncio.wait_for(
@@ -164,8 +179,8 @@ async def _airplay_artwork_bytes(track_id: str) -> bytes | None:
         return None
 
     async with _art_cache_lock:
-        _art_cache[track_id] = art
-        _art_cache.move_to_end(track_id)
+        _art_cache[key] = art
+        _art_cache.move_to_end(key)
         while len(_art_cache) > _ART_CACHE_MAX:
             _art_cache.popitem(last=False)
     return art
@@ -386,7 +401,7 @@ class CastSession:
             forced_sr = 88200
 
         url = cast_tokens.build_stream_url(
-            base_url     = base_url or await _server_base_url(),
+            base_url     = base_url or await _server_base_url(self.target.host),
             track_id     = track_id,
             track_meta   = _track_meta(track),
             codec        = target_codec if needs_transcode else None,
@@ -504,7 +519,7 @@ class CastSession:
                 _SID_EXTS, _MIDI_EXTS, _TRACKER_EXTS, _UADE_EXTS, _HVL_EXTS,
                 _GME_EXTS_STREAM, _DSD_EXTS, NATIVE,
                 _render_sid, _render_midi, _render_tracker, _render_uade,
-                _render_hvl, _render_gme, _render_to_transcoded_flac,
+                _render_hvl, _render_gme, _render_to_transcoded_flac, gme_slot,
                 PRIO_NEXT, PRIO_AHEAD,
                 _prewarm_enabled, _render_ident, _is_rendered_ext,
             )
@@ -513,7 +528,7 @@ class CastSession:
                 is_cache_ready,
             )
             from soniqboom.core.cast_render import materialize_source
-            from soniqboom.config import settings as _settings, active_soundfont_async
+            from soniqboom.config import settings as _settings
         except Exception:
             log.exception("cast prewarm: import of render helpers failed")
             return
@@ -582,43 +597,69 @@ class CastSession:
                 # cached (or in-flight), _start_gated_render is a fast
                 # no-op.
                 from soniqboom.core.cast_render import one_tune_route
+                from soniqboom.api import stream as _stream_routes
+                if _render_ident(track.path, track)[0] in (
+                        _stream_routes._DMXMUS_ROUTE, _stream_routes._ADLIB_ROUTE,
+                        _stream_routes._ZX_ROUTE):
+                    # A DMX MUS / AdLib / ZX file under a suffix another engine
+                    # owns (its record's format names it): the web prewarm,
+                    # which routes it as a play does — never that engine.
+                    _stream_routes._schedule_prewarm(
+                        item.track_id, track, int(item.subsong or 0) or None, prio,
+                        f"cast:{self.target.id}")
+                    continue
                 _one = one_tune_route(item.track_id, track.path, track)
                 if _one is not None:
                     # MDX, SunVox, MGSDRV, GoatTracker, FamiTracker — their own
                     # renderer, under the key a play renders to (cast_render).
                     from soniqboom.api.stream import (
-                        _own_engine, _own_variant, _render_psf,
+                        _own_engine, _own_variant, _psf_tuned, _render_psf, tune_index,
                     )
-                    ck = _ck(track_id=item.track_id, format_type="psf", subsong=0,
-                             variant=_own_variant(_own_engine(_one)[0]))
+                    # (per tune for a GoatTracker / FamiTracker file with several)
+                    _tuned = _psf_tuned(_one, track)
+                    _tune = (tune_index(item.track_id, track, int(item.subsong or 0) or None)
+                             if _tuned else 0)
+                    ck = _ck(track_id=item.track_id, format_type="psf", subsong=_tune,
+                             variant=_own_variant(_own_engine(_one)[0]), tuned=_tuned)
                     if await is_cache_ready(ck):
                         continue
                     path = await _local_src()
                     if path is None:
                         continue
                     await _start_gated_render(
-                        prio, ck, "psf", lambda p=path: _render_psf(p))
+                        prio, ck, "psf", lambda p=path, n=_tune: _render_psf(p, n))
                 elif src_ext in _SID_EXTS:
                     target_dur = int(getattr(_settings, "sid_default_duration", 180))
+                    from soniqboom.api.stream import sid_stereo as _sid_stereo
+                    _sid_st = _sid_stereo(track)          # (a 2SID / 3SID tune: stereo)
                     ck = _ck(
                         track_id=item.track_id, format_type="sid",
                         subsong=int(item.subsong or 0), duration=target_dur,
+                        variant="st" if _sid_st else None,
                     )
                     if await is_cache_ready(ck):
                         continue
                     path = await _local_src()
                     if path is None:
                         continue
+                    from soniqboom.api import stream as _stream_mod
+                    if not await asyncio.to_thread(_stream_mod._is_c64_sid, path):
+                        # A SidMon (Amiga) .sid: uade, as the play renders it.
+                        _stream_mod._schedule_prewarm(
+                            item.track_id, track, int(item.subsong or 0) or None, prio,
+                            f"cast:{self.target.id}")
+                        continue
                     await _start_gated_render(
                         prio, ck, "sid",
-                        lambda p=path, ss=int(item.subsong or 0), d=target_dur:
-                            _render_sid(p, subsong=ss, duration=d),
+                        lambda p=path, ss=int(item.subsong or 0), d=target_dur, st=_sid_st:
+                            _render_sid(p, subsong=ss, duration=d, stereo=st),
                     )
                 elif src_ext in _MIDI_EXTS:
-                    sf = await active_soundfont_async()
+                    # (the synth it plays on now: ``stream.midi_variant``)
+                    from soniqboom.api.stream import midi_variant_async
                     ck = _ck(
                         track_id=item.track_id, format_type="midi",
-                        soundfont_path=str(sf) if sf else "",
+                        soundfont_path=await midi_variant_async(src_ext),
                     )
                     if await is_cache_ready(ck):
                         continue
@@ -671,7 +712,7 @@ class CastSession:
                         lambda p=path, ss=_ss, b=_base:
                             _render_uade(p, subsong=ss, subsong_base=b),
                     )
-                elif src_ext in _TRACKER_EXTS:
+                elif src_ext in _TRACKER_EXTS and src_ext != ".imf":
                     ck = _ck(
                         track_id=item.track_id, format_type="tracker",
                         subsong=_idx,
@@ -700,8 +741,18 @@ class CastSession:
                     await _start_gated_render(
                         prio, ck, "gme",
                         lambda p=path, ss=_idx:
-                            _render_gme(p, subsong=ss),
+                            _render_gme(p, subsong=gme_slot(item.track_id, ss)),
                     )
+                elif _is_rendered_ext(*_render_ident(track.path, track)):
+                    # The other rendered families (PSF, SNDH, YM, SC68,
+                    # AdLib / IMF, the uade family): the web player's own
+                    # prewarm renders them — under its background gate, after
+                    # fetching the source on the scan lane — to the keys the
+                    # cast play reads (``stream.render_chip_family``).
+                    from soniqboom.api import stream as _stream_mod
+                    _stream_mod._schedule_prewarm(
+                        item.track_id, track, int(item.subsong or 0) or None, prio,
+                        f"cast:{self.target.id}")
                 else:
                     # ffmpeg-native sources that still need transcoding
                     # to match the renderer's codec (FLAC→MP3, DSD→FLAC,
@@ -730,6 +781,14 @@ class CastSession:
                         continue
                     path = await _local_src()
                     if path is None:
+                        continue
+                    from soniqboom.api import stream as _stream_mod
+                    if src_ext == ".dsf" and await asyncio.to_thread(
+                            _stream_mod._dsf_is_dreamcast, path):
+                        # A Dreamcast rip, not DSD: rendered like a play.
+                        _stream_mod._schedule_prewarm(
+                            item.track_id, track, int(item.subsong or 0) or None, prio,
+                            f"cast:{self.target.id}")
                         continue
                     src_dur = float(getattr(track, "duration", 0) or 0) or None
                     await _start_gated_render(
@@ -793,7 +852,7 @@ class CastSession:
         transitions feel gapless even without a native queue."""
         async with self._lock:
             ctrl = await self._ensure_controller()
-            base = base_url or await _server_base_url()
+            base = base_url or await _server_base_url(self.target.host)
             urls_meta: list[dict] = []
             kept: list[QueueItem] = []
             from soniqboom.core import skip_rules
@@ -1059,38 +1118,57 @@ def _track_meta(track) -> dict:
     }
 
 
-_BASE_URL_CACHE: dict[str, Any] = {"value": "", "ts": 0.0}
+# renderer host ("" = none known) → (base URL, when it was picked)
+_BASE_URL_CACHE: dict[str, tuple[str, float]] = {}
 
 
-async def _server_base_url() -> str:
-    """Best LAN IP for the renderer to call back to.
+async def _server_base_url(target_host: str | None = None) -> str:
+    """The base URL the renderer at ``target_host`` calls back to: our
+    address on the interface the kernel routes to that renderer
+    (``_pick_lan_ip``).  One address for every renderer — the route to a
+    public address — was unreachable for a renderer on another interface (a
+    Mac on Wi-Fi and Ethernet, a VPN up, a Docker host on several networks).
 
-    Cached for 60 s — interface discovery isn't free and the network
-    state doesn't change between songs.
+    Cached per renderer host for 60 s — interface discovery isn't free and
+    the network state doesn't change between songs.
     """
     now = time.time()
-    if now - _BASE_URL_CACHE["ts"] < _BASE_URL_TTL_S and _BASE_URL_CACHE["value"]:
-        return _BASE_URL_CACHE["value"]
+    key = (target_host or "").strip()
+    hit = _BASE_URL_CACHE.get(key)
+    if hit is not None and now - hit[1] < _BASE_URL_TTL_S:
+        return hit[0]
     from soniqboom.config import settings
     port = int(getattr(settings, "port", 8080) or 8080)
-    ip = await asyncio.to_thread(_pick_lan_ip)
+    ip = await asyncio.to_thread(_pick_lan_ip, key or None)
     base = f"http://{ip}:{port}"
-    _BASE_URL_CACHE["value"] = base
-    _BASE_URL_CACHE["ts"]    = now
+    if len(_BASE_URL_CACHE) > 256:
+        _BASE_URL_CACHE.clear()
+    _BASE_URL_CACHE[key] = (base, now)
     return base
 
 
-def _pick_lan_ip() -> str:
-    """Pick a non-loopback IPv4 reachable from the LAN.  Falls back to
-    127.0.0.1 only when no other interface is available — renderers
-    typically can't dial that back."""
+def _route_source_ip(dest: str) -> str | None:
+    """The local IPv4 the kernel would send from to reach ``dest`` (UDP
+    ``connect`` sends no packet), or None."""
     try:
-        # Trick: open a UDP socket to a public address (no packets sent
-        # since UDP is connectionless), then read the local endpoint
-        # the kernel picked.  Works on macOS + Linux + most BSDs.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 53))
+            s.connect((dest, 9))
             return s.getsockname()[0]
-    except OSError:
-        pass
-    return "127.0.0.1"
+    except (OSError, UnicodeError):
+        return None
+
+
+def _pick_lan_ip(target_host: str | None = None) -> str:
+    """Pick a non-loopback IPv4 the renderer at ``target_host`` can reach:
+    the source address of the route to it; without a (usable) host, the
+    route to a public address.  Falls back to 127.0.0.1 only when no other
+    interface is available — renderers typically can't dial that back (a
+    renderer on this very host, whose route is loopback, gets it)."""
+    if target_host:
+        ip = _route_source_ip(target_host)
+        if ip and ip != "0.0.0.0":
+            return ip
+    # Trick: open a UDP socket to a public address (no packets sent
+    # since UDP is connectionless), then read the local endpoint
+    # the kernel picked.  Works on macOS + Linux + most BSDs.
+    return _route_source_ip("8.8.8.8") or "127.0.0.1"

@@ -4,7 +4,7 @@
  * still controlled by an older service worker can serve a cached utils.js
  * without these names, and a named import of a missing export fails to link.
  */
-import { subsongStart, subsongWireToTune } from './utils.js';
+import { subsongStart, subsongWireToTune, TRACKER_FORMAT_NAMES } from './utils.js';
 
 // A queue entry for one tune of a multi-tune file: the file's track object
 // plus the wire in ``subsong`` (what the player forwards as ?subsong=), the
@@ -26,9 +26,14 @@ export function subsongVirtualTrack(base, wire, { count = 0, start = 1, lengths 
            subsongStart: subsongStart(start, count),
            subsongLabel: `Tune ${tune}` };
 }
-// Console-rip formats that can hold several tunes (libgme): their track-info
-// panel shows the tune list even though they have no module details.
-export const TUNE_CHIP_FORMAT_NAMES = new Set(['NSF', 'NSFe', 'GBS', 'AY', 'SAP', 'KSS', 'HES']);
+// Formats that can hold several tunes whose row may not know it yet: console
+// rips (libgme; HES / KSS are counted when played or opened), GoatTracker
+// songs and FamiTracker modules — their track-info panel shows the tune list
+// even though they have no module details — and tracker modules (several
+// subsongs: the phone's Now Playing asks for their tune list too).
+export const TUNE_CHIP_FORMAT_NAMES = new Set(['NSF', 'NSFe', 'GBS', 'AY', 'SAP', 'KSS', 'HES',
+                                               'GoatTracker', 'FamiTracker',
+                                               ...TRACKER_FORMAT_NAMES]);
 
 // A multi-tune file's tune count for the list badge ("5 tunes"), 0 when it
 // has one tune — or when the row IS one tune of it (a picked ``subsong``).

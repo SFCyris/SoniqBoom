@@ -26,7 +26,23 @@
  * which one plays.
  *
  * Radio and the shared library Player are MUTUALLY EXCLUSIVE: starting one
- * stops the other, so only one thing is ever making sound.
+ * stops the other, so only one thing is ever making sound.  The radio taking
+ * the output parks the library track (``Player.suspendForExternalAudio``): its
+ * queue entry is cued at the position it had, so ▶ after the station stopped
+ * starts it there.
+ *
+ * Recovery (``stream_recovery.js``, the desktop's numbers): a station that
+ * drops the connection is reconnected — the same URL on the same element, up
+ * to 3 times, 600 ms backing off to 4 s, the budget forgiven after 10 s of
+ * play; a playhead that stands for 2.5 s while the element says it plays is a
+ * drop too (WebKit tells nothing when a direct stream's connection goes); a
+ * sustained stall pauses to fill a longer buffer; a reconnect that
+ * does not play within 9 s is the next attempt; a fresh tune-in that does not
+ * play within 9 s fails (the radio view falls back: direct → relay).  When the
+ * budget is spent the station stops and ``lost`` is told.  ``status`` says
+ * which ('tuning', 'live', 'buffering', 'reconnecting', 'paused', 'off');
+ * while it recovers, ``playing`` stays true (the key means "pause") and the
+ * station's second line says so.
  *
  * What the station plays (``now``): a station played through the relay has its
  * song title read by the server, which tells every client at a change of song
@@ -37,6 +53,7 @@
  * directly has no relay reading its titles: ``now`` stays null.
  */
 import { Player } from '../player.js';
+import { createStreamRecovery, STARTUP_GRACE_MS } from '../stream_recovery.js';
 
 const el = new Audio();
 el.preload = 'none';
@@ -57,12 +74,13 @@ let _owned = false;      // the station owns the media session (_takeOver ran)
 // (or silenced) the shared element, so the stale one abandons instead of
 // resurrecting itself on top.  (QA 2026-07-05: buffering-window race.)
 let _playSeq = 0;
+let _url = '';           // the stream the station plays (a reconnect loads it again)
 // The play() a pause by the user landed in while it tuned in: that play keeps
 // its station, paused, instead of failing (a fallback would play on).
 let _pausedInSeq = -1;
 
-function emit(ev) {
-  (listeners[ev] || []).forEach(cb => { try { cb(); } catch (e) { console.error(e); } });
+function emit(ev, arg) {
+  (listeners[ev] || []).forEach(cb => { try { cb(arg); } catch (e) { console.error(e); } });
 }
 
 // [m-radio-now:begin] — tests/js/mobile_radio_now.test.mjs runs this region as is
@@ -138,13 +156,47 @@ function _setPlaybackState(state) {
   }
 }
 
+// The recovery of the element playing the station (see the top of the file).
+const _rec = createStreamRecovery({
+  reconnect(a) {
+    if (a !== cur || !_station || !_url) return;
+    try { a.pause(); } catch { /* ignore */ }
+    a.removeAttribute('src');
+    a.load();                      // (the old connection goes)
+    a.src = _url;
+    a.load();
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {});   // a failure is an 'error' — the next attempt
+  },
+  giveUp() {
+    const st = _station;
+    MobileRadio.stop();
+    emit('lost', st);
+  },
+  status() {
+    if (!_station) return;
+    _setPlaybackState(_rec.recovering || !cur.paused ? 'playing' : 'paused');
+    emit('state');
+    emit('meta');                  // (the second line says "Reconnecting…")
+  },
+});
+
 function _wire(a) {
   // Only the element in use reports: the other one's late events (its stream
-  // released) are no news.
-  a.addEventListener('playing', () => { if (a === cur) { _setPlaybackState('playing'); emit('state'); } });
-  a.addEventListener('pause',   () => { if (a === cur) { _setPlaybackState('paused');  emit('state'); } });
-  a.addEventListener('ended',   () => { if (a === cur) emit('state'); });
-  a.addEventListener('error',   () => { if (a === cur) emit('state'); });
+  // released) are no news.  While the stream recovers, its own pauses / ends
+  // are not the listener's: the lock screen keeps "playing".
+  a.addEventListener('playing', () => {
+    if (a !== cur) return;
+    const again = _rec.status === 'reconnecting';
+    _rec.handle('playing', a);
+    _setPlaybackState('playing');
+    emit('state');
+    if (again) MobileRadio.refreshNow();   // (a song may have changed meanwhile)
+  });
+  a.addEventListener('pause',   () => { if (a === cur) { _rec.handle('pause', a); _setPlaybackState(_rec.recovering ? 'playing' : 'paused'); emit('state'); } });
+  a.addEventListener('waiting', () => { if (a === cur) _rec.handle('waiting', a); });
+  a.addEventListener('ended',   () => { if (a === cur) { _rec.handle('ended', a); emit('state'); } });
+  a.addEventListener('error',   () => { if (a === cur) { _rec.handle('error', a); emit('state'); } });
 }
 _wire(el);
 
@@ -190,8 +242,9 @@ function _takeOver(station) {
   _sessionMeta();
   if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
     try {
-      navigator.mediaSession.setActionHandler('play',  () => { cur.play().catch(() => {}); });
-      navigator.mediaSession.setActionHandler('pause', () => { cur.pause(); });
+      // (through toggle(): a dropped stream is loaded again, a pause stops a reconnect)
+      navigator.mediaSession.setActionHandler('play',  () => { if (!MobileRadio.playing) MobileRadio.toggle(); });
+      navigator.mediaSession.setActionHandler('pause', () => { if (MobileRadio.playing) MobileRadio.toggle(); });
       navigator.mediaSession.setActionHandler('nexttrack', null);
       navigator.mediaSession.setActionHandler('previoustrack', null);
       navigator.mediaSession.playbackState = 'playing';
@@ -241,14 +294,23 @@ export const MobileRadio = {
   get el()      { return cur; },
   get active()  { return !!_station; },
   get station() { return _station; },
-  get playing() { return !!_station && !cur.paused; },
+  /** The station is on (playing, or recovering on the listener's behalf). */
+  get playing() { return !!_station && (_rec.recovering || !cur.paused); },
+  /** 'off' | 'tuning' | 'live' | 'buffering' | 'reconnecting' | 'paused'. */
+  get status()  { return _station ? _rec.status : 'off'; },
   /** The station plays through the audio graph (the meters can read it). */
   get metered() { return !!_station && cur === elG; },
   /** What the station said it plays ({title, artist, song, cover}), or null:
    *  it has not said, or the phone streams it directly. */
   get now()     { return _station ? _now : null; },
   /** The two lines ({title, sub}) a surface shows for the station playing. */
-  get lines()   { return _stationLines(_station, _station ? _now : null); },
+  get lines() {
+    const l = _stationLines(_station, _station ? _now : null);
+    const s = _station ? _rec.status : 'off';
+    if (s === 'reconnecting') l.sub = 'Reconnecting\u2026';
+    else if (s === 'buffering') l.sub = 'Buffering\u2026';
+    return l;
+  },
 
   /** The library socket's ``radio_meta`` / ``radio_art`` (app.js): taken when
    *  it is of the station playing here through the relay. */
@@ -302,11 +364,19 @@ export const MobileRadio = {
     _release(el);                  // release the previous live stream's decoder
     _release(elG);
     cur = a;
+    _url = url;
+    _rec.watch(a);                 // a fresh start: 'tuning' until it plays
     a.src = url;
     a.load();
     emit('change');                // UI shows the new station immediately
+    let graceT = null;
     try {
-      await a.play();
+      // A stream that does not start within the grace fails (the caller
+      // falls back), like the desktop's startup grace.
+      await Promise.race([a.play(), new Promise((_, no) => {
+        graceT = setTimeout(() => no(Object.assign(new Error('The station did not start'), { name: 'TimeoutError' })),
+                            STARTUP_GRACE_MS);
+      })]);
     } catch (e) {
       // Superseded while connecting (newer play() or a stop() ran) → abandon
       // quietly so the caller doesn't fall back to the relay for a station the
@@ -318,8 +388,11 @@ export const MobileRadio = {
         MobileRadio.refreshNow();  // (the relay may run already and know the song)
         return;
       }
+      if (e && e.name === 'TimeoutError') { try { a.pause(); } catch { /* ignore */ } }
       emit('state');
       throw e;                     // genuine failure — caller falls back to relay
+    } finally {
+      clearTimeout(graceT);
     }
     // A newer play() or a stop() landed while we awaited a.play(); that call now
     // owns the element (playing its own stream) or silenced it — don't take over
@@ -336,13 +409,18 @@ export const MobileRadio = {
 
   toggle() {
     if (!_station) return;
-    if (cur.paused) {
+    if (cur.paused && !_rec.recovering) {
       if (MobileRadio.onResume && MobileRadio.onResume()) return;
+      // A stream that dropped while paused is loaded again (the recovery does it).
+      if (_rec.resume()) return;
       // (what the station plays may have changed while it was paused)
       cur.play().then(() => MobileRadio.refreshNow()).catch(() => {});
     } else {
+      // (also while it reconnects or rebuffers: the listener stops the attempt)
       _pausedInSeq = _playSeq;
+      _rec.pause();
       cur.pause();
+      emit('state');
     }
   },
 
@@ -352,6 +430,8 @@ export const MobileRadio = {
     _release(elG);
     cur = el;
     _station = null;
+    _url = '';
+    _rec.stop();                   // (no reconnect left pending)
     _forgetNow();
     _viaRelay = false;
     _owned = false;

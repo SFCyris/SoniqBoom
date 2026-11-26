@@ -1,0 +1,2595 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CSDbData><SID><ID>20901</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Best.sid</HVSCPath>
+<Name>Best</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>38912</LoadAddr>
+<InitAddr>47145</InitAddr>
+<PlayAddr>47366</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>9747</DataSize>
+<UsedIn><Release><ID>11589</ID>
+<Name>Mist II</Name>
+<AKA>The Mist II, Mist 2</AKA>
+<Type>C64 Demo</Type>
+<ReleaseDay>4</ReleaseDay>
+<ReleaseMonth>11</ReleaseMonth>
+<ReleaseYear>1990</ReleaseYear>
+<ReleasedAt><Event><ID>80</ID>
+<Name>Censor Halloween Party 1990</Name>
+<EventType>Copy Party</EventType>
+<EventType>Demo Party</EventType>
+<Tagline>-= Censor (C64) / Horizon (Amiga!) =- -</Tagline>
+<StartDay>2</StartDay>
+<StartMonth>11</StartMonth>
+<StartYear>1990</StartYear>
+<EndDay>4</EndDay>
+<EndMonth>11</EndMonth>
+<EndYear>1990</EndYear>
+<Address>Sannaskolan</Address>
+<City>Gothenburg</City>
+<Country>Sweden</Country>
+</Event>
+</ReleasedAt>
+<Achievement><Compo>C64 Demo</Compo>
+<Place>2</Place>
+</Achievement>
+<Rating>8.5</Rating>
+<ScreenShot>https://csdb.dk/gfx/releases/11000/11589.png</ScreenShot>
+<ReleasedBy><Group><ID>510</ID>
+<Name>Vision</Name>
+<Short>VSN</Short>
+<BaseCountry>Netherlands</BaseCountry>
+<FoundDay>1</FoundDay>
+<FoundMonth>10</FoundMonth>
+<FoundYear>1988</FoundYear>
+<Rating>8.43</Rating>
+<Grouptypes><Grouptype>Demo Group</Grouptype>
+<Grouptype>Cracker Group</Grouptype>
+</Grouptypes>
+</Group>
+</ReleasedBy>
+<Credits><Credit><CreditType>Code</CreditType>
+<Handle><ID>8077</ID>
+<Handle>Yabba</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>7357</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>8077</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1652</ID>
+<Handle>Harmony Productions</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1640</ID>
+<Country>France</Country>
+<Handles><Handle><ID>1652</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>750</ID>
+<Handle>Moon</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>734</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>750</ID>
+</Handle>
+<Handle><ID>18781</ID>
+<Handle>D400</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>734</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>5749</ID>
+<Handle>Gryzor</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>5384</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>5749</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Logo Graphician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>7668</ID>
+<Handle>Spinx</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>7018</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>7668</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>12774</ID>
+<Handle>Tomcat</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>11445</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>12774</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>6085</ID>
+<Handle>Icon</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>5630</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>6085</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>6085</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>626</ID>
+<Handle>JCH</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>610</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>19150</ID>
+<Handle>Chordian</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>610</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Musician</Function>
+<Function>Webmaster</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>626</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Musician</Function>
+<Function>Webmaster</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>8067</ID>
+<Handle>Glasnost</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>7349</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>8067</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>8067</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>895</ID>
+<Handle>Scooby</Handle>
+<AKA>STC</AKA>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>879</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>895</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+<Function>Logo Graphician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>895</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1684</ID>
+<Handle>EVS</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1672</ID>
+<Country>Netherlands</Country>
+<Handles><Handle><ID>1684</ID>
+</Handle>
+<Handle><ID>13096</ID>
+<Handle>The Silicon Expert</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>1672</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>8749</ID>
+<Handle>PBXcellent</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>1672</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Original Supplier</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>1012</ID>
+<Handle>The Guardian</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>996</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>1012</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Swapper</Function>
+<Function>Webmaster</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>5830</ID>
+<Handle>Antti Hannula</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>514</ID>
+<Country>Finland</Country>
+<Handles><Handle><ID>530</ID>
+<Handle>Flex</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>514</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Graphician</Function>
+<Function>Musician</Function>
+<Function>Organizer</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>5830</ID>
+</Handle>
+<Handle><ID>4907</ID>
+<Handle>Devil</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>514</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+<Function>Mega Swapper</Function>
+<Function>Organizer</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>27525</ID>
+<Handle>Andy</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>514</ID>
+</Scener>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>8051</ID>
+<Handle>Reyn Ouwehand</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>682</ID>
+<Country>Netherlands</Country>
+<Handles><Handle><ID>8051</ID>
+</Handle>
+<Handle><ID>5621</ID>
+<Handle>MacMagix</Handle>
+<AKA>MacMagic</AKA>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>682</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>348</ID>
+<Handle>Bird</Handle>
+<AKA>Fugl, Mr.Bird</AKA>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>332</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>348</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Cracker</Function>
+<Function>Diskmag Editor</Function>
+<Function>Graphician</Function>
+<Function>Swapper</Function>
+<Function>Sysop</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>753</ID>
+<Handle>Morpheus</Handle>
+<AKA>Morph, Morfar, Moffe, Morphine, Moffi</AKA>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>737</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>753</ID>
+</Handle>
+<Handle><ID>12441</ID>
+<Handle>Hook 2001</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>737</ID>
+</Scener>
+</Handle>
+<Handle><ID>15025</ID>
+<Handle>Thundersoft</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>737</ID>
+</Scener>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Diskmag Editor</Function>
+<Function>Graphician</Function>
+<Function>Mega Swapper</Function>
+<Function>Organizer</Function>
+<Function>Public Relations Manager</Function>
+<Function>Webmaster</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>753</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>16</ID>
+<Handle>Drax</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>10</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>16</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>2270</ID>
+<Handle>Lars Hoff</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2260</ID>
+<Country>Norway</Country>
+<Handles><Handle><ID>11758</ID>
+<Handle>Shade</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2260</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>11775</ID>
+<Handle>Paralaxx</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2260</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>2270</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+</Credits>
+<UsedSIDs><SID><ID>20901</ID>
+</SID>
+<SID><ID>15572</ID>
+<HVSCPath>/MUSICIANS/J/JCH/Bones_plus.sid</HVSCPath>
+<Name>Bones+</Name>
+<Author>Jens-Christian Huus</Author>
+<Released>1989 Bones</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>2</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3967</DataSize>
+</SID>
+<SID><ID>14441</ID>
+<HVSCPath>/MUSICIANS/H/Hannula_Antti/Conflex.sid</HVSCPath>
+<Name>Conflex</Name>
+<Author>Antti Hannula</Author>
+<Released>1990 Artline Designs</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>8580</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2003</DataSize>
+</SID>
+<SID><ID>22056</ID>
+<HVSCPath>/MUSICIANS/O/Ouwehand_Reyn/Dignified_tune_1.sid</HVSCPath>
+<Name>Dignified (tune 1)</Name>
+<Author>Reyn Ouwehand</Author>
+<Released>1989 Density</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4168</InitAddr>
+<PlayAddr>4129</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>4311</DataSize>
+<UserComment><Date>02.09.2025</Date>
+<Text>The filter and pulse on the melody is just stunning.  Also I don't think anyone consistently nailed the start of C64 tunes like Reyn did.</Text>
+</UserComment>
+<UserComment><Date>23.01.2021</Date>
+<Text>Simply a awesome tune by Reyn Ouwehand!</Text>
+</UserComment>
+</SID>
+<SID><ID>14448</ID>
+<HVSCPath>/MUSICIANS/H/Hannula_Antti/Ghettoblaster.sid</HVSCPath>
+<Name>Ghettoblaster</Name>
+<Author>Antti Hannula (Flex)</Author>
+<Released>1990 Artline Designs</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>8580</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2222</DataSize>
+</SID>
+<SID><ID>20940</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Gliding_Away.sid</HVSCPath>
+<Name>Gliding Away</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2590</DataSize>
+</SID>
+<SID><ID>10029</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Intro_I.sid</HVSCPath>
+<Name>Intro I</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3058</DataSize>
+</SID>
+<SID><ID>14503</ID>
+<HVSCPath>/MUSICIANS/H/Harmony_Productions/Like_the.sid</HVSCPath>
+<Name>Like the...</Name>
+<Author>Ludovic Llorca (Harmony Prods)</Author>
+<Released>1990 Warriors of Time</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4168</InitAddr>
+<PlayAddr>4129</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3144</DataSize>
+</SID>
+<SID><ID>32953</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/van_Santen_Edwin/So-Phisticated_III_part_4.sid</HVSCPath>
+<Name>So-Phisticated III (part 4)</Name>
+<Author>Edwin van Santen</Author>
+<Released>1989 20CC/Black Mail/Inorix</Released>
+<LoadAddr>4090</LoadAddr>
+<InitAddr>4090</InitAddr>
+<PlayAddr>4223</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2772</DataSize>
+</SID>
+<SID><ID>22854</ID>
+<HVSCPath>/MUSICIANS/P/Prosonix/Hoff_Lars/Recovery.sid</HVSCPath>
+<Name>The Recovery</Name>
+<Author>Lars Hoff</Author>
+<Released>1989 Prosonix</Released>
+<LoadAddr>61440</LoadAddr>
+<InitAddr>61440</InitAddr>
+<PlayAddr>61449</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3341</DataSize>
+<UserComment><Date>31.08.2019</Date>
+<Text>Truly a magnificent composition.</Text>
+</UserComment>
+<UserComment><Date>05.01.2014</Date>
+<Text>What a brilliant tune. I could listen to it forever... What's with Lars these days, does anyone know?</Text>
+</UserComment>
+</SID>
+</UsedSIDs>
+</Release>
+<Release><ID>653</ID>
+<Name>Summer Code IV - One Year</Name>
+<AKA>Summer Code 4</AKA>
+<Type>C64 Demo</Type>
+<ReleaseDay>2</ReleaseDay>
+<ReleaseMonth>7</ReleaseMonth>
+<ReleaseYear>1990</ReleaseYear>
+<ReleasedAt><Event><ID>36</ID>
+<Name>Bergen Party 1990</Name>
+<EventType>Copy Party</EventType>
+<EventType>Demo Party</EventType>
+<Tagline>By Full Force/Megastyle/Shadows/Science 451/Contex/BOA/MFI/Cryptoburners</Tagline>
+<StartDay>29</StartDay>
+<StartMonth>6</StartMonth>
+<StartYear>1990</StartYear>
+<EndDay>1</EndDay>
+<EndMonth>7</EndMonth>
+<EndYear>1990</EndYear>
+<Address>Bergenshallen</Address>
+<City>Bergen</City>
+<Country>Norway</Country>
+</Event>
+</ReleasedAt>
+<Achievement><Compo>C64 Demo</Compo>
+<Place>2</Place>
+</Achievement>
+<ScreenShot>https://csdb.dk/gfx/releases/1/653.gif</ScreenShot>
+<ReleasedBy><Group><ID>362</ID>
+<Name>Flash Inc.</Name>
+<AKA>Flash Incorporated</AKA>
+<Short>FHI</Short>
+<BaseCountry>Sweden</BaseCountry>
+<FoundMonth>6</FoundMonth>
+<FoundYear>1989</FoundYear>
+<DissolveDay>4</DissolveDay>
+<DissolveMonth>11</DissolveMonth>
+<DissolveYear>2018</DissolveYear>
+<Website>https://www.c64.com/homepages/flashinc</Website>
+<Rating>8.75</Rating>
+<Grouptypes><Grouptype>Demo Group</Grouptype>
+<Grouptype>Cracker Group</Grouptype>
+</Grouptypes>
+</Group>
+</ReleasedBy>
+<Credits><Credit><CreditType>Music</CreditType>
+<Handle><ID>750</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>753</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>2160</ID>
+<Handle>Dexion</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2149</ID>
+<Country>Norway</Country>
+<Handles><Handle><ID>2160</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Logo Graphician</Function>
+<Function>Swapper</Function>
+<Function>Sysop</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>2522</ID>
+<Handle>Crept</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2512</ID>
+<Country>Norway</Country>
+<Handles><Handle><ID>2522</ID>
+</Handle>
+<Handle><ID>25449</ID>
+<Handle>Radix</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2512</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>6005</ID>
+<Handle>Sharp</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>5556</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>6005</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>6005</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>1145</ID>
+<Handle>Zodiac</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1129</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>20513</ID>
+<Handle>Kilobyte</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>1129</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>1145</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+<Function>Logo Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>1145</ID>
+</Handle>
+</Credit>
+</Credits>
+<UsedSIDs><SID><ID>21020</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Summer_Code.sid</HVSCPath>
+<Name>Summer Code</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>57344</LoadAddr>
+<InitAddr>57385</InitAddr>
+<PlayAddr>57606</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>7713</DataSize>
+</SID>
+<SID><ID>20955</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Intro.sid</HVSCPath>
+<Name>Intro</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>57344</LoadAddr>
+<InitAddr>57344</InitAddr>
+<PlayAddr>57347</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2902</DataSize>
+</SID>
+<SID><ID>20893</ID>
+<HVSCPath>/MUSICIANS/M/Moon/An_FLI_Song.sid</HVSCPath>
+<Name>An FLI Song</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2621</DataSize>
+</SID>
+<SID><ID>21001</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Rabbit_Song.sid</HVSCPath>
+<Name>Rabbit Song</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2606</DataSize>
+</SID>
+<SID><ID>20953</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Injection_5.sid</HVSCPath>
+<Name>Injection 5</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>57344</LoadAddr>
+<InitAddr>57385</InitAddr>
+<PlayAddr>57606</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>6773</DataSize>
+<UserComment><Date>01.10.2026</Date>
+<Text>very catchy!!!</Text>
+</UserComment>
+</SID>
+<SID><ID>20901</ID>
+</SID>
+</UsedSIDs>
+</Release>
+<Release><ID>4212</ID>
+<Name>FHI Classics</Name>
+<AKA>Flash Inc. Classics</AKA>
+<Type>C64 Demo</Type>
+<ReleaseMonth>12</ReleaseMonth>
+<ReleaseYear>1992</ReleaseYear>
+<ScreenShot>https://csdb.dk/gfx/releases/4000/4212.gif</ScreenShot>
+<ReleasedBy><Group><ID>362</ID>
+</Group>
+</ReleasedBy>
+<Credits><Credit><CreditType>Code</CreditType>
+<Handle><ID>1892</ID>
+<Handle>Kwon</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1880</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>1892</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+<Function>Logo Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>1892</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>1145</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>1145</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>750</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>16</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>9475</ID>
+<Handle>Dwarf</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>8581</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>9475</ID>
+</Handle>
+<Handle><ID>11935</ID>
+<Handle>Fish</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>8581</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>17064</ID>
+<Handle>Falcon</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>8581</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1684</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>2374</ID>
+<Handle>Falco Paul</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2364</ID>
+<Country>Netherlands</Country>
+<Handles><Handle><ID>17151</ID>
+<Handle>Falco</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2364</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>2374</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>6005</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>6005</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>753</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>753</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>577</ID>
+<Handle>Guy Shavitt</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>561</ID>
+<Country>Israel</Country>
+<Handles><Handle><ID>23305</ID>
+<Handle>GS</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>561</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>577</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>8051</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>13356</ID>
+<Handle>Jesper Thorndahl</Handle>
+<AKA>Jesper</AKA>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2506</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>13356</ID>
+</Handle>
+<Handle><ID>2516</ID>
+<Handle>McTech</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2506</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>2160</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1195</ID>
+<Handle>Rage</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1183</ID>
+<Country>Norway</Country>
+<Handles><Handle><ID>12318</ID>
+<Handle>Orion</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>1183</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>8176</ID>
+<Handle>The Predator</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>1183</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>1195</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>866</ID>
+<Handle>Redstar</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>850</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>866</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>2521</ID>
+<Handle>Unifier</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>11771</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>9763</ID>
+<Handle>Wellknown 1844</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>11771</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>32277</ID>
+<Handle>Beastifire</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>11771</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>13134</ID>
+<Handle>Kerouac</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>11771</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>2521</ID>
+</Handle>
+<Handle><ID>12346</ID>
+<Handle>Beastian</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>11771</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Diskmag Editor</Function>
+<Function>Musician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Diskmag Editor</Function>
+<Function>Musician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>2521</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>2521</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>2076</ID>
+<Handle>Ronny Pasch</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2065</ID>
+<Country>Netherlands</Country>
+<Handles><Handle><ID>11357</ID>
+<Handle>Cody</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2065</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Graphician</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>16927</ID>
+<Handle>Ron</Handle>
+<AKA>Ronn</AKA>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>2065</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>2076</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>2951</ID>
+<Handle>Scorp</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2941</ID>
+<Country>Netherlands</Country>
+<Handles><Handle><ID>2951</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Co-Organizer</Function>
+<Function>Cover Designer</Function>
+<Function>Diskmag Editor</Function>
+<Function>Graphician</Function>
+<Function>Logo Graphician</Function>
+<Function>Papermag Editor</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Charset</CreditType>
+<Handle><ID>2951</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>1026</ID>
+<Handle>The Spy</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1010</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>1026</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Linking</CreditType>
+<Handle><ID>1026</ID>
+</Handle>
+</Credit>
+</Credits>
+<UsedSIDs><SID><ID>21038</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Tracking_Acid.sid</HVSCPath>
+<Name>Tracking Acid</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>28672</LoadAddr>
+<InitAddr>28713</InitAddr>
+<PlayAddr>28934</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>5280</DataSize>
+</SID>
+<SID><ID>10051</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Just_Cool.sid</HVSCPath>
+<Name>Just Cool</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Noise</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2880</DataSize>
+</SID>
+<SID><ID>20927</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Fatal_Attraction.sid</HVSCPath>
+<Name>Fatal Attraction</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>8192</LoadAddr>
+<InitAddr>8233</InitAddr>
+<PlayAddr>8454</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>7167</DataSize>
+</SID>
+<SID><ID>32950</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/van_Santen_Edwin/So-Phisticated_III_part_1.sid</HVSCPath>
+<Name>So-Phisticated III (part 1)</Name>
+<Author>Edwin van Santen</Author>
+<Released>1989 20CC/Black Mail/Inorix</Released>
+<LoadAddr>4076</LoadAddr>
+<InitAddr>4076</InitAddr>
+<PlayAddr>4219</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL &amp; NTSC</ClockSpeed>
+<DataSize>2998</DataSize>
+</SID>
+<SID><ID>32903</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/Paul_Falco/Words.sid</HVSCPath>
+<Name>The Words</Name>
+<Author>Falco Paul</Author>
+<Released>1989 20th Century Composers</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>8120</InitAddr>
+<PlayAddr>4239</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>4030</DataSize>
+</SID>
+<SID><ID>10120</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Osteria.sid</HVSCPath>
+<Name>Osteria</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3742</DataSize>
+</SID>
+<SID><ID>26868</ID>
+<HVSCPath>/MUSICIANS/S/Shavitt_Guy/Vector_Victory_Main.sid</HVSCPath>
+<Name>Vector Victory Main</Name>
+<Author>Guy Shavitt</Author>
+<Released>1990 Sidchip Scratchers</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4123</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2960</DataSize>
+<UserComment><Date>14.01.2014</Date>
+<Text>Ah, love it.</Text>
+</UserComment>
+</SID>
+<SID><ID>22056</ID>
+</SID>
+<SID><ID>20901</ID>
+</SID>
+<SID><ID>19010</ID>
+<HVSCPath>/MUSICIANS/R/Rage/Survival.sid</HVSCPath>
+<Name>Survival</Name>
+<Author>Anders Rodahl (Rage)</Author>
+<Released>1990 Megastyle</Released>
+<LoadAddr>49152</LoadAddr>
+<InitAddr>49224</InitAddr>
+<PlayAddr>49185</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2556</DataSize>
+</SID>
+<SID><ID>20958</ID>
+<HVSCPath>/MUSICIANS/M/Moon/In_Bad_Mode.sid</HVSCPath>
+<Name>In Bad Mode</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2624</DataSize>
+</SID>
+<SID><ID>10492</ID>
+<HVSCPath>/MUSICIANS/D/Danko_Tomas/Long_Distance.sid</HVSCPath>
+<Name>Long Distance</Name>
+<Author>Tomas Danko</Author>
+<Released>1990 Tomas Danko</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3401</DataSize>
+</SID>
+<SID><ID>20891</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Another_Song.sid</HVSCPath>
+<Name>Another Song</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>3072</LoadAddr>
+<InitAddr>9001</InitAddr>
+<PlayAddr>9222</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>7401</DataSize>
+</SID>
+<SID><ID>20944</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Human_Vox.sid</HVSCPath>
+<Name>Human Vox</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4137</InitAddr>
+<PlayAddr>4358</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>7040</DataSize>
+</SID>
+<SID><ID>7240</ID>
+<HVSCPath>/MUSICIANS/A/Audial_Arts/Pasch_Ronny/Wave_Goodbye.sid</HVSCPath>
+<Name>Wave Goodbye</Name>
+<Author>Ronny Pasch</Author>
+<Released>1990 Audial Arts</Released>
+<LoadAddr>4095</LoadAddr>
+<InitAddr>4095</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2969</DataSize>
+<UserComment><Date>04.08.2023</Date>
+<Text>Lovely</Text>
+</UserComment>
+</SID>
+<SID><ID>21006</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Secrets_with_Me.sid</HVSCPath>
+<Name>Secrets with Me</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1991 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2764</DataSize>
+</SID>
+<SID><ID>21025</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Surrogat_Hora.sid</HVSCPath>
+<Name>Surrogat Hora</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1991 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2897</DataSize>
+</SID>
+<SID><ID>20941</ID>
+<HVSCPath>/MUSICIANS/M/Moon/GPO_Grafter.sid</HVSCPath>
+<Name>GPO Grafter</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1991 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2804</DataSize>
+</SID>
+<SID><ID>21037</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Topsy-Turvy.sid</HVSCPath>
+<Name>Topsy-Turvy</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1991 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2864</DataSize>
+</SID>
+</UsedSIDs>
+</Release>
+<Release><ID>9103</ID>
+<Name>One Two Three</Name>
+<AKA>1 2 3</AKA>
+<Type>C64 One-File Demo</Type>
+<ReleaseYear>1992</ReleaseYear>
+<ScreenShot>https://csdb.dk/gfx/releases/9000/9103.gif</ScreenShot>
+<ReleasedBy><Group><ID>94</ID>
+<Name>Active</Name>
+<Short>[A]</Short>
+<BaseCountry>Sweden</BaseCountry>
+<FoundDay>1</FoundDay>
+<FoundMonth>5</FoundMonth>
+<FoundYear>1989</FoundYear>
+<Grouptypes><Grouptype>Cracker Group</Grouptype>
+<Grouptype>Demo Group</Grouptype>
+</Grouptypes>
+</Group>
+</ReleasedBy>
+<Credits><Credit><CreditType>Code</CreditType>
+<Handle><ID>610</ID>
+<Handle>Injun</Handle>
+<AKA>Injun Inc.</AKA>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>594</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>610</ID>
+</Handle>
+<Handle><ID>6237</ID>
+<Handle>Jolly Roger</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>594</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>6380</ID>
+<Handle>Devil.Fox</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>594</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>457</ID>
+<Handle>Dexter</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>441</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>457</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Original Supplier</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1684</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1816</ID>
+<Handle>Trond Kjetil Lindanger</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1804</ID>
+<Country>Norway</Country>
+<Handles><Handle><ID>1816</ID>
+</Handle>
+<Handle><ID>7032</ID>
+<Handle>IQ64</Handle>
+<AKA>IQ 64</AKA>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>1804</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>992</ID>
+<Handle>The Beasty Boy</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>976</ID>
+<Country>Finland</Country>
+<Handles><Handle><ID>36941</ID>
+<Handle>Mosh</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>976</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>992</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>750</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Text</CreditType>
+<Handle><ID>981</ID>
+<Handle>Surfer</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>965</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>981</ID>
+</Handle>
+<Handle><ID>5335</ID>
+<Handle>Gunner</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>965</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Cracker</Function>
+<Function>Graphician</Function>
+<Function>Organizer</Function>
+<Function>Original Supplier</Function>
+<Function>Public Relations Manager</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Graphics</CreditType>
+<Handle><ID>482</ID>
+<Handle>Draz</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>466</ID>
+<Country>Sweden</Country>
+<Handles><Handle><ID>482</ID>
+</Handle>
+<Handle><ID>26572</ID>
+<Handle>Drastic Art</Handle>
+<AKA>Draztic Art</AKA>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>466</ID>
+</Scener>
+<FreelanceFunctions><Function>Graphician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Cover Designer</Function>
+<Function>Graphician</Function>
+<Function>Logo Graphician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+</Credits>
+<UsedSIDs><SID><ID>32956</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/van_Santen_Edwin/Spijkerhoek.sid</HVSCPath>
+<Name>Spijkerhoek</Name>
+<Author>Edwin van Santen</Author>
+<Released>1989 20th Century Composers</Released>
+<LoadAddr>4090</LoadAddr>
+<InitAddr>4090</InitAddr>
+<PlayAddr>4250</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3432</DataSize>
+</SID>
+<SID><ID>19385</ID>
+<HVSCPath>/MUSICIANS/L/Lindanger_Trond/Two_Divided_by_Zero.sid</HVSCPath>
+<Name>Two Divided by Zero</Name>
+<Author>Trond Kjetil Lindanger (IQ64)</Author>
+<Released>1991 Moz(Ic)Art</Released>
+<LoadAddr>57344</LoadAddr>
+<InitAddr>57344</InitAddr>
+<PlayAddr>57347</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>5407</DataSize>
+</SID>
+<SID><ID>27946</ID>
+<HVSCPath>/MUSICIANS/T/TBB/Griffie.sid</HVSCPath>
+<Name>Griffie</Name>
+<Author>Tero Hilpinen (TBB)</Author>
+<Released>1991 Side B/Death Sector</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2961</DataSize>
+</SID>
+<SID><ID>20901</ID>
+</SID>
+</UsedSIDs>
+</Release>
+<Release><ID>253480</ID>
+<Name>Music.</Name>
+<Type>C64 Music Collection</Type>
+<ScreenShot>https://csdb.dk/gfx/releases/253000/253480.png</ScreenShot>
+<ReleasedBy><Group><ID>1794</ID>
+<Name>Trackfire</Name>
+<Short>TKF</Short>
+<BaseCountry>Denmark</BaseCountry>
+<DissolveYear>1991</DissolveYear>
+<Grouptypes><Grouptype>Demo Group</Grouptype>
+</Grouptypes>
+</Group>
+</ReleasedBy>
+<Credits><Credit><CreditType>Music</CreditType>
+<Handle><ID>677</ID>
+<Handle>Laxity</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>661</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>677</ID>
+</Handle>
+<Handle><ID>6739</ID>
+<Handle>Synth</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>661</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>6740</ID>
+<Handle>The Sad Sausage</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>661</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>750</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>2205</ID>
+<Handle>Jens Blidon</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>2195</ID>
+<Country>Germany</Country>
+<Handles><Handle><ID>2205</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>8051</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>3304</ID>
+<Handle>Scarzix</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>3294</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>3304</ID>
+</Handle>
+<Handle><ID>27330</ID>
+<Handle>Kresten Wunderschön</Handle>
+<AKA>Keewl</AKA>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>3294</ID>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>30014</ID>
+<Handle>Berggreen</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>3294</ID>
+</Scener>
+</Handle>
+<Handle><ID>29241</ID>
+<Handle>Carsten</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>3294</ID>
+</Scener>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Author</Function>
+<Function>Coder</Function>
+<Function>Musician</Function>
+<Function>Public Relations Manager</Function>
+<Function>Webmaster</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1208</ID>
+<Handle>Link</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>1196</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>1208</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>626</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>16</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>728</ID>
+<Handle>Metal</Handle>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>712</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>9085</ID>
+<Handle>Wizzbone</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>712</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>9086</ID>
+<Handle>Timelock</Handle>
+<CurrentlyUsedHandle>false</CurrentlyUsedHandle>
+<Scener><ID>712</ID>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+<Handle><ID>728</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Musician</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>5830</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Music</CreditType>
+<Handle><ID>1684</ID>
+</Handle>
+</Credit>
+<Credit><CreditType>Code</CreditType>
+<Handle><ID>5863</ID>
+<Handle>Practical Joke</Handle>
+<AKA>P. Joke, P.Joke, P.J.</AKA>
+<CurrentlyUsedHandle>true</CurrentlyUsedHandle>
+<Scener><ID>5469</ID>
+<Country>Denmark</Country>
+<Handles><Handle><ID>5863</ID>
+</Handle>
+</Handles>
+</Scener>
+<FreelanceFunctions><Function>Coder</Function>
+<Function>Cracker</Function>
+<Function>Graphician</Function>
+<Function>Swapper</Function>
+</FreelanceFunctions>
+</Handle>
+</Credit>
+</Credits>
+<UsedSIDs><SID><ID>17650</ID>
+<HVSCPath>/MUSICIANS/L/Link/Tune_Nr_2.sid</HVSCPath>
+<Name>Tune Nr. 2</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3451</DataSize>
+</SID>
+<SID><ID>17649</ID>
+<HVSCPath>/MUSICIANS/L/Link/Tune_Nr_1.sid</HVSCPath>
+<Name>Tune Nr. 1</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3355</DataSize>
+</SID>
+<SID><ID>17616</ID>
+<HVSCPath>/MUSICIANS/L/Link/Piece.sid</HVSCPath>
+<Name>The Piece</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>2956</DataSize>
+</SID>
+<SID><ID>17641</ID>
+<HVSCPath>/MUSICIANS/L/Link/Stranger.sid</HVSCPath>
+<Name>Stranger</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1989 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3176</DataSize>
+</SID>
+<SID><ID>17634</ID>
+<HVSCPath>/MUSICIANS/L/Link/Sky_Breaker.sid</HVSCPath>
+<Name>Sky Breaker</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3412</DataSize>
+</SID>
+<SID><ID>17627</ID>
+<HVSCPath>/MUSICIANS/L/Link/Robocop.sid</HVSCPath>
+<Name>Robocop</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3144</DataSize>
+</SID>
+<SID><ID>17624</ID>
+<HVSCPath>/MUSICIANS/L/Link/Revealed.sid</HVSCPath>
+<Name>Revealed</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>2961</DataSize>
+</SID>
+<SID><ID>17619</ID>
+<HVSCPath>/MUSICIANS/L/Link/Psycho_Tune.sid</HVSCPath>
+<Name>Psycho Tune</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3168</DataSize>
+</SID>
+<SID><ID>17621</ID>
+<HVSCPath>/MUSICIANS/L/Link/Raiders.sid</HVSCPath>
+<Name>Raiders</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1989 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>2976</DataSize>
+</SID>
+<SID><ID>17618</ID>
+<HVSCPath>/MUSICIANS/L/Link/Prove_It.sid</HVSCPath>
+<Name>Prove It</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3155</DataSize>
+</SID>
+<SID><ID>17614</ID>
+<HVSCPath>/MUSICIANS/L/Link/Part_Uno.sid</HVSCPath>
+<Name>Part Uno</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3317</DataSize>
+</SID>
+<SID><ID>17617</ID>
+<HVSCPath>/MUSICIANS/L/Link/Power_Muzax.sid</HVSCPath>
+<Name>Power Muzax</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3684</DataSize>
+</SID>
+<SID><ID>17613</ID>
+<HVSCPath>/MUSICIANS/L/Link/Part_Time.sid</HVSCPath>
+<Name>Part Time</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>2971</DataSize>
+</SID>
+<SID><ID>17612</ID>
+<HVSCPath>/MUSICIANS/L/Link/Party_Mix.sid</HVSCPath>
+<Name>Party Mix</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3469</DataSize>
+</SID>
+<SID><ID>17603</ID>
+<HVSCPath>/MUSICIANS/L/Link/Musix_Zone.sid</HVSCPath>
+<Name>Musix Zone</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3037</DataSize>
+</SID>
+<SID><ID>17590</ID>
+<HVSCPath>/MUSICIANS/L/Link/La_La_Link.sid</HVSCPath>
+<Name>La La Link</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3461</DataSize>
+</SID>
+<SID><ID>17598</ID>
+<HVSCPath>/MUSICIANS/L/Link/Lykkehjulet.sid</HVSCPath>
+<Name>Lykkehjulet</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3201</DataSize>
+<UserComment><Date>10.09.2012</Date>
+<Text>This sid was used in a Danish version of the game "Wheel of Fortune" (in Danish: Lykkehjulet). I can't find the game anywhere but I'm pretty sure that the sid was made for the game.</Text>
+</UserComment>
+</SID>
+<SID><ID>17601</ID>
+<HVSCPath>/MUSICIANS/L/Link/Mean_Rock.sid</HVSCPath>
+<Name>Mean Rock</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>2937</DataSize>
+</SID>
+<SID><ID>17574</ID>
+<HVSCPath>/MUSICIANS/L/Link/Go_for_It.sid</HVSCPath>
+<Name>Go for It</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3233</DataSize>
+</SID>
+<SID><ID>17600</ID>
+<HVSCPath>/MUSICIANS/L/Link/Master_Mix.sid</HVSCPath>
+<Name>Master Mix</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3038</DataSize>
+</SID>
+<SID><ID>17573</ID>
+<HVSCPath>/MUSICIANS/L/Link/Game_Intro.sid</HVSCPath>
+<Name>Game Intro</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1989 Genesis Project</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>2988</DataSize>
+</SID>
+<SID><ID>17594</ID>
+<HVSCPath>/MUSICIANS/L/Link/Future_Force_plus.sid</HVSCPath>
+<Name>Future Force +</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3640</DataSize>
+</SID>
+<SID><ID>17542</ID>
+<HVSCPath>/MUSICIANS/L/Link/Fashionating.sid</HVSCPath>
+<Name>Fashionating</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3501</DataSize>
+</SID>
+<SID><ID>17540</ID>
+<HVSCPath>/MUSICIANS/L/Link/Alf_Theme.sid</HVSCPath>
+<Name>Alf Theme</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3350</DataSize>
+</SID>
+<SID><ID>17552</ID>
+<HVSCPath>/MUSICIANS/L/Link/Bronx_Mix.sid</HVSCPath>
+<Name>Bronx Mix</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1989 Genesis Project</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3291</DataSize>
+</SID>
+<SID><ID>17550</ID>
+<HVSCPath>/MUSICIANS/L/Link/Boingsongs.sid</HVSCPath>
+<Name>Boingsongs</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3609</DataSize>
+</SID>
+<SID><ID>17553</ID>
+<HVSCPath>/MUSICIANS/L/Link/Bror_Flov.sid</HVSCPath>
+<Name>Bror Flov</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>6144</LoadAddr>
+<InitAddr>6144</InitAddr>
+<PlayAddr>6150</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3411</DataSize>
+</SID>
+<SID><ID>17551</ID>
+<HVSCPath>/MUSICIANS/L/Link/Boing_Baing.sid</HVSCPath>
+<Name>Boing Baing</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1988 Cheyens</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4102</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2911</DataSize>
+</SID>
+<SID><ID>17749</ID>
+<HVSCPath>/MUSICIANS/L/Laxity/Demo_Music.sid</HVSCPath>
+<Name>Demo Music</Name>
+<Author>Thomas E. Petersen (Laxity)</Author>
+<Released>1987 2000 A.D.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4102</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>1744</DataSize>
+</SID>
+<SID><ID>20901</ID>
+</SID>
+<SID><ID>21008</ID>
+<HVSCPath>/MUSICIANS/M/Moon/Sharp_Dressed.sid</HVSCPath>
+<Name>Sharp Dressed</Name>
+<Author>Anders Elmén (Moon)</Author>
+<Released>1990 Flash Inc.</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2368</DataSize>
+</SID>
+<SID><ID>3856</ID>
+<HVSCPath>/MUSICIANS/B/Blidon_Jens/Metal_Force.sid</HVSCPath>
+<Name>Metal Force</Name>
+<Author>Jens Blidon</Author>
+<Released>1989 Game On/CP Verlag</Released>
+<LoadAddr>28160</LoadAddr>
+<InitAddr>28163</InitAddr>
+<PlayAddr>28160</PlayAddr>
+<NOSongs>6</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>4570</DataSize>
+</SID>
+<SID><ID>22104</ID>
+<HVSCPath>/MUSICIANS/O/Ouwehand_Reyn/Peppered_Pizza.sid</HVSCPath>
+<Name>Peppered Pizza</Name>
+<Author>Reyn Ouwehand</Author>
+<Released>1989 Reyn Ouwehand</Released>
+<LoadAddr>57344</LoadAddr>
+<InitAddr>57416</InitAddr>
+<PlayAddr>57377</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3132</DataSize>
+</SID>
+<SID><ID>10120</ID>
+</SID>
+<SID><ID>32952</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/van_Santen_Edwin/So-Phisticated_III_part_3.sid</HVSCPath>
+<Name>So-Phisticated III (part 3)</Name>
+<Author>Edwin van Santen</Author>
+<Released>1989 20CC/Black Mail/Inorix</Released>
+<LoadAddr>4076</LoadAddr>
+<InitAddr>4076</InitAddr>
+<PlayAddr>4225</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL &amp; NTSC</ClockSpeed>
+<DataSize>2981</DataSize>
+</SID>
+<SID><ID>15607</ID>
+<HVSCPath>/MUSICIANS/J/JCH/Glider_Pilot.sid</HVSCPath>
+<Name>Glider Pilot</Name>
+<Author>Jens-Christian Huus</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2339</DataSize>
+</SID>
+<SID><ID>14446</ID>
+<HVSCPath>/MUSICIANS/H/Hannula_Antti/Frazze.sid</HVSCPath>
+<Name>Frazze</Name>
+<Author>Antti Hannula (Flex)</Author>
+<Released>1990 Artline Designs/Contex</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>8580</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2120</DataSize>
+</SID>
+<SID><ID>15654</ID>
+<HVSCPath>/MUSICIANS/J/JCH/Narrow_plus.sid</HVSCPath>
+<Name>Narrow+</Name>
+<Author>Jens-Christian Huus</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2157</DataSize>
+<UserComment><Date>20.01.2021</Date>
+<Text>Great tune which I to this day still find myself humming every now and then.</Text>
+</UserComment>
+</SID>
+<SID><ID>15721</ID>
+<HVSCPath>/MUSICIANS/J/JCH/Super_Oswald.sid</HVSCPath>
+<Name>Super Oswald</Name>
+<Author>Jens-Christian Huus</Author>
+<Released>1989 Silverrock</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>2</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3800</DataSize>
+</SID>
+<SID><ID>9926</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Doomsday.sid</HVSCPath>
+<Name>Doomsday</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3290</DataSize>
+</SID>
+<SID><ID>10058</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Kuldioxid.sid</HVSCPath>
+<Name>Kuldioxid</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3493</DataSize>
+<UserComment><Date>26.12.2020</Date>
+<Text>Well done Sid :)</Text>
+</UserComment>
+</SID>
+<SID><ID>10227</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Warriors.sid</HVSCPath>
+<Name>Warriors</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3568</DataSize>
+</SID>
+<SID><ID>26556</ID>
+<HVSCPath>/MUSICIANS/S/Scarzix/Galactix_V2_0.sid</HVSCPath>
+<Name>Galactix V2.0</Name>
+<Author>Carsten Berggreen (Scarzix)</Author>
+<Released>1989 Carsten Berggreen</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3033</DataSize>
+<UserComment><Date>21.11.2013</Date>
+<Text>Carsten, congrats to this phenomenal track. I adored it back in time and I have used it for my Illusion intro...</Text>
+</UserComment>
+<UserComment><Date>11.08.2013</Date>
+<Text>My old tunes from 1988-1990 were made on 6581 SID - recently I discovered that using "Trurl6581R3_4885" filter emulation in Sidplay2 gives the tunes much of the original sound back.
+So if you liked my Galactix V2.0 or the title theme from our Combat Zone game (subtune 5) from 1990... please select this filter if you use emulation of 6581 SID.</Text>
+</UserComment>
+</SID>
+<SID><ID>17567</ID>
+<HVSCPath>/MUSICIANS/L/Link/Dwarf_Fly.sid</HVSCPath>
+<Name>Dwarf Fly</Name>
+<Author>Klaus Grøngaard (Link)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>3252</DataSize>
+</SID>
+<SID><ID>10014</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Heaven.sid</HVSCPath>
+<Name>Heaven</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2323</DataSize>
+</SID>
+<SID><ID>15697</ID>
+<HVSCPath>/MUSICIANS/J/JCH/Sampler_1.sid</HVSCPath>
+<Name>Sampler #1</Name>
+<Author>Jens-Christian Huus</Author>
+<Released>1988 JCH</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>4</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3035</DataSize>
+</SID>
+<SID><ID>9896</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Church.sid</HVSCPath>
+<Name>Church</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>4062</DataSize>
+</SID>
+<SID><ID>9911</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Dacapo.sid</HVSCPath>
+<Name>Dacapo</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3052</DataSize>
+<UserComment><Date>28.12.2020</Date>
+<Text>Always loved this one.  I probably used it  in some intro or so.</Text>
+</UserComment>
+</SID>
+<SID><ID>15599</ID>
+<HVSCPath>/MUSICIANS/J/JCH/Duchesse.sid</HVSCPath>
+<Name>Duchesse</Name>
+<Author>Jens-Christian Huus</Author>
+<Released>1989 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3609</DataSize>
+</SID>
+<SID><ID>9863</ID>
+<HVSCPath>/MUSICIANS/D/DRAX/Axel_Mix.sid</HVSCPath>
+<Name>Axel Mix</Name>
+<Author>Thomas Mogensen (DRAX)</Author>
+<Released>1990 Vibrants</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3282</DataSize>
+</SID>
+<SID><ID>19291</ID>
+<HVSCPath>/MUSICIANS/M/Metal/Sayonara.sid</HVSCPath>
+<Name>Sayonara</Name>
+<Author>Torben Hansen (Metal)</Author>
+<Released>1990 Bonzai</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>3266</DataSize>
+</SID>
+<SID><ID>14462</ID>
+<HVSCPath>/MUSICIANS/H/Hannula_Antti/Superstitious.sid</HVSCPath>
+<Name>Superstitious</Name>
+<Author>Antti Hannula (Flex)</Author>
+<Released>1990 Artline Designs</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4096</InitAddr>
+<PlayAddr>4099</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>8580</SIDModel>
+<ClockSpeed>PAL</ClockSpeed>
+<DataSize>2404</DataSize>
+</SID>
+<SID><ID>32906</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/van_Santen_Edwin/Airwolf_Mix.sid</HVSCPath>
+<Name>Airwolf Mix</Name>
+<Author>Edwin van Santen</Author>
+<Released>1988 20th Century Composers</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>4222</InitAddr>
+<PlayAddr>4216</PlayAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>1977</DataSize>
+</SID>
+<SID><ID>32936</ID>
+<HVSCPath>/MUSICIANS/0-9/20CC/van_Santen_Edwin/No_Mercy.sid</HVSCPath>
+<Name>No Mercy</Name>
+<Author>Edwin van Santen</Author>
+<Released>1988 20th Century Composers</Released>
+<LoadAddr>4096</LoadAddr>
+<InitAddr>8180</InitAddr>
+<PlayAddr>4250</PlayAddr>
+<NOSongs>3</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>Unknown</SIDModel>
+<ClockSpeed>Unknown</ClockSpeed>
+<DataSize>4092</DataSize>
+</SID>
+</UsedSIDs>
+</Release>
+</UsedIn>
+</SID>
+</CSDbData>

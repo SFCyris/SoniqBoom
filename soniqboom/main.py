@@ -856,6 +856,8 @@ app.include_router(fstree.router,  prefix="/api")
 app.include_router(smart.router,   prefix="/api")
 app.include_router(artist.router,  prefix="/api")
 app.include_router(users_api.router, prefix="/api")
+from soniqboom.api import voices as _voices_api  # noqa: E402
+app.include_router(_voices_api.router, prefix="/api")
 
 from soniqboom.api import stations as _stations_api  # noqa: E402
 app.include_router(_stations_api.router, prefix="/api")
@@ -1203,8 +1205,19 @@ async def ui_config(request: Request = None):
         # played yet: For tunes shown in lists").
         "catalogue_roots": [r["root"] for r in _catalogue.roots()] if signed_in else [],
         "catalogue_list_reads": _catalogue_list_reads(),
+        # Renderers → stereo width of retro tunes (percent, the web player's
+        # default — core/render_options.py) and its headphone preset.
+        **_render_public_config(),
         "placeholder_art_data_uri": f"data:image/jpeg;base64,{placeholder_b64}",
     }
+
+
+def _render_public_config() -> dict:
+    try:
+        from soniqboom.core import render_options
+        return render_options.public_config()
+    except Exception:                                   # noqa: BLE001
+        return {}
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -2027,6 +2040,13 @@ async def startup():
             log.info("Conversion cache warmup: adopted %d existing render(s)", adopted)
     except Exception:
         log.exception("Conversion cache warmup failed (non-fatal — renders will rebuild on demand)")
+    try:
+        # Compresses finished renders losslessly in the background (WavPack),
+        # only while no render runs.
+        from soniqboom.core.conversion_cache import start_packer
+        start_packer()
+    except Exception:
+        log.exception("Conversion cache packer did not start (renders stay uncompressed)")
 
     _ss_phase("ffmpeg", "Selecting ffmpeg binary")
     # ── Resolve ffmpeg path ──────────────────────────────────────────────
@@ -2235,6 +2255,14 @@ async def startup():
     # on the app state so the shutdown handler can cancel it cleanly.
     from soniqboom.core.scrobble import retry_loop
     app.state._scrobble_task = asyncio.create_task(retry_loop())
+
+    # Loudness of local files without ReplayGain tags, measured while no
+    # render runs (core/loudness; conf ``loudness_scan``).
+    from soniqboom.core import loudness as _loudness_mod
+    _lt = _loudness_mod.start_native_pass()
+    if _lt is not None:
+        _BG_TASKS.add(_lt)
+        _lt.add_done_callback(_BG_TASKS.discard)
 
     # Filesystem watcher — auto-rescan on file changes inside any scan root.
     # Skipped silently for remote shares (SMB/FTP) — they have no push API.
@@ -3250,6 +3278,12 @@ async def shutdown():
         return
     run_epoch = _run_epoch
     t_total = time.monotonic()
+    try:
+        # A pack in progress stops (its ffmpeg killed, its temp file removed).
+        from soniqboom.core.conversion_cache import stop_packer
+        stop_packer()
+    except Exception:
+        log.debug("Conversion cache packer stop failed", exc_info=True)
 
     # Per-step health, collected for the single consolidated "stopped" line at
     # the end so an operator (or a log-scraping monitor) can see at a glance
@@ -3295,6 +3329,11 @@ async def shutdown():
     for _t in list(_BG_TASKS):
         if not _t.done():
             _t.cancel()
+    try:                       # (measured loudness still batched: into the store's last snapshot)
+        from soniqboom.core import loudness as _loudness_mod
+        _loudness_mod.stop()
+    except Exception:          # noqa: BLE001
+        log.debug("loudness flush at shutdown failed", exc_info=True)
 
     # Renders, transcodes, pumps and prewarms: their renderer processes and
     # temp files must not outlive the process (uvicorn re-raises the signal

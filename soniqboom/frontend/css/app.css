@@ -756,6 +756,15 @@ body::before {
 #btn-admin .btn-admin-gear { display: inline-block; transition: transform 0.3s; }
 #btn-admin:hover .btn-admin-gear { transform: rotate(30deg); }
 
+/* The Retro hi-fi / Modern switch (app.js): boxed like the gear beside it; its
+   icon is the style in use — a needle meter (Retro hi-fi), a flat panel with a
+   waveform (Modern).  At ≤600 px it folds into the ⋯ menu (#hdr-more-style). */
+#btn-ui-style { padding: 0 8px; }
+#btn-ui-style .ui-style-ico { display: block; flex: none; }
+:root:not([data-ui-style="modern"]) #btn-ui-style .ui-style-ico-modern,
+:root[data-ui-style="modern"] #btn-ui-style .ui-style-ico-retro { display: none; }
+#hdr-more-style { display: none; }
+
 .scan-badge {
   font-size: 11px;
   color: var(--accent);
@@ -807,6 +816,23 @@ body::before {
   transition: transform 0.15s;
 }
 .btn-section-toggle.collapsed { transform: rotate(-90deg); }
+/* The Folders heading's "open in the main pane" key (app.js → the Folders
+   view): as small as the collapse arrow beside it, so the heading keeps its
+   height (the section floors below count on it). */
+.btn-section-open {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text2);
+  cursor: pointer;
+  padding: 2px 4px;
+  line-height: 0;
+}
+.btn-section-open:hover { color: var(--text0); }
+.btn-section-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 #sidebar ul { list-style: none; }
 #nav-library li {
@@ -1065,6 +1091,9 @@ body::before {
 /* ── Browse header ────────────────────────────────────────────────────────── */
 /* ── Group filter bar (content-area filter: Artists/Albums/Genres/etc.) ──── */
 #group-filter-bar[hidden] { display: none; }
+/* The Folders view: a music folder that can't be reached (library.js showFolders) */
+#track-tbody tr.group-row.group-unavailable { opacity: 0.55; }
+#track-tbody tr.group-row.group-unavailable .group-count { color: var(--danger, #ee5555); }
 #group-filter-bar {
   display: flex;
   align-items: center;
@@ -1106,6 +1135,129 @@ body::before {
 }
 .scene-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .scene-tab-count { font-size: 10px; color: var(--text2); font-variant-numeric: tabular-nums; }
+/* The Genres view's "Show all N genres" key (library.js _paintGenreToggle):
+   a quiet key after the count, never shrunk below its text. */
+.group-filter-toggle[hidden] { display: none; }
+.group-filter-toggle {
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--text1);
+  background: rgba(255,255,255,0.05);
+  border: 1px solid var(--glass-border);
+  border-radius: 7px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.group-filter-toggle:hover { background: rgba(255,255,255,0.09); color: var(--text0); }
+.group-filter-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+:root[data-theme="light"]:not([data-ui-style="retro"]) .group-filter-toggle { background: rgba(0,0,0,0.035); border-color: rgba(0,0,0,0.22); }
+:root[data-theme="light"]:not([data-ui-style="retro"]) .group-filter-toggle:hover { background: rgba(0,0,0,0.08); }
+
+/* (the keys of the panel over a list press like the Scene keys) */
+.scene-tab[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: rgba(240,114,42,0.55);
+  background: rgba(240,114,42,0.12);
+}
+
+/* The panel over a list (library.js "The panel over a list"): a composer's
+   page, the compo winners' keys, On this day, the composers a search names.
+   Never taller than about half the pane: the list stays the view. */
+#scene-panel[hidden] { display: none; }
+#scene-panel {
+  flex-shrink: 0;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding: 10px 14px 9px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.025);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text1);
+}
+#scene-panel .scp-top { display: flex; gap: 14px; align-items: flex-start; min-width: 0; }
+#scene-panel .scp-photo { flex: 0 0 auto; width: 76px; min-width: 76px; max-width: 76px; height: 76px; }
+#scene-panel .scp-photo[hidden] { display: none; }
+#scene-panel .scp-photo img { width: 100%; height: 100%; object-fit: cover; border-radius: 6px; display: block; }
+#scene-panel .scp-id { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+#scene-panel .scp-name { margin: 0; font-size: 19px; font-weight: 650; color: var(--text0); line-height: 1.2;
+                        overflow-wrap: anywhere; }
+#scene-panel .scp-sub { color: var(--text1); }
+#scene-panel .scp-line { overflow-wrap: anywhere; }
+#scene-panel .scp-k {
+  display: inline-block;
+  min-width: 0;
+  margin-right: 8px;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text2);
+  opacity: 0.8;
+}
+#scene-panel .scp-links { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 3px; }
+#scene-panel .scp-link {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 10px;
+  background: var(--border-bright, rgba(255,255,255,0.12));
+  color: var(--text1);
+  text-decoration: none;
+  white-space: nowrap;
+}
+#scene-panel .scp-link:hover { background: var(--accent); color: #fff; }
+#scene-panel .scp-count { flex: 0 0 auto; text-align: right; color: var(--text1); white-space: nowrap; }
+#scene-panel .scp-count b { display: block; font-size: 22px; color: var(--text0); font-variant-numeric: tabular-nums; }
+#scene-panel .scp-count span { display: block; font-size: 11px; color: var(--text2); }
+#scene-panel .scp-notes {
+  margin: 0;
+  max-height: 4.8em;
+  overflow-y: auto;
+  white-space: pre-line;
+  line-height: 1.55;
+}
+#scene-panel .scp-notes[hidden] { display: none; }
+#scene-panel .scp-results summary { cursor: pointer; color: var(--text0); }
+#scene-panel .scp-results ol { list-style: none; margin: 6px 0 0; padding: 0; max-height: 9.5em; overflow-y: auto; }
+#scene-panel .scp-results li { display: flex; gap: 8px; align-items: baseline; padding: 2px 0;
+                              border-bottom: 1px solid rgba(255,255,255,0.04); min-width: 0; }
+#scene-panel .scp-results li a { color: var(--text0); text-decoration: none; }
+#scene-panel .scp-results li a:hover { text-decoration: underline; }
+#scene-panel .scp-place { flex: 0 0 auto; min-width: 3.4em; max-width: 4.6em; color: var(--accent);
+                         font-variant-numeric: tabular-nums; }
+#scene-panel .scp-where { color: var(--text2); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis;
+                         white-space: nowrap; min-width: 0; }
+#scene-panel .scp-keys, #scene-panel .scp-row { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+#scene-panel .scp-row .scp-k { min-width: 5.5em; }
+#scene-panel .scp-party { display: inline-flex; gap: 6px; align-items: center; padding: 3px 9px;
+                         border: 1px solid var(--glass-border); border-radius: 7px; }
+#scene-panel .scp-note { color: var(--text2); }
+#scene-panel .scp-also { color: var(--text2); font-weight: 400; }
+#scene-panel .scp-input {
+  flex: 1 1 220px;
+  min-width: 160px;
+  max-width: 360px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text0);
+  background: var(--bg2);
+  border: 1px solid var(--glass-border);
+  border-radius: 7px;
+  padding: 4px 9px;
+}
+:root[data-theme="light"]:not([data-ui-style="retro"]) #scene-panel { background: rgba(0,0,0,0.025); }
+:root[data-theme="light"]:not([data-ui-style="retro"]) #scene-panel .scp-link { background: rgba(0,0,0,0.07); color: #333; }
+:root[data-theme="light"]:not([data-ui-style="retro"]) #scene-panel .scp-link:hover { background: var(--accent); color: #fff; }
+:root[data-theme="light"]:not([data-ui-style="retro"]) .scene-tab[aria-pressed="true"] {
+  color: #8a3a08; border-color: rgba(138,58,8,0.6); background: rgba(240,114,42,0.12);
+}
+/* An Artists row of a scene musician: it opens his composer page */
+#track-table tbody .group-name.group-composer::after { content: " \266A"; color: var(--accent); opacity: 0.7; }
+/* Track Info's "Composer page" key */
+button.ti-composer-page { border: 0; font: inherit; font-size: 11px; cursor: pointer; vertical-align: 1px; }
 .group-filter-search {
   flex: 1;
   max-width: 320px;
@@ -3893,6 +4045,11 @@ a.btn-secondary { display: inline-flex; align-items: center; text-decoration: no
 .admin-msg.ok   { background: rgba(76,175,122,0.14); color: #4caf7a; border: 1px solid rgba(76,175,122,0.2); }
 .admin-msg.warn { background: rgba(230,180,60,0.14); color: #e6b43c; border: 1px solid rgba(230,180,60,0.25); }
 .admin-msg.err  { background: rgba(220,80,80,0.14);  color: #e06060; border: 1px solid rgba(220,80,80,0.2); }
+/* The MT-32 ROM folder's state (Renderers → MIDI synths): found / not usable. */
+.mt32-rom-state.mt32-ok  { color: #4caf7a; }
+.mt32-rom-state.mt32-bad { color: #e06060; }
+:root[data-theme="light"] .mt32-rom-state.mt32-ok  { color: #1d6b43; }
+:root[data-theme="light"] .mt32-rom-state.mt32-bad { color: #a52a22; }
 /* Work in progress ("Saving…", "Clearing…"): neutral, no ✓ — nothing has
    succeeded yet.  The text's own trailing "…" is the cue. */
 .admin-msg.info { background: rgba(107,200,240,0.08); color: var(--text0); border: 1px solid var(--border-bright); }
@@ -4223,6 +4380,55 @@ a.btn-secondary { display: inline-flex; align-items: center; text-decoration: no
 }
 .ti-scene-pane.active { display: flex; }
 .ti-scene-pane.hidden { display: none; }
+
+/* ── Voices pane (js/voices/voices_tab.js): a row per chip voice — number,
+   name, oscilloscope, Mute, Solo ───────────────────────────────────────────── */
+.ti-voices-pane {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px 28px;
+  display: none;
+  flex-direction: column;
+}
+.ti-voices-pane.active { display: flex; }
+.ti-voices-pane.hidden { display: none; }
+.ti-voices { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.ti-voices-head { display: flex; align-items: center; gap: 10px; min-height: 26px; }
+.ti-voices-status { flex: 1; min-width: 0; font-size: 12px; color: var(--text2); }
+.ti-voices-list {
+  display: flex; flex-direction: column; gap: 6px;
+  --ti-scope-ink: var(--accent);
+  --ti-scope-dim: rgba(255,255,255,0.10);
+}
+.ti-voice {
+  display: grid;
+  grid-template-columns: 22px minmax(56px, 104px) minmax(0, 1fr) 30px 30px;
+  align-items: center;
+  gap: 8px;
+}
+.ti-voice-n { font-size: 11px; color: var(--text2); text-align: right; font-variant-numeric: tabular-nums; }
+.ti-voice-name { font-size: 12px; color: var(--text0); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ti-voice-scope {
+  display: block; width: 100%; height: 34px; min-width: 0;
+  border-radius: 6px; background: rgba(0,0,0,0.28);
+}
+.ti-voices-noscope .ti-voice-scope { visibility: hidden; }
+.ti-voice-btn, .ti-voices-reset {
+  border-radius: 6px; border: 1px solid var(--border-bright);
+  background: var(--bg2); color: var(--text1);
+  font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.ti-voice-btn { width: 30px; height: 26px; padding: 0; }
+.ti-voices-reset { padding: 3px 10px; font-size: 12px; font-weight: 600; }
+.ti-voice-btn:hover, .ti-voices-reset:hover { color: var(--text0); border-color: var(--text2); }
+.ti-voice-btn:focus-visible, .ti-voices-reset:focus-visible { outline: 2px solid var(--state-focus); outline-offset: 1px; }
+.ti-voice-m[aria-pressed="true"] { background: #b3261e; border-color: #b3261e; color: #fff; }
+.ti-voice-s[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #141414; }
+.ti-voice-off :is(.ti-voice-n, .ti-voice-name) { opacity: 0.45; }
+.ti-voice-off .ti-voice-scope { opacity: 0.35; }
+.ti-voices-note { font-size: 11px; line-height: 1.45; color: var(--text2); margin: 6px 0 0; }
+:root[data-theme="light"] .ti-voice-scope { background: rgba(0,0,0,0.06); }
+:root[data-theme="light"] .ti-voices-list { --ti-scope-dim: rgba(0,0,0,0.14); --ti-scope-ink: #b4501a; }
 
 .ti-scene-artist { margin-bottom: 18px; }
 .ti-scene-name {
@@ -5228,6 +5434,28 @@ tr.dragging { opacity: 0.4; }
 .player-progress.has-waveform #seek-bar {
   background: transparent !important;
 }
+/* The waveform's whole rectangle seeks (app.js, js/player/wave_seek.js): a
+   transparent hit box laid over it (placed with the canvas by
+   _resizeWaveformCanvas, above the seek bar so its thumb still shows under it)
+   takes the pointer while a waveform shows — and in Retro hi-fi wherever the
+   LCD glass is painted.  Never in radio mode (a live stream has nothing to
+   seek into).  The keyboard still seeks through the seek bar. */
+#waveform-hit {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  z-index: 3;
+  pointer-events: none;
+  cursor: pointer;
+  touch-action: none;
+}
+.player-progress.has-waveform > #waveform-hit,
+:root[data-ui-style="retro"] #player-bar:not(.radio-mode) #waveform-canvas[style] ~ #waveform-hit {
+  pointer-events: auto;
+}
+#player-bar.radio-mode #waveform-hit { pointer-events: none; }
 
 /* ── Radio mode ──────────────────────────────────────────────────────────────
    A live stream has no seekable position and no next/prev *track*, so the
@@ -5301,10 +5529,14 @@ tr.dragging { opacity: 0.4; }
      LAST target collapsed to ~16px (flex-shrink:0 ignored), making the pill
      left-heavy and pushing the play button ~53px off-centre.  min/max-width are
      fundamental box constraints every engine obeys, so both flanks stay 120px
-     and the transport is centred cross-browser. */
-  flex: 0 0 120px;
-  min-width: 120px;
-  max-width: 120px;
+     and the transport is centred cross-browser.
+     Narrower where the bar has less room beside the transport: app.js sets
+     --radio-target-w on #player-bar (one width for both; 0 hides them — the
+     names stay in ◄◄ / ►►'s tooltips).  At 120 px the pill lay over its
+     column's edge and ◎ under the icon row (≈1000–1380 px, and 601 px). */
+  flex: 0 0 var(--radio-target-w, 120px);
+  min-width: var(--radio-target-w, 120px);
+  max-width: var(--radio-target-w, 120px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -7522,6 +7754,9 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   box-shadow: inset 0 2px 0 rgba(240,114,42,0.35);
 }
 #track-table tbody tr.compo-group-first td.col-compo { color: var(--text0); font-weight: 600; }
+/* A composer's page: the first tune of each platform starts its group */
+#track-table tbody tr.platform-group-first > td { box-shadow: inset 0 2px 0 rgba(240,114,42,0.35); }
+:root[data-theme="light"] #track-table tbody tr.platform-group-first > td { box-shadow: inset 0 2px 0 rgba(138,58,8,0.4); }
 :root[data-theme="light"] #track-table tbody tr.compo-group-first > td { box-shadow: inset 0 2px 0 rgba(138,58,8,0.4); }
 
 /* Non-primary tracks are slightly dimmed to emphasize the primary */
@@ -7708,7 +7943,7 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
   body::before { display: none !important; }
   #header, #sidebar, #player-bar, .player-bar, #shortcuts-overlay,
   #admin-overlay, #queue-panel, #playlist-panel, #ti-overlay,
-  #eq-overlay, .skip-to-main, .toast-host,
+  #eq-overlay, .skip-to-main, .sb-toast-host,
   /* New overlays added by the multi-user / password flows: must also
      stay out of printed pages so a "Print" while logged-out doesn't
      dump a full-page login modal. */
@@ -7790,7 +8025,8 @@ th.col-rating { font-size: 14px; color: var(--accent); cursor: default; }
 .auth-overlay {
   position: fixed;
   inset: 0;
-  z-index: 20000;            /* above admin, toast, everything */
+  z-index: 20000;            /* above admin (999) and the modals (10000); the
+                                toasts (100000, utils.js) are above it */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -8728,6 +8964,7 @@ body.auth-blocked > #app {
   .header-actions > a.header-link,
   .btn-section-toggle,
   .btn-section-action,
+  .btn-section-open,
   .btn-track-info {
     min-width: 44px;
     min-height: 44px;
@@ -8898,6 +9135,9 @@ body.auth-blocked > #app {
   /* Save search is a ⋯ menu item here (its ⚡ key left a phone's field ~75 px) */
   #search-save-smart { display: none; }
   #hdr-more-save:not([hidden]) { display: flex; }
+  /* …and the style switch too */
+  #btn-ui-style { display: none; }
+  #hdr-more-style { display: flex; }
   #admin-overlay {
     width: 100vw;
     height: 100vh;

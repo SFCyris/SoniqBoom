@@ -131,7 +131,8 @@ def _exts() -> frozenset:
         _tune_exts = frozenset(
             m.SID_EXTS | m._MIDI_EXTS | m._TRACKER_EXTS | m._GME_EXTS | m._ADLIB_EXTS
             | m._ATARI_EXTS | m._PSF_EXTS | m._ZXTUNE_EXTS | m._MDX_EXTS | m._UADE_SUFFIX_EXTS
-            | m._SUNVOX_EXTS | m._MGS_EXTS | {".ftm", ".sng", ".dmf", ".st"}
+            | m._SUNVOX_EXTS | m._MGS_EXTS | {".ftm", ".sng", ".dmf", ".st", ".fur"}
+            | m.ZX_EXTS | m.GAME_MIDI_EXTS | set(m.ADLIB_SHARED_FORMATS)
             | {".imf", ".hvl", ".ahx", ".mus"} | set(m.XMP_EXT_NAMES) | set(m.PW_EXT_NAMES))
     return _tune_exts
 

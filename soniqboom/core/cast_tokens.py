@@ -271,9 +271,19 @@ def replay_ok(claims: dict[str, Any], remote_ip: str | None, *, bind: bool = Tru
     ``bind=False`` checks without claiming: a HEAD probe from a DLNA control
     point (a phone app that then tells the TV to play the link) must not tie
     the link to the phone's IP and lock the TV's GET out.
+
+    A DLNA Media Server link (``o`` claim ``"dlna"``: a Browse / Search
+    result) is never bound: any device on the LAN may Browse for a fresh one
+    anonymously, so binding guards nothing — and it broke every renderer but
+    the first that played it (a control point's cached link moved to a
+    second speaker, "play to two renderers", the phone playing it itself:
+    404 "Stream link no longer valid").  Links a signed-in sender minted for
+    one cast target stay bound.
     """
     if not claims.get("jti"):
         return True  # no nonce — best-effort (legacy)
+    if claims.get("o") == "dlna":
+        return True
     key = _replay_key(claims)
     ip = remote_ip or "-"
     with _replay_lock:

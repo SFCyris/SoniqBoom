@@ -192,6 +192,9 @@ class VUResult:
     frames:      int     # total number of frames captured
     mono:        bytes   # frames * channels bytes (row-major: frame 0 ch 0..N, frame 1 ch 0..N, …)
     pan:         bytes   # channels bytes (0 = center, 1 = left, 2 = right)
+    # Optional voice names, one per channel ("Square 1", "DSP 3", "OPL 7 BD"):
+    # written after the levels with flag bit 0 set (docs/vu-cache-format.md).
+    names:       tuple = ()
 
 
 # Default cadence — see docs/vu-cache-format.md for the rationale.
@@ -211,6 +214,8 @@ def extract_vu(
     rate_hz:     int = DEFAULT_VU_RATE_HZ,
     samplerate:  int = 48000,
     max_seconds: float = 0.0,
+    repeat:      int = 0,
+    total_seconds: float = 0.0,
 ) -> VUResult | None:
     """Open *file_bytes* via libopenmpt, advance the mixer in
     ``samplerate / rate_hz``-sample chunks, and capture per-channel
@@ -223,6 +228,10 @@ def extract_vu(
     ``max_seconds``: defensive ceiling on how long the VU pass will
     run.  0.0 means "use the module's reported duration".  Useful
     for malformed modules that report 0 duration.
+
+    ``repeat`` / ``total_seconds`` (a render with a loop count —
+    ``render_options.tracker_ending``): the song repeats ``repeat`` times
+    more and the pass covers ``total_seconds``, the render's length.
 
     Returns ``None`` on any failure path (library not loaded, file
     not parseable, no channels).
@@ -270,7 +279,9 @@ def extract_vu(
             channels = 32
 
         duration = float(lib.openmpt_module_get_duration_seconds(mod))
-        if max_seconds > 0:
+        if repeat > 0 and total_seconds > 0 and _set_repeat(lib, mod, repeat):
+            duration = total_seconds
+        elif max_seconds > 0:
             duration = min(duration, max_seconds)
         elif subsong < 1 and duration > 0:
             # The length SoniqBoom renders: a song-end loop is cut where it
@@ -687,13 +698,23 @@ def _loop_cut(lib, mod, file_bytes: bytes) -> "float | None":
 
 
 def render_plan(file_bytes: bytes, subsong: int = 0) -> "tuple[float, float | None] | None":
-    """``(seconds, end_at)`` of the render of tune index ``subsong`` (0: the
-    default play — every subsong in turn, as ``openmpt123`` without
-    ``--subsong``; N > 0: libopenmpt subsong N): how long it plays, and the
-    time to stop it at (``openmpt123 --end-time``) when a song-end loop is
-    cut there (``song_end_loop``), else None.  ``(0.0, None)`` for bytes
-    libopenmpt can't open; None when libopenmpt can't be loaded.  Never
-    raises."""
+    """``(seconds, end_at)`` of ``plan``: the render of tune index
+    ``subsong``.  ``(0.0, None)`` for bytes libopenmpt can't open; None when
+    libopenmpt can't be loaded.  Never raises."""
+    got = plan(file_bytes, subsong)
+    return None if got is None else got[:2]
+
+
+def plan(file_bytes: bytes, subsong: int = 0) -> "tuple[float, float | None, int] | None":
+    """``(seconds, end_at, subsongs)`` of the render of tune index ``subsong``
+    of the module in *file_bytes*: how long it plays, the time to stop it at
+    (``openmpt123 --end-time``) when a song-end loop is cut there
+    (``song_end_loop``) else None, and the module's subsong count.  Tune N is
+    libopenmpt subsong N — in a module with several subsongs tune 0 is its
+    FIRST subsong (each subsong is a tune of its own); in a module with one,
+    tune 0 plays it as ``openmpt123`` does without ``--subsong`` (subsong
+    -1).  ``(0.0, None, 0)`` for bytes libopenmpt can't open; None when
+    libopenmpt can't be loaded.  Never raises."""
     try:
         if not _bind():
             return None
@@ -701,20 +722,115 @@ def render_plan(file_bytes: bytes, subsong: int = 0) -> "tuple[float, float | No
         assert lib is not None
         mod = _open_silent(lib, file_bytes)
         if not mod:
-            return 0.0, None
+            return 0.0, None, 0
         try:
-            lib.openmpt_module_select_subsong(mod, subsong if subsong > 0 else -1)
+            n = max(0, int(lib.openmpt_module_get_num_subsongs(mod)))
+            lib.openmpt_module_select_subsong(mod, subsong if (subsong > 0 or n > 1) else -1)
             duration = float(lib.openmpt_module_get_duration_seconds(mod))
             if duration <= 0:
-                return 0.0, None
+                return 0.0, None, n
             cut = _loop_cut(lib, mod, file_bytes) if subsong <= 0 else None
         finally:
             lib.openmpt_module_destroy(mod)
         if cut is not None and 0 < cut < duration:
-            return cut, cut
-        return duration, None
+            return cut, cut, n
+        return duration, None, n
     except Exception:                                   # noqa: BLE001
         log.debug("openmpt_vu: render plan failed", exc_info=True)
+        return None
+
+
+# A module lists at most this many subsongs as tunes (libopenmpt finds one
+# per unreachable stretch of the order list — junk orders after the end can
+# make dozens).
+MAX_TUNES = 64
+
+
+def subsong_lengths(file_bytes: bytes) -> "list[float] | None":
+    """Each subsong's own length in seconds (whole ms, as ``openmpt123
+    --info --subsong N`` prints it), in subsong order — for a module with
+    SEVERAL subsongs (at most ``MAX_TUNES``); None for a module with one,
+    bytes libopenmpt can't open, or without libopenmpt.  Never raises."""
+    try:
+        if not _bind():
+            return None
+        lib = _load()
+        assert lib is not None
+        mod = _open_silent(lib, file_bytes)
+        if not mod:
+            return None
+        try:
+            n = int(lib.openmpt_module_get_num_subsongs(mod))
+            if n <= 1:
+                return None
+            out = []
+            for k in range(min(n, MAX_TUNES)):
+                lib.openmpt_module_select_subsong(mod, k)
+                out.append(duration_ms(max(0.0, float(
+                    lib.openmpt_module_get_duration_seconds(mod)))) / 1000)
+            return out
+        finally:
+            lib.openmpt_module_destroy(mod)
+    except Exception:                                   # noqa: BLE001
+        log.debug("openmpt_vu: subsong lengths failed", exc_info=True)
+        return None
+
+
+def _set_repeat(lib, mod, count: int) -> bool:
+    """``openmpt_module_set_repeat_count``; False when it can't be set."""
+    try:
+        f = lib.openmpt_module_set_repeat_count
+        f.argtypes = [_Module, ctypes.c_int32]
+        f.restype = ctypes.c_int
+        return bool(f(mod, int(count)))
+    except AttributeError:
+        return False
+
+
+def loop_plan(file_bytes: bytes, subsong: int = 0) -> "tuple[float, float] | None":
+    """``(seconds, restart_seconds)`` of tune index ``subsong`` (0: the
+    default play) for a render with a loop count: its length played once and
+    where a repeat of it starts (its restart position — ``get_restart_order``
+    / ``get_restart_row`` — as a time), so ``n`` passes last ``seconds +
+    (n - 1) * (seconds - restart_seconds)``.  None when the plan can't be
+    made: no libopenmpt / position API, an unreadable module, or a default
+    play of a module with several subsongs (``openmpt123`` plays them all in
+    turn; a loop count names no one of them).  Never raises."""
+    try:
+        if not _bind() or not file_bytes:
+            return None
+        lib = _load()
+        if lib is None or not _bind_positions(lib):
+            return None
+        try:
+            lib.openmpt_module_get_restart_order.argtypes = [_Module, ctypes.c_int32]
+            lib.openmpt_module_get_restart_order.restype = ctypes.c_int32
+            lib.openmpt_module_get_restart_row.argtypes = [_Module, ctypes.c_int32]
+            lib.openmpt_module_get_restart_row.restype = ctypes.c_int32
+        except AttributeError:
+            return None
+        mod = _open_silent(lib, file_bytes)
+        if not mod:
+            return None
+        try:
+            n_sub = int(lib.openmpt_module_get_num_subsongs(mod))
+            if subsong <= 0 and n_sub != 1:
+                return None
+            index = subsong if subsong > 0 else 0
+            lib.openmpt_module_select_subsong(mod, index)
+            duration = float(lib.openmpt_module_get_duration_seconds(mod))
+            if not (duration > 0):
+                return None
+            order = int(lib.openmpt_module_get_restart_order(mod, index))
+            row = int(lib.openmpt_module_get_restart_row(mod, index))
+            restart = float(lib.openmpt_module_get_time_at_position(mod, order, row))
+        finally:
+            lib.openmpt_module_destroy(mod)
+        if not (0 <= restart < duration):
+            restart = 0.0
+        return duration, restart
+    except Exception:                                   # noqa: BLE001
+        log.debug("openmpt_vu: loop plan failed", exc_info=True)
         return None
 
 
@@ -729,6 +845,17 @@ def duration_ms(seconds: float) -> int:
 
 VUMR_MAGIC   = b"VUMR"
 VUMR_VERSION = 1
+# Flags byte (offset 6), bit 0: a voice-names block follows the levels —
+# per channel one length byte (0–VUMR_NAME_MAX) and that many bytes of UTF-8.
+VUMR_FLAG_NAMES = 0x01
+VUMR_NAME_MAX = 32
+
+
+def _name_bytes(name: str) -> bytes:
+    """``name`` as UTF-8 cut to ``VUMR_NAME_MAX`` bytes at a character
+    boundary."""
+    b = str(name or "").encode("utf-8")[:VUMR_NAME_MAX]
+    return b.decode("utf-8", "ignore").encode("utf-8")
 
 
 def serialize_vumr(result: VUResult) -> bytes:
@@ -752,20 +879,49 @@ def serialize_vumr(result: VUResult) -> bytes:
             f"mono size mismatch: {len(result.mono)} vs {expected_mono}",
         )
 
+    names = tuple(result.names or ())
+    if names and len(names) != result.channels:
+        raise ValueError(f"names size mismatch: {len(names)} vs {result.channels}")
+
     header = bytearray(16)
     header[0:4]   = VUMR_MAGIC
     header[4]     = VUMR_VERSION
     header[5]     = result.channels
-    header[6]     = 0  # flags, reserved
+    header[6]     = VUMR_FLAG_NAMES if names else 0  # flags
     header[7]     = 0  # reserved
     header[8:12]  = result.sample_rate.to_bytes(4, "little")
     header[12:16] = result.frames.to_bytes(4, "little")
 
-    return bytes(header) + result.pan + result.mono
+    tail = b""
+    if names:
+        tail = b"".join(bytes([len(b)]) + b for b in map(_name_bytes, names))
+    return bytes(header) + result.pan + result.mono + tail
+
+
+def vumr_names(raw: bytes) -> "list[str]":
+    """The voice names of a VUMR v1 blob (flag bit 0), else [].  Never
+    raises: a damaged names block reads as none."""
+    try:
+        if len(raw) < 16 or raw[0:4] != VUMR_MAGIC or not raw[6] & VUMR_FLAG_NAMES:
+            return []
+        channels = raw[5]
+        frames = int.from_bytes(raw[12:16], "little")
+        pos = 16 + channels + frames * channels
+        out = []
+        for _ in range(channels):
+            n = raw[pos]
+            if n > VUMR_NAME_MAX or pos + 1 + n > len(raw):
+                return []
+            out.append(raw[pos + 1:pos + 1 + n].decode("utf-8"))
+            pos += 1 + n
+        return out if pos == len(raw) else []
+    except (IndexError, UnicodeDecodeError):
+        return []
 
 
 def parse_and_validate_vumr(raw: bytes, *, max_channels: int = 32,
-                            max_frames: int = 240 * 600) -> "tuple[int, int, int]":
+                            max_frames: int = 240 * 600,
+                            allow_names: bool = False) -> "tuple[int, int, int]":
     """Validate a raw VUMR v1 blob (e.g. an untrusted client upload) against the
     exact invariants :func:`serialize_vumr` guarantees, WITHOUT trusting the
     sender.  Returns ``(channels, sample_rate, frames)`` on success; raises
@@ -776,7 +932,10 @@ def parse_and_validate_vumr(raw: bytes, *, max_channels: int = 32,
     ``1 <= sample_rate <= 240``, ``0 <= frames <= max_frames``, and an EXACT
     total length ``16 + channels + frames*channels`` (rejects trailing garbage
     or a truncated body — the frontend parser tolerates trailing bytes, so the
-    length gate is what actually bounds a hostile upload).
+    length gate is what actually bounds a hostile upload).  ``allow_names``:
+    a names block (flag bit 0) may follow the levels — one per channel, each
+    at most ``VUMR_NAME_MAX`` bytes of UTF-8, nothing after it; off (uploads)
+    the length stays exact.
     """
     if len(raw) < 16:
         raise ValueError("VUMR too short for header")
@@ -794,6 +953,10 @@ def parse_and_validate_vumr(raw: bytes, *, max_channels: int = 32,
     if not (0 <= frames <= max_frames):
         raise ValueError(f"frames out of range: {frames}")
     expected = 16 + channels + frames * channels
+    if allow_names and raw[6] & VUMR_FLAG_NAMES and len(raw) > expected:
+        if len(vumr_names(raw)) != channels:
+            raise ValueError("bad VUMR names block")
+        return channels, sample_rate, frames
     if len(raw) != expected:
         raise ValueError(f"length mismatch: {len(raw)} != {expected}")
     return channels, sample_rate, frames

@@ -389,8 +389,9 @@ def _ws_session_still_valid(ws: WebSocket) -> bool:
     return user is not None and user.enabled
 
 
-def _resolve_ws_user_id(ws: WebSocket) -> str | None:
-    """Return the user_id behind the WS cookie, or None for pre-bootstrap.
+def _resolve_ws_user(ws: WebSocket):
+    """Return the account (``User``) behind the WS cookie, or None
+    (pre-bootstrap, no cookie, or a session that no longer resolves).
 
     Used to register the socket with ``api.users`` so an admin demote /
     disable / delete on the user can broadcast-close the socket
@@ -407,8 +408,7 @@ def _resolve_ws_user_id(ws: WebSocket) -> str | None:
     cookie = ws.cookies.get("sb_session") if hasattr(ws, "cookies") else None
     if not cookie:
         return None
-    user = store.lookup_session(cookie)
-    return user.id if user else None
+    return store.lookup_session(cookie)
 
 
 @router.websocket("/ws")
@@ -417,20 +417,42 @@ async def multiroom_ws(ws: WebSocket):
     if not _ws_auth_ok(ws):
         await ws.close(code=4401)
         return
-    await ws.accept()
     # Register this socket with the user registry so admin-driven
-    # revocation can close it.  Lazy-import to avoid circular deps.
-    _registered_user_id: str | None = _resolve_ws_user_id(ws)
+    # revocation can close it.  Lazy-import to avoid circular deps.  The
+    # account and its standing as this session lookup sees them, taken now
+    # because the accept below yields.
+    _user = _resolve_ws_user(ws)
+    _registered_user_id: str | None = _user.id if _user is not None else None
+    _standing = None
+    if _user is not None:
+        try:
+            from soniqboom.api.users import ws_standing
+            _standing = ws_standing(_user)
+        except Exception:
+            pass
+    await ws.accept()
+    _revoked = None
     if _registered_user_id:
         try:
             from soniqboom.api.users import register_open_ws
-            register_open_ws(_registered_user_id, ws)
+            register_open_ws(_registered_user_id, ws, _standing)
         except Exception:
             _registered_user_id = None
+    if _registered_user_id:
+        # A change that landed during the accept (with no await between
+        # the two calls, a later reload sees the socket registered).
+        try:
+            from soniqboom.api.users import ws_revoked_since_admitted
+            _revoked = ws_revoked_since_admitted(_registered_user_id, ws)
+        except Exception:
+            _revoked = None
     client: Client | None = None
     room: Room | None = None
 
     try:
+        if _revoked:
+            await ws.close(code=4401)
+            return
         while True:
             msg = await ws.receive_json()
             # Per-message auth re-check: a user disabled/demoted between

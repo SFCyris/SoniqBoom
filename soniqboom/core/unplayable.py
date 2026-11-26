@@ -111,8 +111,10 @@ HEADER = "X-SB-Defect"            # on the 422 of a verified refusal
 # mlrender and the uade player fixes.  3: GoatTracker, FamiTracker, SunVox
 # and MGSDRV; "can't write" is an I/O failure.  4: xmprender, the C64
 # Sidplayer, the formats libopenmpt and uade play under other names.  5:
-# DefleMask (Furnace) and Sawteeth (sawteethrender).
-RULES = 5
+# DefleMask (Furnace) and Sawteeth (sawteethrender).  6: the ZX Spectrum
+# trackers (zxtune123), Furnace modules, the rest of AdPlug's formats and
+# midirender (OPL3 / OPN2 / MT-32; XMI, DMX MUS, HMI …).
+RULES = 6
 VERIFY_MAX_S = 20.0
 SWEEP_EVERY_S = 3600.0
 _MIN_FREE_BYTES = 256 * 1024 * 1024
@@ -133,6 +135,8 @@ KIND_KEYS = {
     "SunVox": "sunvoxrender", "MGSDRV": "kssrender", "GoatTracker": "sidplayfp",
     "FamiTracker": "furnace", "DefleMask": "furnace", "C64 Sidplayer": "sidplayfp",
     "Sawteeth": "sawteethrender",
+    "ZX Spectrum": "zxtune123", "Furnace": "furnace",
+    "OPL3 MIDI": "midirender", "OPN2 MIDI": "midirender", "MT-32 MIDI": "midirender",
 }
 # xmprender's renders pass the module's format name (``metadata.XMP_EXT_NAMES``
 # / ``PW_EXT_NAMES``) as their kind.
@@ -162,7 +166,8 @@ NAMES = {
     "sunvoxrender": "the SunVox player (sunvoxrender)",
     "kssrender": "the MSX player (kssrender)",
     "gt2reloc": "the GoatTracker converter (gt2reloc)",
-    "furnace": "the FamiTracker and DefleMask player (Furnace)",
+    "furnace": "the Furnace, FamiTracker and DefleMask player (Furnace)",
+    "midirender": "the OPL3 / OPN2 / MT-32 MIDI synths (midirender)",
     "xmprender": "the module player (libxmp)",
     "sawteethrender": "the Sawteeth player (sawteethrender)",
 }

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CSDbData><SID><ID>1</ID>
+<HVSCPath>/DEMOS/0-9/128_Byte_Blues_BASIC.sid</HVSCPath>
+<Name>128 Byte Blues</Name>
+<Author>Leonard J. Paul (Freaky DNA)</Author>
+<Released>2005 Freaky DNA</Released>
+<LoadAddr>2049</LoadAddr>
+<NOSongs>1</NOSongs>
+<DefaultSong>1</DefaultSong>
+<SIDModel>6581 &amp; 8580</SIDModel>
+<ClockSpeed>PAL &amp; NTSC</ClockSpeed>
+<DataSize>125</DataSize>
+<UsedIn><Release><ID>18063</ID>
+<Name>128 Byte Blues</Name>
+<Type>C64 Music</Type>
+<ReleaseDay>9</ReleaseDay>
+<ReleaseMonth>4</ReleaseMonth>
+<ReleaseYear>2005</ReleaseYear>
+<ReleasedAt><Event><ID>850</ID>
+<Name>Tiny Sid C64 Music Competition</Name>
+<EventType>Standalone Compo</EventType>
+<StartDay>15</StartDay>
+<StartMonth>1</StartMonth>
+<StartYear>2005</StartYear>
+<EndDay>8</EndDay>
+<EndMonth>5</EndMonth>
+<EndYear>2005</EndYear>
+<Country>Italy</Country>
+<Website>http://digilander.iol.it/ice00/tsid/tinysid</Website>
+</Event>
+</ReleasedAt>
+<Achievement><Compo>C64 Music</Compo>
+<Place>9</Place>
+</Achievement>
+<ScreenShot>https://csdb.dk/gfx/releases/18000/18063.png</ScreenShot>
+</Release>
+<Release><ID>18202</ID>
+<Name>PETSCII Ate My TinySID</Name>
+<Type>C64 Music Collection</Type>
+<ReleaseDay>11</ReleaseDay>
+<ReleaseMonth>6</ReleaseMonth>
+<ReleaseYear>2005</ReleaseYear>
+<ScreenShot>https://csdb.dk/gfx/releases/18000/18202.gif</ScreenShot>
+</Release>
+</UsedIn>
+</SID>
+</CSDbData>

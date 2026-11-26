@@ -32,7 +32,9 @@ LOG_DIR="$DATA_DIR/log"
 LOG_FILE="$LOG_DIR/soniqboom.log"
 
 # ── Parse args ───────────────────────────────────────────────────────────────
-PORT=8080
+# --port wins; without it the port is resolved below, once the venv is known to
+# exist.
+PORT=""
 while [[ $# -gt 0 ]]; do
   case $1 in
     --port) PORT="$2"; shift 2 ;;
@@ -51,6 +53,22 @@ _port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; }
 if [ ! -f "$SONIQBOOM" ]; then
   echo -e "${RED}SoniqBoom not installed. Run: bash install.sh${NC}"
   exit 1
+fi
+
+# No --port: use the port the server picks by itself — SONIQBOOM_PORT, then
+# ~/.soniqboom.env, then server.port in SoniqBoom.conf (default 8080) — so the
+# busy check, the readiness wait, the banner and the menu bar all use the port
+# it really listens on.  Asked from soniqboom.config itself (~0.1 s) so the
+# rules can't drift; if that fails, 8080 (the old fixed default).
+_valid_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+PORT_SOURCE="--port"
+if [ -z "$PORT" ]; then
+  PORT_SOURCE="configured"
+  PORT=$("$VENV/bin/python" -I -c 'from soniqboom.config import settings; print(int(settings.port))' 2>/dev/null | tail -1 || true)
+  _valid_port "$PORT" || PORT=8080
 fi
 
 # Check if already running
@@ -191,7 +209,9 @@ echo -e "  ───────────────────────
 echo -e "  ${BOLD}SoniqBoom $VERSION${RESET}  ·  ${GREEN}ready${NC}  ·  ${TRACK_COUNT} tracks  ·  pid ${BOLD}$APP_PID${RESET}"
 echo -e "  ──────────────────────────────────────────────────────"
 echo -e "  Local:     ${GREEN}http://localhost:${PORT}${NC}"
-for addr in "${NET_ADDRS[@]}"; do
+# ${A[@]+"${A[@]}"}: macOS's bash 3.2 calls an empty array unbound under set -u
+# (a Mac with no network address would abort here, before the menu bar starts).
+for addr in ${NET_ADDRS[@]+"${NET_ADDRS[@]}"}; do
   echo -e "  Network:   ${CYAN}✓${NC}  http://${addr}:${PORT}"
 done
 echo -e "  Hostname:  ${CYAN}✓${NC}  http://${HOSTNAME_LOCAL}:${PORT}"
@@ -246,7 +266,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
   if [ -f "$MENUBAR" ]; then
     # Kill any existing menubar instance
     pkill -f 'soniqboom-menubar\.py' 2>/dev/null || true
-    "$VENV/bin/python" "$MENUBAR" "$PORT" "$SCRIPT_DIR" &
+    # PORT_SOURCE "configured" tells it to start / restart WITHOUT --port, so a
+    # port changed in SoniqBoom.conf takes effect on its next Start / Restart.
+    "$VENV/bin/python" "$MENUBAR" "$PORT" "$SCRIPT_DIR" "$PORT_SOURCE" &
     disown
   fi
 fi

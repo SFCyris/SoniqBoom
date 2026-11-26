@@ -48,9 +48,8 @@
 import { Player } from '../../player.js';
 import { MobileRadio } from '../radio-player.js';
 import { Auth } from '../../auth.js';
-import { isUadeAmigaTrack } from '../../utils.js';
 import { setVizSettings } from '../../viz/engine.js';
-import { createVumrFetcher, parseVUMR, vuEligible, vuKeyOf, vuLabelStep, vumrLevelsAt,
+import { createVumrFetcher, parseVUMR, vuEligible, vuKeyOf, vuLabelStep, vumrLevelsAt, serverPassTrack,
          fftColumnLevels, vuFallbackText, FFT_FALLBACK_BARS, SID_VU_RETRY_MS,
          AMIGA_VU_RETRY_MS, AMIGA_VU_SETTLE_S, AMIGA_VU_SETTLE_POLL_MS,
          AMIGA_VU_SETTLE_MAX_WAITS } from '../../vu/vumr.js';
@@ -168,7 +167,7 @@ export function mountNpVisuals({ root, np, ctx }) {
     if (key === vuKey && vuPhase) return;
     vuKey = key; vuPhase = 'fetch'; vumr = null; pollKey = '';
     const primary = String(t.format || '').split('/')[0].trim() || 'this format';
-    const amiga = isUadeAmigaTrack(t);
+    const amiga = serverPassTrack(t);                   // (Amiga, libgme, AdLib: the server's pass)
     _buildLeds(FFT_FALLBACK_BARS, false);
     vuNote = ''; _paintNote();
     const r = await vuFetch.fetch(t.id, t.subsong, { start: !amiga });

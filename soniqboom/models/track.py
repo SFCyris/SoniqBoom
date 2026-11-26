@@ -116,8 +116,14 @@ class TrackMeta(BaseModel):
     # Per-tune lengths a multi-tune file states itself (SNDH FRMS / TIME, the
     # libgme formats that state one — NSFe, AY), in tune order, seconds
     # as played (with the fade); 0 = unknown.  A SID's come from HVSC
-    # (``hvsc_lengths``).
+    # (``hvsc_lengths``); a tracker module's subsongs' are libopenmpt's, a
+    # KSS file's kssrender's.
     tune_lengths: list[float] | None = None
+    # The song slot each tune of a HES / KSS file plays (they state no tune
+    # count: the slots that sound, found when it is first played or opened —
+    # ``stream._hes_kss_tune_list``), in tune order; None: not probed (tune N
+    # is slot N).
+    tune_slots: list[int] | None = None
     # Seconds of fade-out included in ``duration`` and ``tune_lengths`` (a PSF
     # rip's ``fade`` tag) — "Skip short tunes" judges a tune by its length
     # before the fade.  None: none recorded (a libgme rip's fixed fade is
@@ -134,6 +140,12 @@ class TrackMeta(BaseModel):
     # the key Modland's nightly ``allmods_md5`` index is joined on, so
     # author enrichment needs no file I/O and works for remote tracks.
     file_md5: str | None = None
+    # A local file without a whole-file checksum (no ``sid_md5`` /
+    # ``file_md5``): a hash of its size and first and last 64 KiB, made at
+    # scan time (``core/track_moves.content_key``) — what tells a moved or
+    # renamed file (a new path, so a new id) from another one, so it keeps
+    # its user data.  None: not read (a share's file, an archive member).
+    content_key: str | None = None
     # The matched Modland tree path ("Future Composer 1.3/Pow/intro.smod") —
     # the module's scene provenance, shown in the track-info modal.
     scene_path: str | None = None
@@ -249,6 +261,18 @@ class TrackMeta(BaseModel):
     replaygain_album_gain: float | None = None   # dB
     replaygain_track_peak: float | None = None   # 0..1+ (true-peak allowed)
     replaygain_album_peak: float | None = None
+    # Loudness MEASURED where the file carries no ReplayGain (core/loudness):
+    # tune key (the render's tune index; "0" for a one-tune file) →
+    # [integrated LUFS, true peak] — [I, TP, sample peak] when the sample peak
+    # is above full scale (a float render).  ``loudness_source`` "analysed".
+    # Levels like a track gain of −18 − I dB; never replaces a tag.
+    loudness: dict[str, list[float]] | None = None
+    loudness_source: str | None = None
+    # The render settings those were measured under (8 hex digits of the
+    # render cache key's settings part — SID chip model / filter, soundfont,
+    # renderer variant; "" or None for none / a file): measured again after a
+    # change of them.
+    loudness_v: str | None = None
     # Codec lossiness — derived from format at ingest time.  Used by the
     # library UI to surface a lossless/lossy badge and by future "lossless
     # only" filters.  Pre-computed so the read path is O(1) instead of

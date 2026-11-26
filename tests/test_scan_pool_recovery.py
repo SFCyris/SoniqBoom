@@ -2083,6 +2083,194 @@ async def test_a_remote_scan_with_nothing_to_extract_starts_no_worker(remote_env
     assert plan["extract"] == 0 and submits == []
 
 
+# ── a remote scan's count and "in progress" mark never outlive it ───────────
+
+def _remote_counters(monkeypatch, others: int) -> None:
+    """``others`` scans (another share's) counted running; the busy period
+    and the shares in progress this test's own."""
+    monkeypatch.setattr(scanner, "_scan_count", others)
+    monkeypatch.setattr(scanner, "_progress", scanner.ScanProgress(running=bool(others)))
+    monkeypatch.setattr(scanner, "_loud_running", 0)
+    for name in ("_busy_loud", "_busy_changed", "_busy_shown"):
+        monkeypatch.setattr(scanner, name, False)
+    monkeypatch.setattr(scanner, "_busy_dirs", [])
+    monkeypatch.setattr(scanner, "_current_remote_dirs", set())
+
+
+def _thread_pools(monkeypatch) -> list:
+    pools: list = []
+    monkeypatch.setattr(scanner, "_process_pool",
+                        lambda n: pools.append(concurrent.futures.ThreadPoolExecutor(2)) or pools[-1])
+    return pools
+
+
+@pytest.mark.parametrize("others", [0, 1])
+async def test_a_remote_scan_refused_a_pool_counts_nothing(remote_env, monkeypatch, others):
+    store, wav = remote_env
+    _remote_counters(monkeypatch, others)
+
+    def stopping(n):
+        raise RuntimeError("the server is stopping — no new scan workers")
+    monkeypatch.setattr(scanner, "_process_pool", stopping)
+    with pytest.raises(RuntimeError, match="stopping"):
+        await _remote(_MemSource({"/a.wav": wav}))
+    assert scanner._scan_count == others and scanner._current_remote_dirs == set()
+    assert scanner._progress.running is bool(others)
+    pools = _thread_pools(monkeypatch)                      # … the next scan of the share
+    try:                                                     # runs (not "already in progress")
+        plan = await _remote(_MemSource({"/a.wav": wav}))
+    finally:
+        for p in pools:
+            p.shutdown(wait=False)
+    assert plan["extract"] == 1 and scanner._scan_count == others
+
+
+@pytest.mark.parametrize("how", ["raise", "cancel"])
+async def test_a_remote_scan_stopped_at_its_first_progress_frame_leaves_nothing_behind(
+        remote_env, monkeypatch, how):
+    store, wav = remote_env
+    _remote_counters(monkeypatch, 1)                         # (another share's scan running)
+    pools = _thread_pools(monkeypatch)
+    entered = asyncio.Event()
+    calls: list = []
+
+    async def first_frame(_p):
+        calls.append((scanner._scan_count, set(scanner._current_remote_dirs),
+                      scanner._loud_running))
+        if len(calls) > 1:
+            return                                           # (the cleanup's last frame)
+        entered.set()
+        if how == "raise":
+            raise RuntimeError("frame failed")
+        await asyncio.Event().wait()                         # (stopped while sending it)
+    task = asyncio.create_task(scanner.start_remote_scan(
+        "share", "ftp://h/music", _MemSource({"/a.wav": wav}), first_frame))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        assert calls[0] == (2, {"ftp://h/music"}, 1)         # (counted and in progress)
+        if how == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 30)
+        else:
+            assert await asyncio.wait_for(task, 30) == {}    # (a failed scan's plan)
+    finally:
+        for p in pools:
+            p.shutdown(wait=False)
+    assert scanner._scan_count == 1 and scanner._current_remote_dirs == set()
+    assert scanner._loud_running == 0 and scanner._progress.running
+    assert len(store._tracks) == 0                           # (it never walked)
+
+
+@pytest.mark.parametrize("loud", [False, True], ids=["silent", "loud"])
+@pytest.mark.parametrize("how", ["cancel", "finish"])
+async def test_a_remote_scan_of_an_earlier_server_run_leaves_the_new_run_alone(
+        remote_env, monkeypatch, how, loud):
+    from soniqboom.core import partial_length
+    store, wav = remote_env
+    _remote_counters(monkeypatch, 0)
+    pools = _thread_pools(monkeypatch)
+    entered, go = asyncio.Event(), asyncio.Event()
+
+    async def body(*a, **k):
+        store.enter_batch_mode()                             # (its own batch level)
+        k["batch_state"]["entered"] = True
+        entered.set()
+        await go.wait()
+        return {"scan_root": "ftp://h/music", "walked": 1, "extract": 1, "new": 1}
+    monkeypatch.setattr(scanner, "_remote_scan_body", body)
+    released: list = []
+    real_release = scanner._release_pool
+    monkeypatch.setattr(scanner, "_release_pool", lambda ex: released.append(ex) or real_release(ex))
+    frames: list = []
+
+    async def cb(p):
+        frames.append(p.running)
+    ends: list = []
+    real_send = scanner._send_scan_end
+
+    async def spy_send(end):
+        if end is not None:
+            ends.append(end)
+        await real_send(end)
+    monkeypatch.setattr(scanner, "_send_scan_end", spy_send)
+    passes: list = []
+    monkeypatch.setattr(scanner, "_spawn_scene_autoapply", lambda: passes.append("scene"))
+    monkeypatch.setattr(scanner, "_schedule_folder_album_pass", lambda: passes.append("folder"))
+    monkeypatch.setattr(scanner, "_queue_remote_album_backfill",
+                        lambda r, p: passes.append("backfill") or False)
+    monkeypatch.setattr(partial_length, "after_remote_scan", lambda r, p: passes.append("length"))
+    task = asyncio.create_task(scanner.start_remote_scan(
+        "share", "ftp://h/music", _MemSource({}), cb if loud else None))
+    try:
+        await asyncio.wait_for(entered.wait(), 30)
+        # A new server run (``begin_run`` reset the scan state) — scanning the
+        # same share itself, a page told so …
+        monkeypatch.setattr(scanner, "_run_epoch", scanner._run_epoch + 1)
+        monkeypatch.setattr(scanner, "_scan_count", 1)
+        monkeypatch.setattr(scanner, "_current_remote_dirs", {"ftp://h/music"})
+        monkeypatch.setattr(scanner, "_progress", scanner.ScanProgress(running=True))
+        monkeypatch.setattr(scanner, "_loud_running", 1)
+        monkeypatch.setattr(scanner, "_busy_dirs", ["ftp://h/music"])
+        monkeypatch.setattr(scanner, "_busy_shown", True)
+        sent = len(frames)
+        if how == "cancel":                                  # … and the old scan ends only now
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 30)
+        else:
+            go.set()
+            assert (await asyncio.wait_for(task, 30))["extract"] == 1
+    finally:
+        for p in pools:
+            p.shutdown(wait=False)
+    assert scanner._scan_count == 1 and scanner._current_remote_dirs == {"ftp://h/music"}
+    assert scanner._progress.running and scanner._loud_running == 1
+    assert scanner._busy_dirs == ["ftp://h/music"] and scanner._busy_shown
+    assert len(frames) == sent and ends == [] and passes == []
+    assert released == pools                                 # … its pool and batch level it ends
+    assert store._batch_depth == 0 and not store._batch_mode
+
+
+class _NoReleaseThread(threading.Thread):
+    """A ``threading.Thread`` whose scan-pool release thread can't start."""
+
+    def start(self):
+        if self.name == "scan-pool-release":
+            raise RuntimeError("can't start new thread")
+        super().start()
+
+
+async def test_a_remote_scan_whose_pool_cant_be_released_still_ends(remote_env, monkeypatch, caplog):
+    store, wav = remote_env
+    _remote_counters(monkeypatch, 0)
+    pools = _thread_pools(monkeypatch)
+    monkeypatch.setattr(scanner.threading, "Thread", _NoReleaseThread)
+    try:
+        plan = await _remote(_MemSource({"/a.wav": wav}))
+    finally:
+        for p in pools:
+            p.shutdown(wait=False)
+    assert plan["extract"] == 1 and len(store._tracks) == 1
+    assert scanner._scan_count == 0 and scanner._current_remote_dirs == set()
+    assert not scanner._progress.running
+    assert "A scan pool could not be released" in caplog.text
+
+
+async def test_a_local_scan_whose_pool_cant_be_released_still_returns(library, monkeypatch, caplog):
+    root, store = library
+    pools = _thread_pools(monkeypatch)
+    monkeypatch.setattr(scanner.threading, "Thread", _NoReleaseThread)
+    try:
+        assert await _scan(root) is True
+    finally:
+        for p in pools:
+            p.shutdown(wait=False)
+    assert len(store._tracks) == 4
+    assert scanner._scan_count == 0 and not scanner._progress.running
+    assert "A scan pool could not be released" in caplog.text
+
+
 # ── files given up: automatic scans retry them after a wait ──────────────────
 
 def _records(store, root) -> dict:

@@ -316,3 +316,26 @@ test('a queue restored after a reload is cued at its current entry, from the sta
   assert.equal(cue[1].sec, 0);
   assert.equal(p.cuedTrack, p.queue[2]);
 });
+
+test('a resumed queue saved again keeps its place (it used to be overwritten with position 0)', async (t) => {
+  signedIn(t);
+  const pq = { get: { ids: ['t00002', 't00003'], current_index: 1, position: 9000,
+                      changed: 5e9, changed_by: 'DSub' } };
+  const p = makePlayer({ server: withQueueEndpoint(makeServer(100), pq) });
+  await p._offerServerQueue();
+  await p.env.toasts.find((x) => x[0] === 'action')[3]();       // Resume
+  await p.settle();
+  assert.equal(p.trackId, null, 'cued, not loaded');
+  const body = p._qsyncBody();
+  assert.equal(body.current_index, 1);
+  assert.equal(body.position, 9000, 'the cued place is what a save sends');
+  await p._pushQueueSync();
+  assert.equal(pq.puts.at(-1).position, 9000, 'the server keeps the place');
+  // A different input: a cued entry with no saved place still goes at 0.
+  const q2 = { get: { ids: ['t00004'], current_index: 0, position: 0, changed: 5e9, changed_by: 'DSub' } };
+  const p2 = makePlayer({ server: withQueueEndpoint(makeServer(100), q2) });
+  await p2._offerServerQueue();
+  await p2.env.toasts.find((x) => x[0] === 'action')[3]();
+  await p2.settle();
+  assert.equal(p2._qsyncBody().position, 0);
+});

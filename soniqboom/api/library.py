@@ -23,7 +23,7 @@ from soniqboom.core.data import (
 )
 from soniqboom.core.scanner import get_progress, start_scan
 from soniqboom.core.store import get_store
-from soniqboom.api.users import require_admin
+from soniqboom.api.users import optional_listener_uid, require_admin
 
 router = APIRouter(prefix="/library", tags=["library"])
 
@@ -655,14 +655,15 @@ async def scan_status():
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
 
-def _ws_auth_ok(ws: WebSocket) -> tuple[bool, str | None]:
+def _ws_auth_ok(ws: WebSocket) -> tuple[bool, object]:
     """Gate a WebSocket on the session cookie.  Pre-bootstrap installs
     (no users at all) keep the old anonymous-open behaviour so the
     initial setup UI still works.
 
-    Returns ``(allowed, user_id)`` so the caller can record the user_id
-    in the per-user open-socket registry.  ``user_id`` is None for
-    anonymous-bootstrap connections (registry no-ops on None).
+    Returns ``(allowed, user)``, where ``user`` is the account the session
+    check looked up, so the caller can record its id and standing in the
+    per-user open-socket registry.  ``user`` is None for anonymous-bootstrap
+    connections (the registry does nothing for those).
     """
     try:
         from soniqboom.core.users import get_user_store
@@ -677,27 +678,48 @@ def _ws_auth_ok(ws: WebSocket) -> tuple[bool, str | None]:
     user = store.lookup_session(cookie)
     if user is None or not user.enabled:
         return False, None
-    return True, user.id
+    return True, user
 
 
 @router.websocket("/ws")
 async def library_ws(ws: WebSocket):
-    allowed, user_id = _ws_auth_ok(ws)
+    allowed, user = _ws_auth_ok(ws)
     if not allowed:
         await ws.close(code=4401)  # custom code: unauthorized
         return
+    user_id = user.id if user is not None else None
+    standing = None
+    if user is not None:
+        # The standing as the session check saw it, taken now because the
+        # accept below yields.
+        from soniqboom.api.users import ws_standing
+        standing = ws_standing(user)
     await ws.accept()
     _ws_clients.add(ws)
+    revoked = None
     if user_id is not None:
         _ws_user_id[ws] = user_id
         # Cross-module registry so admin demote/disable can iterate this
         # user's open sockets and slam them shut.
         try:
             from soniqboom.api.users import register_open_ws
-            register_open_ws(user_id, ws)
+            register_open_ws(user_id, ws, standing)
         except Exception:
             pass
+        # A change that landed during the accept (with no await between
+        # the two calls, a later reload sees the socket registered).
+        try:
+            from soniqboom.api.users import ws_revoked_since_admitted
+            revoked = ws_revoked_since_admitted(user_id, ws)
+        except Exception:
+            revoked = None
     try:
+        if revoked:
+            try:
+                await ws.close(code=4401)
+            except Exception:
+                pass                    # (the client went away first)
+            return
         # The state on connect, not an event: ``snapshot`` marks it so a page
         # does not take ``running: false`` for a scan that just finished, and
         # ``lib_gen`` tells a reconnecting page whether the library changed
@@ -764,13 +786,22 @@ async def library_counts(request: Request):
     drives: Hide", "Tracks that can't be played: Hide")."""
     cached = _cache_get("counts")
     store = get_store()
+    # (the composer identities, built off the loop: none yet after a start —
+    # the count is not known yet, asked again — never a wait here)
+    composers_ready = await store.composer_index_async(cold=False) is not None
     kw = {"primary_only": _dedup_on(store), "exclude": _hidden(store), "swap": _swap(store)}
+    from soniqboom.core import composers
     # (the scene browse views follow writes the counts' key may not see — a
-    # party or composer found later: read from the store's own memo each time)
-    facets = {name: (None if facet in _SX_FACETS and store._sx_todo is not None
+    # party or composer found later: read from the store's own memo each time;
+    # the Artists count folds with the composer identities built last)
+    facets = {name: (None if (facet in _SX_FACETS and store._sx_todo is not None)
+                     or (facet == "composer" and not composers_ready)
                      else len(store.aggregate_facet(facet, **kw)))
               for facet, name in _FACET_LISTS.items()}
-    if cached is not None and any(cached.get(n) != v for n, v in facets.items()):
+    facets["chips"] = None if store._sx_todo is not None else len(_chip_rows(store, kw))
+    cv = composers.version_of(store)
+    if cached is not None and (_COUNTS_CV.get("v") != cv
+                               or any(cached.get(n) != v for n, v in facets.items())):
         cached = None
     if cached is None:
         from soniqboom.core.data import track_count
@@ -781,7 +812,7 @@ async def library_counts(request: Request):
         cached = {
             "tracks": await track_count(),
             "visible": store.visible_track_count(**kw),
-            "artists": rows(store.aggregate_artists(**kw)),
+            "artists": _artist_count(store, kw),
             "album_artists": rows(store.aggregate_album_artists(**kw)),
             "albums": rows(store.aggregate_albums(artist=None, album_artist=None, **kw)),
             "genres": rows(store.aggregate_genres(**kw)),
@@ -794,25 +825,70 @@ async def library_counts(request: Request):
         if any(v is None for v in facets.values()):
             return JSONResponse(cached, headers={"Cache-Control": "no-store"})
         _cache_set("counts", cached)
+        _COUNTS_CV["v"] = cv              # (the composer identities the counts fold with)
     return _etag_response(request, "counts", cached)
+
+
+_COUNTS_CV: dict = {}
+
+
+def _artist_rows(store, kw: dict) -> list:
+    """The Artists view's rows: ``aggregate_artists`` with each scene
+    musician's spellings folded into one row (``composers.fold_artist_rows``
+    — its ``composer`` key opens his page; the Subsonic / DLNA artist lists
+    keep the tags as they are).  A start still building the search indexes
+    lists the tags unfolded (the counts ask again)."""
+    rows = store.aggregate_artists(**kw)
+    if store._sx_todo is not None or store._facet_memo.get("composer:index") is None:
+        return rows
+    from soniqboom.core import composers
+    try:
+        return composers.fold_artist_rows(store, rows, **kw)
+    except Exception:                                   # noqa: BLE001
+        __import__("logging").getLogger(__name__).warning(
+            "Artists: scene musicians not folded", exc_info=True)
+        return rows
+
+
+def _artist_count(store, kw: dict) -> int:
+    """How many rows ``_artist_rows`` lists (without a label) — counted, not
+    built (``composers.folded_artist_count``: no list, no sort)."""
+    rows = store.aggregate_artists(**kw)
+    if store._sx_todo is not None or store._facet_memo.get("composer:index") is None:
+        return sum(1 for r in rows if not r.get("label"))
+    from soniqboom.core import composers
+    try:
+        return composers.folded_artist_count(store, rows, **kw)
+    except Exception:                                   # noqa: BLE001
+        __import__("logging").getLogger(__name__).warning(
+            "Artists: scene musicians not counted folded", exc_info=True)
+        return sum(1 for r in rows if not r.get("label"))
 
 
 @router.get("/artists")
 async def list_artists(request: Request):
-    cached = _cache_get("artists")
+    from soniqboom.core import composers
+    # (the scene rows follow the Demozoo index file too)
+    store = get_store()
+    # (none built yet after a start: the tags unfolded, not kept)
+    ready = await store.composer_index_async(cold=False) is not None
+    ck = f"artists\0{composers.version_of(store)}"
+    cached = _cache_get(ck)
     if cached is None:
-        store = get_store()
         # ``list(...)`` copies the store's MEMOISED aggregate before we append
         # the synthetic "[No Artist]" bucket — appending to the returned list
         # in place would corrupt the store's cache (the same object is served
         # to Subsonic / DLNA) until the next mutation.
-        cached = list(store.aggregate_artists(primary_only=_dedup_on(store),
-                                              exclude=_hidden(store), swap=_swap(store)))
+        kw = {"primary_only": _dedup_on(store), "exclude": _hidden(store), "swap": _swap(store)}
+        cached = list(_artist_rows(store, kw))
         untagged = _untagged_count(store, "artist")
         if untagged > 0:
             cached.append({"artist": "", "count": untagged, "label": "[No Artist]"})
-        _cache_set("artists", cached)
-    return _etag_response(request, "artists", cached)
+        if not ready:
+            # (unfolded while a start builds what they read: not kept)
+            return JSONResponse(cached, headers={"Cache-Control": "no-store"})
+        _cache_set(ck, cached)
+    return _etag_response(request, ck, cached)
 
 
 @router.get("/album-artists")
@@ -917,6 +993,8 @@ def _facet_route(facet: str, name: str):
         store = get_store()
         if facet in _SX_FACETS:
             await store.search_indexes_ready()
+        if facet == "composer":
+            await store.composer_index_async()       # (built off the loop)
         # (the store's memo knows when the list changed — some of its writes
         # move no ``_current_agg_seq``; the same rows object while it holds)
         rows = store.aggregate_facet(facet, primary_only=_dedup_on(store),
@@ -933,6 +1011,225 @@ def _facet_route(facet: str, name: str):
 
 for _facet, _name in _FACET_LISTS.items():
     _facet_route(_facet, _name)
+
+
+def _chip_rows(store, kw: dict) -> list:
+    """``[{chip, key, count}]`` — the sound chips the library's retro tunes are
+    written for (``store.format_chip``: the ``chip:`` operator's keys), in
+    ``search_values.CHIP_NAMES``' order; counts as ``chip:<key>`` lists them
+    (in the mode of the lists).  The SID models (6581 / 8580) stay search
+    values of their own."""
+    from soniqboom.core.search_values import CHIP_NAMES
+    if store._sx_todo is not None:
+        return []
+    hide = kw.get("primary_only")
+    out = []
+    for key, name in CHIP_NAMES.items():
+        tids = store._tag_chip.get(key)
+        if not tids:
+            continue
+        n = store._bucket_count(tids, hide, kw.get("exclude"), kw.get("swap") if hide else None)
+        if n is None:
+            n = store._count_primaries(tids) if hide else len(tids)
+        if n:
+            out.append({"chip": name, "key": key, "count": n})
+    return out
+
+
+@router.get("/chips")
+async def list_chips():
+    """The Scene view's Chips list (``_chip_rows``); a row opens
+    ``chip:<key>``."""
+    store = get_store()
+    await store.search_indexes_ready()
+    return _chip_rows(store, {"primary_only": _dedup_on(store), "exclude": _hidden(store),
+                              "swap": _swap(store)})
+
+
+def _today():
+    import datetime
+    return datetime.date.today()
+
+
+def _search_count(store, q: str, uid: str | None = None) -> int:
+    from soniqboom.api.search import search_predicates
+    from soniqboom.core import availability
+    preds = search_predicates(q, uid)
+    ids = store.filter_track_ids(filter_duplicates=_dedup_on(store), swap=_swap(store), **preds)
+    excl = availability.hidden(store)
+    return sum(1 for i in ids if not (excl and i in excl)) if excl else len(ids)
+
+
+@router.get("/discover")
+async def list_discover(date: str | None = Query(None, max_length=10),
+                        weeks: int = Query(6, ge=1, le=26),
+                        uid: str | None = Depends(optional_listener_uid)):
+    """The Scene view's Discover list: ``[{discover, count, kind, …}]`` —
+    ``kind`` ``winners`` (``place_max``: the compo winners / top three of
+    every party), ``on-this-day`` (``date`` "MM-DD": the listener's day),
+    ``upcoming`` (``weeks``: the party series coming up — ``count`` their
+    past editions' tunes, ``parties`` how many series), ``search`` (``q``:
+    a preset search, ``scene_discovery.presets``).  Rows of no tracks are
+    left out; ``needs_index`` rows say the Demozoo index lacks the party
+    dates (an older layout — Settings refreshes it)."""
+    from soniqboom.core import demozoo, scene_discovery as sd
+    store = get_store()
+    await store.search_indexes_ready()
+    today = _today()
+    rows = []
+    for pm, label in ((1, "Compo winners — every party"), (3, "Top three at every party")):
+        n = _search_count(store, f"place:<={pm}", uid)
+        if n:
+            rows.append({"discover": label, "count": n, "kind": "winners", "place_max": pm})
+    has_parties = bool(store._facet_sets("party"))
+    cal = demozoo.party_calendar() if has_parties else None
+    if has_parties and cal is None and demozoo.has_index():
+        rows.append({"discover": "On this day and parties coming up — refresh the Demozoo "
+                     "index (Settings → Metadata)", "count": 0, "kind": "needs-index"})
+    elif cal:
+        mo, d = sd.parse_day(date, today)
+        on = sd.parties_on(cal, mo, d, today)
+        n = len(_visible(store, list(sd.party_ids(store, [p["name"] for p in on]))))
+        if n:
+            import calendar
+            rows.append({"discover": f"On this day — {d} {calendar.month_name[mo]}",
+                         "count": n, "kind": "on-this-day", "date": f"{mo:02d}-{d:02d}"})
+        ids: set = set()
+        n_up = 0
+        for u in sd.upcoming(cal, today, weeks):
+            mine = sd.party_ids(store, u["past"])
+            if mine:
+                ids |= mine
+                n_up += 1
+        n = len(_visible(store, list(ids))) if ids else 0
+        if n:
+            rows.append({"discover": f"Parties coming up — {n_up} in the next {weeks} weeks",
+                         "count": n, "kind": "upcoming", "weeks": weeks, "parties": n_up})
+    for pr in sd.presets(today):
+        n = _search_count(store, pr["q"], uid if isinstance(uid, str) else None)
+        if n:
+            rows.append({"discover": pr["label"], "count": n, "kind": "search", "q": pr["q"]})
+    return rows
+
+
+def _rows_of(store, ids, limit: int) -> list:
+    from soniqboom.api.tracks import public_tracks
+    from soniqboom.core import availability
+    return availability.mark_rows(public_tracks([store._meta_dict(i) for i in ids[:limit]]), store)
+
+
+def _visible(store, ids) -> list:
+    from soniqboom.core import availability
+    excl = availability.hidden(store)
+    hide = _dedup_on(store)
+    swap = _swap(store)
+    if hide:
+        keep = set(store.filter_track_ids(filter_duplicates=True, swap=swap))
+        ids = [i for i in ids if i in keep]
+    return [i for i in ids if not (excl and i in excl)]
+
+
+@router.get("/on-this-day")
+async def on_this_day(date: str | None = Query(None, max_length=10),
+                      limit: int = Query(2000, ge=1, le=2000)):
+    """The tunes released at the parties held on this month and day in past
+    years (``scene_discovery``; ``date`` "MM-DD" — the listener's day, else
+    the server's): ``{date, needs_index, parties: [{name, date, count}],
+    total, tracks}``, newest party first, by competition and place."""
+    from soniqboom.core import demozoo, scene_discovery as sd
+    store = get_store()
+    await store.search_indexes_ready()
+    today = _today()
+    mo, d = sd.parse_day(date, today)
+    cal = demozoo.party_calendar()
+    if cal is None:
+        return {"date": f"{mo:02d}-{d:02d}", "needs_index": True, "parties": [], "total": 0,
+                "tracks": []}
+    parties = []
+    ids: set = set()
+    for p in sd.parties_on(cal, mo, d, today):
+        mine = sd.party_ids(store, [p["name"]])
+        if mine:
+            ids |= mine
+            parties.append({"name": p["name"], "date": p["start"].isoformat(),
+                            "count": len(_visible(store, list(mine)))})
+    order = _visible(store, sd.party_order(store, ids))
+    return {"date": f"{mo:02d}-{d:02d}", "needs_index": False, "parties": parties,
+            "total": len(order), "tracks": _rows_of(store, order, limit)}
+
+
+@router.get("/upcoming-parties")
+async def upcoming_parties(weeks: int = Query(6, ge=1, le=26),
+                           series: str | None = Query(None, max_length=200),
+                           limit: int = Query(2000, ge=1, le=2000)):
+    """The party series whose next edition starts in the coming ``weeks``
+    (``scene_discovery.upcoming``, from the Demozoo index's dates — offline):
+    ``{needs_index, series: [{key, series, next, date, scheduled, count}]}``
+    — ``count``: the library's tunes from its past editions.  With
+    ``series`` (a row's ``key``): ``{series, next, date, scheduled, total,
+    tracks}`` — those tunes, newest edition first, by competition and
+    place."""
+    from soniqboom.core import demozoo, scene_discovery as sd
+    store = get_store()
+    await store.search_indexes_ready()
+    cal = demozoo.party_calendar()
+    if cal is None:
+        return {"needs_index": True, "series": []}
+    rows = []
+    for u in sd.upcoming(cal, _today(), weeks):
+        ids = sd.party_ids(store, u["past"])
+        if not ids:
+            continue
+        if series is not None:
+            if u["key"] != series:
+                continue
+            order = _visible(store, sd.party_order(store, ids))
+            return {"series": u["series"], "next": u["next"], "date": u["date"],
+                    "scheduled": u["scheduled"], "total": len(order),
+                    "tracks": _rows_of(store, order, limit)}
+        n = len(_visible(store, list(ids)))
+        if n:
+            rows.append({"key": u["key"], "series": u["series"], "next": u["next"],
+                         "date": u["date"], "scheduled": u["scheduled"], "count": n})
+    if series is not None:
+        return {"series": series, "total": 0, "tracks": []}
+    return {"needs_index": False, "series": rows}
+
+
+@router.get("/compo-summary")
+async def compo_summary(place_max: int = Query(1, ge=1, le=100)):
+    """The compo winners' filters: ``{total, chips: [{key, chip, count}],
+    years: [{year, count}], compos: [{name, count}]}`` over the tunes placed
+    ``place_max`` or better (``place:<=N``) — the sound chip (``chip:``: the
+    list narrows by ``q=place:<=N chip:<key>``), the tune's year (as
+    ``year:`` reads it), the competitions most common first (at most 40)."""
+    from collections import Counter
+
+    from soniqboom.core.search_values import CHIP_NAMES
+    from soniqboom.core.store import format_chip
+    store = get_store()
+    await store.search_indexes_ready()
+    from soniqboom.api.search import search_predicates
+    ids = _visible(store, list(store.filter_track_ids(**search_predicates(f"place:<={place_max}"))))
+    chips: Counter = Counter()
+    years: Counter = Counter()
+    comps: Counter = Counter()
+    for i in ids:
+        t = store._tracks.get(i) or {}
+        c = format_chip(t.get("format"))
+        if c:
+            chips[c] += 1
+        y = t.get("year")                # (what the list's ``year:`` key reads)
+        if isinstance(y, int) and 1970 <= y <= 2100:
+            years[y] += 1
+        c = (t.get("scene_compo") or "").strip()
+        if c:
+            comps[c] += 1
+    return {"total": len(ids),
+            "chips": [{"key": k, "chip": CHIP_NAMES.get(k, k), "count": n}
+                      for k, n in chips.most_common()],
+            "years": [{"year": y, "count": years[y]} for y in sorted(years, reverse=True)],
+            "compos": [{"name": n, "count": c} for n, c in comps.most_common(40)]}
 
 
 @router.get("/scene-groups")

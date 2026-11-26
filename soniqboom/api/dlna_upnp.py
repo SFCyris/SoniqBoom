@@ -657,6 +657,11 @@ def _parse_search_criteria(crit: str):
     return None
 
 
+# Longest SearchCriteria accepted: the search box's limit
+# (``search_values.QUERY_MAX_LEN``) plus room for the UPnP clause syntax.
+_SEARCH_CRITERIA_MAX = 2000
+
+
 async def _do_search(args: dict[str, str], request: Request) -> FResponse:
     """ContentDirectory:1 Search — returns matching track items as DIDL-Lite."""
     get_store = _dlna_store
@@ -671,7 +676,12 @@ async def _do_search(args: dict[str, str], request: Request) -> FResponse:
     container = args.get("ContainerID", "music") or "music"
     store = get_store()
 
-    filt = _parse_search_criteria(args.get("SearchCriteria", ""))
+    crit = args.get("SearchCriteria", "")
+    if len(crit) > _SEARCH_CRITERIA_MAX:
+        # (ContentDirectory:1 error 708 "Unsupported or invalid search
+        # criteria" — the SOAP form of the search entry points' 422)
+        return _soap_fault(708, "SearchCriteria is too long.")
+    filt = _parse_search_criteria(crit)
     if filt is None:
         # Match everything — same as browsing music/all.
         total = await asyncio.to_thread(store.track_count)

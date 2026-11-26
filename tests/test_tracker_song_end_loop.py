@@ -381,7 +381,9 @@ def test_a_sample_ringing_across_the_repeats_is_not_cut(monkeypatch):
 async def test_a_stale_tracker_render_is_not_reused(tmp_data_dir):
     """Renders made before this revision (float 48 kHz, a song-end loop
     played out) have another key: never served, nor read back as a length."""
-    assert cc._cache_key("t", "tracker", 0) == "t__sub0__r2"
+    # (r3: tune 0 of a module with several subsongs is its first alone —
+    # tests/test_every_tune.py; + the Amiga resampler at its default, 2.3.0)
+    assert cc._cache_key("t", "tracker", 0) == "t__sub0__r3__amauto"
 
 
 @needs_cli
@@ -424,11 +426,15 @@ def test_float_wav_headers_and_the_audibility_meter():
 
 @needs_cli
 @needs_lib
-async def test_a_loud_module_is_not_clipped(tmp_data_dir, tmp_path):
+async def test_a_loud_module_is_not_clipped(tmp_data_dir, tmp_path, monkeypatch):
     """Four channels of a full-scale square wave mix past full scale: the
     float render keeps those peaks (a 16-bit render held 34 % of its samples
-    flat at full scale)."""
+    flat at full scale).  (libopenmpt's own interpolation: the Amiga
+    resampler — 2.3.0 — shapes the squares' edges otherwise; its renders
+    are float the same way.)"""
     from soniqboom.api import stream
+    from soniqboom.config import settings
+    monkeypatch.setattr(settings, "amiga_resampler", "off")
     sq = bytes(([127] * 16 + [0x80] * 16) * 64)
     hdr = (b"Loud".ljust(20, b"\0") + b"Sq".ljust(22, b"\0")
            + struct.pack(">HBBHH", len(sq) // 2, 0, 64, 0, len(sq) // 2)

@@ -1093,36 +1093,23 @@ def _local_io_reason(exc: BaseException) -> str:
 def _re_extract_remote_sync(
     file_data: bytes, remote_path: str, track_id: str,
 ) -> tuple[dict | None, str | None]:
-    """Re-run the extractor against an already-downloaded byte buffer.
+    """Re-run the extractor against an already-downloaded byte buffer — the
+    network-share scan's own reader (``scanner._extract_one_remote``), so a
+    re-extract reads a file as the scan does: an Amiga module named in prefix
+    form (``BP.commando``) under its real name, the title fallback from the
+    file / member name.  (Without the scan's PC-program-archive veto, which
+    needs the archive: as before.)
 
     Returns ``(extracted_dict, error_reason)`` — same contract as
     :func:`_re_extract_local_sync`.
     """
-    from soniqboom.core.metadata import extract
-    from soniqboom.core.scanner import _member_stem
+    from soniqboom.core.scanner import _extract_one_remote
 
-    ext = os.path.splitext(remote_path)[1]
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(file_data)
-            tmp_path = Path(tmp.name)
-        meta = extract(tmp_path, track_id)
-        d = meta.model_dump()
-        d["path"] = remote_path
-        d["file_size"] = len(file_data)
-        if meta.title == tmp_path.stem:
-            # The member's own name (``a.zip::b.mod`` → ``b``), like the scan.
-            real_stem = _member_stem(remote_path)
-            if real_stem:
-                d["title"] = real_stem
-        return d, None
-    except Exception as exc:
-        log.warning("Repair: remote extract failed for %s: %s", remote_path, exc)
-        return None, f"remote-error: {type(exc).__name__}: {exc}"
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+    _p, meta, _a, _b = _extract_one_remote(file_data, remote_path, track_id)
+    if isinstance(meta, str):
+        log.warning("Repair: remote extract failed for %s: %s", remote_path, meta)
+        return None, f"remote-error: {meta}"
+    return meta.model_dump(), None
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────────

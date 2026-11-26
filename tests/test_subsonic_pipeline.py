@@ -948,6 +948,7 @@ def test_a_copy_of_a_track_is_mapped_but_never_displaces_the_store_dict(lib, mon
 
 def test_memo_is_bounded(lib, monkeypatch):
     monkeypatch.setattr(S, "_SONG_MEMO_MAX", 4)
+    monkeypatch.setattr(S, "_song_memo_cap", lambda store: 4)   # (2.3.0: scales with the library)
     S._song_memo_clear()
     want = _ref_all(lib, lambda: S._song_ctx(lib, _USER))
     for _ in range(2):

@@ -397,7 +397,7 @@ function _fmtDur(sec) {
 // format / type — a format name, a file extension or a family — length,
 // added, rating, plays / played — the signed-in user's plays — folder, path,
 // group, party, status, composer, title, lossless, bitdepth, samplerate,
-// bitrate, source, bpm, tunes, chip, dup, channels, has).  A leading ``-``
+// bitrate, source, bpm, tunes, chip, dup, channels, has, place, compo).  A leading ``-``
 // (``-format:mp3``) excludes; it is not part of the name.  Keeping this in lockstep with the backend means an
 // unsupported field surfaces an honest "Unknown field" hint instead of wrong
 // results (test-guarded: tests/test_search_filters_phase1.py).  If the backend
@@ -408,7 +408,7 @@ const _SUPPORTED_OPS = new Set([
   'length', 'added', 'rating', 'plays', 'played',
   'folder', 'path', 'group', 'party', 'status', 'composer', 'title',
   'lossless', 'bitdepth', 'samplerate', 'bitrate', 'source',
-  'bpm', 'tunes', 'chip', 'dup', 'channels', 'has',
+  'bpm', 'tunes', 'chip', 'dup', 'channels', 'has', 'place', 'compo',
 ]);
 let _syntaxHintShown = false;
 
@@ -499,10 +499,21 @@ function _renderBadOpsWarning(container, badOps) {
 }
 
 // ── Main search ─────────────────────────────────────────────────────────────
+// The box emptied or cleared: back to the view the search was started from
+// (Library.leaveSearch; the Stations view's own search goes back to the
+// station list it came from) — with no search results showing, nothing moves.
+function _leaveSearch() {
+  if (_inStationsView()) {
+    import('./stations.js').then((m) => m.Stations.leaveSearch && m.Stations.leaveSearch()).catch(() => {});
+    return;
+  }
+  Promise.resolve(Library.leaveSearch()).catch(() => {});
+}
+
 async function query(text) {
   _cancelPreviewSearch();
   _hidePreview();
-  if (!text.trim()) { Library.showAll(); return; }
+  if (!text.trim()) { _leaveSearch(); return; }
   // The whole result set, paged like All Tracks (Library.showSearch — a view
   // entry: a newer search or a nav click wins over a late answer).  A failure
   // is said and the prior view stays.
@@ -624,7 +635,7 @@ input.addEventListener('input', () => {
     _stationLookup.cancel();
     _curStations = [];
     _hidePreview();
-    Library.showAll();
+    _leaveSearch();
   }
 });
 
@@ -733,7 +744,7 @@ clear.addEventListener('click', () => {
   input.dispatchEvent(new Event('sb:search-set'));   // (app.js: Save as smart playlist)
   input.focus();  // clear is now hidden — keep keyboard focus on the search field
   _hidePreview();
-  Library.showAll();
+  _leaveSearch();
   input.focus();
 });
 

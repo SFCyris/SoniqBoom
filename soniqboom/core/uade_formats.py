@@ -96,6 +96,17 @@ _SUFFIX_OWNED_ELSEWHERE = frozenset({
     "s98", "v2m", "mdx", "pdx", "sunvox", "mgs",
     # AdLib AMUSIC
     "amd",
+    # zxtune123 (ZX Spectrum trackers — ``metadata.ZX_FORMATS``; ``stp`` /
+    # ``sqt`` stay uade's: told apart by content), Furnace (``fur``), the
+    # AdLib formats AdPlug reads by its verdict (``metadata._ADLIB_VERIFY_NAMES``)
+    # and midirender's game MIDI formats (``metadata.GAME_MIDI_FORMATS``)
+    "pt3", "pt2", "pt1", "stc", "st1", "st3", "asc", "as0", "psc", "gtr", "ftc", "vtx",
+    "psg", "ayc", "chi", "str", "dst", "sqd", "dmm", "et1", "pdt", "tf0", "tfe", "tfc",
+    "tfd", "cop", "fur",
+    "wlf", "adlib", "a2t", "xms", "dfm", "hsp", "mad", "mdy", "mdi", "mkj", "cff", "dmo",
+    "mtk", "mtr", "rac", "raw", "sat", "sa2", "xad", "bmf", "lds", "plx", "m", "xsm",
+    "pis", "msc", "mkf", "jbm", "got", "sop", "hsq", "sqx", "sdb", "agd", "ha2",
+    "xmi", "hmi", "hmp", "gmf", "klm", "kar", "rmi",
     # libopenmpt, where it reads them (``metadata._OPENMPT_OPTIONAL``), and
     # other names of the modules it reads (``metadata._TRACKER_ALT_EXTS``)
     "xmf", "dsym", "dtm", "dmf", "mdl", "umx", "psm", "j2b", "mo3", "oxm", "mptm", "rtm",

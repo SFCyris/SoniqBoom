@@ -29,6 +29,14 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 
+# The longest search text a search entry point accepts, in characters
+# (``/api/search*``, ``/api/tracks/shuffled?q=``, a smart playlist's query,
+# Subsonic ``search`` / ``search2`` / ``search3``, DLNA Search, the station
+# search): a longer one is answered 422 (Subsonic: its error envelope).  The
+# parse is linear in the length, but a 2 MB query (a Subsonic form POST) was
+# still seconds of matching for nothing anyone types.
+QUERY_MAX_LEN = 1000
+
 # ── length: ──────────────────────────────────────────────────────────────────
 
 # (At most 9 digits a number: a longer one is no length — and no int() of
@@ -320,7 +328,33 @@ SHARE_SOURCES = frozenset(("ftp", "smb", "webdav"))
 
 # ``chip:`` words (a SID tune's model, or its number of chips) and ``has:``
 # words → the predicate's value.
-CHIPS = {"6581": "6581", "8580": "8580", "2sid": "2sid", "3sid": "3sid"}
+CHIPS = {"6581": "6581", "8580": "8580", "2sid": "2sid", "3sid": "3sid",
+         # the chip a retro format is written for (``store.format_chip``) —
+         # each by its name and the names it is known by
+         **dict.fromkeys(("sid", "mos6581", "mos8580", "c64"), "sid"),
+         **dict.fromkeys(("paula", "amiga"), "paula"),
+         **dict.fromkeys(("ym2149", "ym", "atarist"), "ym2149"),
+         **dict.fromkeys(("ay", "ay-3-8910", "ay38910", "ay-3-8912", "ay8910", "zx"), "ay"),
+         **dict.fromkeys(("opl", "opl2", "opl3", "ym3812", "ymf262", "adlib"), "opl"),
+         **dict.fromkeys(("pokey", "atari8bit"), "pokey"),
+         **dict.fromkeys(("spc700", "spc", "snes", "s-smp", "sdsp", "s-dsp"), "spc700"),
+         **dict.fromkeys(("2a03", "rp2a03", "nes", "2a07"), "2a03"),
+         **dict.fromkeys(("gameboy", "gb", "dmg"), "gameboy"),
+         **dict.fromkeys(("huc6280", "pce", "pcengine", "turbografx"), "huc6280"),
+         **dict.fromkeys(("ym2612", "opn2", "megadrive", "genesis"), "ym2612"),
+         **dict.fromkeys(("ym2151", "opm", "x68000"), "ym2151"),
+         **dict.fromkeys(("spu", "psx", "playstation"), "spu"),
+         **dict.fromkeys(("scsp", "saturn"), "scsp"),
+         **dict.fromkeys(("aica", "dreamcast"), "aica")}
+# The chips a browse lists (``chip:`` key → name), in that order.
+CHIP_NAMES = {
+    "sid": "SID (MOS 6581 / 8580)", "paula": "Paula (Amiga)", "ym2149": "YM2149 (Atari ST)",
+    "ay": "AY-3-8910 (ZX Spectrum, MSX)", "opl": "OPL2 / OPL3 (AdLib)",
+    "pokey": "POKEY (Atari 8-bit)", "spc700": "SPC700 (SNES)", "2a03": "2A03 (NES)",
+    "gameboy": "Game Boy APU", "huc6280": "HuC6280 (PC Engine)", "ym2612": "YM2612 (Mega Drive)",
+    "ym2151": "YM2151 (X68000)", "spu": "SPU (PlayStation)", "scsp": "SCSP (Saturn)",
+    "aica": "AICA (Dreamcast)",
+}
 HAS = {"stil": "stil", "game": "game"}
 
 _YES = {"yes": "yes", "y": "yes", "true": "yes", "1": "yes",

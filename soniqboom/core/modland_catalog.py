@@ -146,7 +146,7 @@ PC_TRACKER_DIRS = ("Fasttracker 2", "Impulsetracker", "Screamtracker 3", "Fasttr
 # Bump when the derivation of a catalogue track from its index line changes:
 # the next build re-derives every catalogue track (user edits and enrichment
 # carried, ``store._carry_enrichment``).
-RULES_VERSION = 8          # 2: the format family genre (Amiga / Tracker …); fill-only credit
+RULES_VERSION = 9          # 2: the format family genre (Amiga / Tracker …); fill-only credit
                            # 3: denylisted uade suffixes in their player's folder are music
                            # 4: YM-ST replay routines (ym.*_replay) are companions, not music;
                            #    Aero Studio and Monotone folders are not uade music
@@ -154,6 +154,8 @@ RULES_VERSION = 8          # 2: the format family genre (Amiga / Tracker …); f
                            # 6: shared Hippel COSO instrument files are companions
                            # 7: the "_unknown" author folder is no composer credit
                            # 8: GoatTracker, FamiTracker, SunVox and MGSDRV files are music
+                           # 9: the ZX Spectrum trackers (zxtune123) and the AdLib formats
+                           #    whose suffix another engine has (AdPlug) are music
 
 # How often the index is refreshed: the setting's value → seconds, and the
 # wording the settings show.
@@ -486,12 +488,32 @@ _UADE_FOREIGN_DIRS = frozenset({
     "Aero Studio", "Monotone",
 })
 # Modland format dirs → the built-in-engine extensions their files carry while
-# being another format no installed engine plays: ZX Spectrum Pro Sound Maker
-# ``.psm`` (Epic MegaGames MASI's suffix), DeFy AdLib Tracker ``.dtm``
-# (Digital Tracker's).  (FamiTracker's ``.ftm`` modules play — Furnace —,
-# told from Face The Music's by content; so do DefleMask's ``.dmf`` ones,
-# ``_DEFLE_DIR``.)
-_CORE_FOREIGN_DIRS: "dict[str, tuple[str, ...]]" = {"Spectrum": (".psm",), "Ad Lib": (".dtm",)}
+# being another format no installed engine plays (none now: ZX Spectrum Pro
+# Sound Maker ``.psm`` plays — zxtune123 —, DeFy AdLib Tracker ``.dtm`` too —
+# AdPlug: ``_ZX_DIR`` / ``_ADLIB_DIR``).  (FamiTracker's ``.ftm`` modules play
+# — Furnace —, told from Face The Music's by content; so do DefleMask's
+# ``.dmf`` ones, ``_DEFLE_DIR``.)
+_CORE_FOREIGN_DIRS: "dict[str, tuple[str, ...]]" = {}
+# Modland's ZX Spectrum / AdLib dirs: a file there with a ZX tracker suffix
+# (``metadata.ZX_FORMATS``) is that ZX module — also under a suffix uade or
+# libopenmpt has too (``.stp``, ``.sqt``, ``.psm``) —, one with an AdLib
+# suffix another engine owns (``metadata.ADLIB_SHARED_FORMATS``: ``.mus``,
+# ``.ims``, ``.sng``, ``.dtm``) that AdLib tune.
+_ZX_DIR = "Spectrum"
+_ADLIB_DIR = "Ad Lib"
+# A ZX / AdLib suffix other files have too (``metadata._ZX_STRICT``,
+# ``metadata._ADLIB_TYPES`` — ``.m``, ``.asc``, ``.str`` …: PMD songs, the
+# second SID of a Stereo Sidplayer song …) is that format's only in its dirs
+# (a catalogue row is listed by its name, before its file is read).
+_ZX_DIRS = frozenset({_ZX_DIR, "Sam Coupe COP", "TFM Music Maker"})
+
+
+def _zx_adlib_exts() -> frozenset:
+    from soniqboom.core import metadata as _md
+    return frozenset(_md.ZX_EXTS | set(_md.ADLIB_SHARED_FORMATS) | set(_md._ADLIB_TYPES))
+
+
+_ZX_ADLIB_EXTS = _zx_adlib_exts()
 # Modland's DefleMask dir: its ``.dmf`` files are DefleMask modules (Furnace),
 # not libopenmpt's X-Tracker / DSMI / Software Visions modules.
 _DEFLE_DIR = "Deflemask"
@@ -566,6 +588,18 @@ def _classify(rel: str, majority: dict | None = None) -> int:
         return KIND_MUSIC
     if low.endswith(".dmf") and top == _DEFLE_DIR:
         return KIND_MUSIC
+    from soniqboom.core import metadata as _md
+    _dot = low.rfind(".")
+    _ext = low[_dot:] if _dot > 0 else ""
+    if _ext in _ZX_ADLIB_EXTS:
+        if (top == _ZX_DIR and _ext in _md.ZX_EXTS) or (
+                top == _ADLIB_DIR and _ext in _md.ADLIB_SHARED_FORMATS):
+            return KIND_MUSIC
+        if ((_ext in _md._ZX_STRICT and _ext not in (".stp", ".sqt", ".psm")
+             and top not in _ZX_DIRS)
+                or (_ext in _md._ADLIB_TYPES and _ext not in _md.ADLIB_SHARED_FORMATS
+                    and top != _ADLIB_DIR)):
+            return KIND_OTHER
     if low.endswith(".st"):
         # (Sawteeth's suffix, told by content — Modland has no Sawteeth
         # folder; a ``.st`` there is an Amiga module where its folder names
@@ -1840,6 +1874,10 @@ def format_for(rel: str) -> str:
         return metadata.FAMITRACKER_FORMAT
     if ext == ".dmf" and top == _DEFLE_DIR:
         return metadata.DEFLEMASK_FORMAT
+    if top == _ZX_DIR and ext in metadata.ZX_EXTS:
+        return metadata.ZX_FORMATS[ext][0]
+    if top == _ADLIB_DIR and ext in metadata.ADLIB_SHARED_FORMATS:
+        return metadata.ADLIB_SHARED_FORMATS[ext]
     if (ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS
             and ext != ".st"):
         return metadata.FORMAT_NAMES.get(ext, ext.lstrip(".").upper())
@@ -1955,6 +1993,10 @@ def family_genre(rel: str) -> list[str] | None:
         return ["Chiptune"]                                # FamiTracker (Furnace), not a module
     if ext == ".dmf" and top == _DEFLE_DIR:
         return ["Chiptune"]                                # DefleMask (Furnace), not a module
+    if top == _ZX_DIR and ext in metadata.ZX_EXTS:
+        return ["Chiptune"]                                # a ZX Spectrum module (zxtune123)
+    if top == _ADLIB_DIR and ext in metadata.ADLIB_SHARED_FORMATS:
+        return None                                        # an AdLib tune (AdPlug)
     if (ext in metadata.SUPPORTED_EXTENSIONS and ext not in metadata._UADE_SUFFIX_EXTS
             and ext != ".st"):
         if ext in metadata._TRACKER_EXTS:
@@ -1971,8 +2013,10 @@ def family_genre(rel: str) -> list[str] | None:
             return ["Tracker"]
         if ext in metadata._GME_EXTS:
             return ["Chiptune"]
-        if ext in metadata._MIDI_EXTS:
+        if ext in metadata._MIDI_EXTS or ext in metadata.GAME_MIDI_EXTS:
             return ["MIDI"]
+        if ext in metadata.ZX_EXTS or ext == ".fur":
+            return ["Chiptune"]
         return None
     if uf.classify(name) or folder_player_token(rel):
         return ["Amiga", "Module"]

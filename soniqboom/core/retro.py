@@ -47,10 +47,13 @@ _ADLIB = {
     "LucasArts AdLib", "Sierra AdLib", "DOSBox OPL", "HSC AdLib", "RIX OPL",
     "AdLib Tracker 2", "AdLib", "Bob's AdLib", "Ken's AdLib", "AMUSIC AdLib",
 }
+from soniqboom.core import metadata as _md  # noqa: E402
+# (the rest of AdPlug's formats, and those whose suffix another engine owns)
+_ADLIB |= set(_md._ADLIB_VERIFY_NAMES.values()) | set(_md.ADLIB_SHARED_FORMAT_NAMES)
 _ATARI = {"SNDH", "YM", "SC68"}                       # Atari ST YM2149
 _PSF = {"PSF", "PSF2", "USF", "GSF", "2SF", "SSF", "DSF (Dreamcast)", "NCSF"}
 _SID = {"SID", "GoatTracker", "C64 Sidplayer"}   # (GoatTracker 2 songs play as SID tunes)
-_MIDI = {"MIDI", "General MIDI"}
+_MIDI = {"MIDI", "General MIDI", "RIFF MIDI", *_md.GAME_MIDI_FORMAT_NAMES}
 # Distinct single-chip console/computer formats — each its OWN family.
 _SINGLE = {
     "NSF": "nes", "NSFe": "nes", "SPC": "snes", "GBS": "gameboy",
@@ -67,7 +70,17 @@ _SINGLE = {
     "FamiTracker": "nes", "DefleMask": "deflemask", "MGSDRV": "ay", "SunVox": "sunvox",
     # sawteethrender: Sawteeth (a software-synth tracker, no chip)
     "Sawteeth": "sawteeth",
+    # Furnace's own modules: the chips of many systems (as DefleMask)
+    "Furnace": "deflemask",
 }
+# zxtune123: the ZX Spectrum trackers — the AY-3-8910 ones as AY, the
+# beeper / Covox sample players (CHI, STR, DST, SQD, DMM, ET1, PDT) "zxdac",
+# TurboFM (two YM2203) "turbofm", the SAM Coupé's SAA1099 (E-Tracker) "saa".
+for _e, (_n, _t) in _md.ZX_FORMATS.items():
+    _SINGLE[_n] = ("zxdac" if _e in (".chi", ".str", ".dst", ".sqd", ".dmm", ".et1", ".pdt")
+                   else "turbofm" if _e in (".tf0", ".tfe", ".tfc", ".tfd")
+                   else "saa" if _e == ".cop" else "ay")
+del _e, _n, _t
 
 
 def _build_family() -> dict[str, str]:

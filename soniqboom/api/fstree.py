@@ -39,11 +39,10 @@ _DRILL_TASKS: set = set()
 
 from fastapi import APIRouter, HTTPException, Query
 
-from soniqboom.api.tracks import json_route
+from soniqboom.api.tracks import json_route, public_track
 from soniqboom.core import cache_stats
 from soniqboom.core.metadata import FORMAT_NAMES, SUPPORTED_EXTENSIONS
 from soniqboom.core.scanner import _is_junk_filename
-from soniqboom.models.track import TrackMeta
 
 log = logging.getLogger(__name__)
 
@@ -956,6 +955,40 @@ def _scan_zip(zip_path: str) -> list[Path]:
             for member in zf.namelist():
                 if _is_junk_filename(_zip_basename(member)):
                     continue
+                if member.lower().endswith(".zip"):
+                    # Nested ZIP (e.g. modarchive: outer.zip -> track.it.zip
+                    # -> track.it), tried first as the scanner does: one that
+                    # isn't a zip falls through to the name tests below.
+                    try:
+                        inner_data = zf.read(member)
+                    except Exception:       # bad CRC, encrypted: skipped, as the scanner does
+                        continue
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(inner_data), "r") as inner_zf:
+                            def _inner_head(real, _zf=inner_zf):
+                                with _zf.open(real) as fh:
+                                    return fh.read(archive.HEAD_BYTES)
+                            for inner_name in inner_zf.namelist():
+                                if _is_junk_filename(_zip_basename(inner_name)):
+                                    continue
+                                if _is_audio(inner_name):
+                                    # (``shown`` is the outer zip's names: not reused here)
+                                    inner = archive.content_name(inner_name, _inner_head)
+                                    if archive.rejected_by_bytes(inner_name, inner, _inner_head):
+                                        continue
+                                else:               # (mod.Astra_1 → mod.Astra_1.mod)
+                                    inner = archive.owned_prefix_name(
+                                        inner_name, _inner_head,
+                                        inner_zf.getinfo(inner_name).file_size,
+                                        taken=inner_zf.NameToInfo)
+                                    if inner is None:
+                                        continue
+                                results.append(Path(f"{zip_path}::{member}::{inner}"))
+                        continue
+                    except zipfile.BadZipFile:
+                        pass                # not a zip: maybe a module named *.zip
+                    except Exception:       # corrupt / encrypted inside: skipped
+                        continue
                 if _is_audio(member):
                     # (the scanner's name: ``mod.Opus`` as its bytes say)
                     name = archive.content_name(member, _head_of)
@@ -965,29 +998,20 @@ def _scan_zip(zip_path: str) -> list[Path]:
                     results.append(Path(f"{zip_path}::{name}"))
                 elif archive.sniffable(member):
                     plain.append(member)
-                elif member.lower().endswith(".zip"):
-                    # Nested ZIP (e.g. modarchive: outer.zip -> track.it.zip -> track.it)
-                    try:
-                        inner_data = zf.read(member)
-                        with zipfile.ZipFile(io.BytesIO(inner_data), "r") as inner_zf:
-                            def _inner_head(real, _zf=inner_zf):
-                                with _zf.open(real) as fh:
-                                    return fh.read(archive.HEAD_BYTES)
-                            for inner_name in inner_zf.namelist():
-                                if _is_junk_filename(_zip_basename(inner_name)):
-                                    continue
-                                if _is_audio(inner_name):
-                                    shown = archive.content_name(inner_name, _inner_head)
-                                    if archive.rejected_by_bytes(inner_name, shown, _inner_head):
-                                        continue
-                                    results.append(Path(f"{zip_path}::{member}::{shown}"))
-                    except (zipfile.BadZipFile, OSError):
-                        pass
+                else:
+                    # (named by a prefix only the archive map reads, as the
+                    # scanner lists it: ``mod.Astra_1`` → ``mod.Astra_1.mod``)
+                    name = archive.owned_prefix_name(member, _head_of,
+                                                     zf.getinfo(member).file_size,
+                                                     taken=zf.NameToInfo)
+                    if name is not None:
+                        shown.add(name)
+                        results.append(Path(f"{zip_path}::{name}"))
             # (members only their bytes name, as the scanner lists them)
             for disp in archive.sniffed_members(plain, _head_of,
                                                 taken=shown | set(zf.namelist())):
                 results.append(Path(f"{zip_path}::{disp}"))
-    except (zipfile.BadZipFile, OSError):
+    except Exception:           # unreadable, a name zipfile can't decode: the members so far
         pass
     return results
 
@@ -1232,12 +1256,11 @@ class root_commit:
 
 def _shape_row(d: dict) -> "dict | None":
     """A store track as a browse row — exactly what the root cache holds."""
-    try:
-        out = TrackMeta(**{k: v for k, v in d.items()
-                           if k in TrackMeta.model_fields and k != "embedding"}
-                        ).model_dump(exclude={"embedding"})
-    except Exception:
+    out = public_track(d)
+    if out is None:
         return None
+    if out is d:                    # (``public_track`` may hand back the store's dict)
+        out = dict(d)
     out["_scanned"] = True
     return out
 
@@ -1946,20 +1969,17 @@ def _get_or_build_scan_root_sorted(
 
     raw_dicts = [d for d in store.get_tracks_batch(list(tids_set)) if d]
     shaped: list[tuple[str, dict]] = []
-    fields = TrackMeta.model_fields
     for d in raw_dicts:
         try:
-            # (A copy first: the store's dicts are live, and the loop may write
-            # one — a key added — while a worker thread iterates it, which
-            # raised and lost the row; ``dict.copy`` is one step for the
-            # other threads.)
-            filtered = {
-                k: v for k, v in d.copy().items()
-                if k in fields and k != "embedding"
-            }
-            meta = TrackMeta(**filtered)
-            out = meta.model_dump(exclude={"embedding"})
-            out["_scanned"] = True
+            # (The store's dicts are live, and the loop may write one — a key
+            # added — while a worker thread reads it: ``_shape_row`` never
+            # iterates it in Python — ``public_track`` reads it by field name
+            # and copies it in one step — so no row is lost to a "dict
+            # changed size".  ``public_track`` = ``TrackMeta(**d).model_dump()``
+            # without the per-row model: the stored values over the defaults.)
+            out = _shape_row(d)
+            if out is None:
+                continue
             shaped.append((out.get("path", ""), out))
         except Exception:
             continue

@@ -190,15 +190,24 @@ async def store_hash_lookup(value: str) -> str:
     return get_store().store_hash_lookup(value)
 
 
+def _hash_values(values: list[str]) -> dict[str, str]:
+    return {v: path_hash(v) for v in values}
+
+
 async def store_hash_lookups_batch(values: list[str]) -> dict[str, str]:
     if not values:
         return {}
-    # hashlib releases the GIL during SHA-256, so threading helps
+    # hashlib releases the GIL during SHA-256, so threading helps — only the
+    # hashing: the store write (journaled) is made on the loop.
     import asyncio
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None, get_store().store_hash_lookups_batch, values,
-    )
+    pairs = await loop.run_in_executor(None, _hash_values, list(values))
+    by_hash = [(h, v) for v, h in pairs.items()]
+    for i in range(0, len(by_hash), 20_000):           # (a turn for the loop between slices)
+        if i:
+            await asyncio.sleep(0)
+        get_store().put_hash_lookups(dict(by_hash[i:i + 20_000]))
+    return pairs
 
 
 async def resolve_hash(h: str) -> str | None:
@@ -520,14 +529,19 @@ _TAG_RE = re.compile(r'(?:(?<!\S)(-))?@(\w+):\{((?:\\.|[^\\{}])*)\}', re.DOTALL)
 # Numeric ranges: ``@year:[lo hi]``, ``@track:[lo hi]``, ``@disc:[lo hi]``,
 # ``@length:[lo hi]`` (whole seconds), ``@rating:[lo hi]``, ``@plays:[lo hi]``,
 # ``@bitdepth:[lo hi]``, ``@samplerate:[lo hi]`` (Hz), ``@bitrate:[lo hi]`` (kbps),
-# ``@bpm:[lo hi]``, ``@tunes:[lo hi]``, ``@channels:[lo hi]``.
+# ``@bpm:[lo hi]``, ``@tunes:[lo hi]``, ``@channels:[lo hi]``, ``@place:[lo hi]``.
 _RANGE_FIELDS = ("year|track|disc|length|rating|plays|bitdepth|samplerate|bitrate"
-                 "|bpm|tunes|channels")
-_RANGE_RE = re.compile(r'(?:(?<!\S)(-))?@(' + _RANGE_FIELDS + r'):\[([^\]]+)\]')
+                 "|bpm|tunes|channels|place")
+# A range's inside holds no "[" (two bounds: numbers, ``(``, ``±inf``), so the
+# scan stops at one: else every ``@year:[`` of an unterminated query scanned
+# to the end of the string — quadratic (about 2 s for 10,000 ``@year:[``).
+_RANGE_RE = re.compile(r'(?:(?<!\S)(-))?@(' + _RANGE_FIELDS + r'):\[([^\[\]]+)\]')
 _UNESCAPE_RE = re.compile(r'\\(.)', re.DOTALL)
 # Several values of one operator (``format:flac,alac``): a group of terms
 # joined by ``|`` in parentheses — ``(@format:{FLAC} | @format:{ALAC})``.
-_TERM = r'@\w+:(?:\{(?:\\.|[^\\{}])*\}|\[[^\]]+\])'
+# (Its range stops at a "[" too, as ``_RANGE_RE`` does: an unclosed group of
+# ``@year:[`` terms was quadratic as well.)
+_TERM = r'@\w+:(?:\{(?:\\.|[^\\{}])*\}|\[[^\[\]]+\])'
 _GROUP_RE = re.compile(r'\(\s*(' + _TERM + r'(?:\s*\|\s*' + _TERM + r')+)\s*\)', re.DOTALL)
 
 # Tag-query field → ``TrackStore.filter_tracks`` kwarg.
@@ -561,6 +575,7 @@ _FIELD_MAP = {
     "chip": "chip",
     "dup": "dup",
     "has": "has",
+    "compo": "compo_match",                  # search box compo: → a word start
 }
 
 # Predicates that read one user's plays: the query needs that user's id
@@ -650,11 +665,17 @@ def with_uid(preds: dict, uid: str | None) -> dict:
 
 async def search_indexes_for(preds: dict) -> None:
     """Wait for the search indexes a start is still building when ``preds``
-    read one (``TrackStore.needs_search_indexes``) — the loop serves the
-    other requests meanwhile."""
+    read one (``TrackStore.needs_search_indexes``), and for the composer
+    identities when they read those (``composers.needs_index``) — the loop
+    serves the other requests meanwhile."""
     store = get_store()
     if store.needs_search_indexes(preds):
         await store.search_indexes_ready()
+    from soniqboom.core import composers
+    if composers.needs_index(preds):
+        # (``composer:`` / a composer's tracks: the identities as they are now,
+        # built off the loop when a write made them stale)
+        await store.composer_index_async()
 
 
 def _parse_tag_query(query: str) -> dict:
@@ -692,6 +713,7 @@ def _parse_tag_query(query: str) -> dict:
       @samplerate:[min max]      -> samplerate_min=…, samplerate_max=… (Hz)
       @bitrate:[min max]         -> bitrate_min=min, bitrate_max=max (kbps)
       @bpm:[min max] @tunes:[…] @channels:[…] -> bpm_min/max, tunes_*, channels_*
+      @place:[min max] @compo:{v}  -> place_min/max, compo_match="v"
       (@a:{x} | @a:{y} | …)      -> anyof: several values (see below)
       -<any term above>          -> an exclusion (see below)
       -@text:{word}              -> an excluded free-text word
@@ -1288,6 +1310,15 @@ async def delete_tracks_by_scan_root(root_path: str, stop=None, moved=None) -> i
     ids = list(store.get_track_ids_for_scan_root(h))
     if not ids:
         return 0
+    if not stop():
+        # (the rows with user data are kept aside: the same files added again
+        #  under another address of the share take it over —
+        #  ``scanner._rerooted_moves``)
+        try:
+            scanner.remember_removed_root(store, root_path, ids)
+        except Exception:                       # noqa: BLE001 — never stops the purge
+            log.warning("The removed tracks' user data could not be remembered for %s",
+                        root_path, exc_info=True)
     gone: list[str] = []                        # (the ids deleted: their art goes too)
     deleted, i = 0, 0
     store.enter_batch_mode()

@@ -34,6 +34,9 @@ import { Toast } from './utils.js';
 import { getUiStyle, onUiStyleChange } from './ui_style.js';
 import { createDial } from './stations/dial.js';
 import { createLive } from './stations/live.js';
+// The numbers and helpers of a stream's recovery, shared with the phone's radio.
+import { STALL_SUSTAINED_MS, STARTUP_GRACE_MS, MAX_RECONNECTS, GOOD_PLAY_RESET_MS,
+         bufferedAhead as _bufferedAhead, reconnectDelay, rebufferReady } from './stream_recovery.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
@@ -203,15 +206,9 @@ function _fitTicker(el) {
 // lower-quality stream available we drop to it; with none we pause and rebuffer
 // ourselves (a longer 2x buffer) so the browser can't skip to the live edge —
 // which sounds like jumping to the next song.
-const STALL_SUSTAINED_MS = 1200;   // a MID-STREAM 'waiting' lasting this long = a real underrun
-const STARTUP_GRACE_MS   = 9000;   // a fresh stream gets this long to CONNECT before we downgrade
-const REBUFFER_TARGET_S  = 6;      // "longer buffer (2x)": seconds buffered ahead before resuming
-const REBUFFER_QUARTER_S = REBUFFER_TARGET_S / 4;   // worst-case floor — a quarter of the target
-const REBUFFER_GIVEUP_MS = 8000;   // after this long without the full buffer, accept the quarter
-const MAX_RECONNECTS     = 3;      // relay/upstream EOF: reconnect the same stream up to N times
-const RECONNECT_BASE_MS  = 600;    // first 'ended' reconnect waits this long (then backs off)
-const RECONNECT_MAX_MS   = 4000;   // backoff ceiling
-const GOOD_PLAY_RESET_MS = 10000;  // sustained playback before the reconnect budget is forgiven
+// (the numbers — a 1.2 s stall, 9 s to connect, a 6 s rebuffer or a quarter of
+// it after 8 s, 3 reconnects from 600 ms backing off to 4 s, forgiven after
+// 10 s of play — are stream_recovery.js's, shared with the phone)
 let _stallTimer     = null;
 let _rebufferTimer  = null;        // the in-flight rebuffer poll (must be cancellable)
 let _reconnectTimer = null;        // pending 'ended' reconnect (backoff; cancel on switch/stop)
@@ -386,22 +383,6 @@ function stop() {
   _syncUi();
 }
 
-// Seconds of CONTIGUOUS audio buffered ahead of the playhead (0 when nothing is
-// buffered there).  We measure the range that actually covers currentTime, not
-// the end of the last range — a gap ahead must not count as "buffered" or we'd
-// resume into silence.
-function _bufferedAhead(audio) {
-  try {
-    const b = audio.buffered;
-    if (!b || !b.length) return 0;
-    const t = audio.currentTime || 0;
-    for (let i = 0; i < b.length; i++) {
-      if (b.start(i) <= t + 0.25 && b.end(i) > t) return Math.max(0, b.end(i) - t);
-    }
-    return 0;
-  } catch (_) { return 0; }
-}
-
 // Show a transient status in the now-playing card's title (e.g. "Buffering…"),
 // or restore the live ICY title when ``msg`` is null.
 function _setRebufferStatus(msg) {
@@ -427,9 +408,7 @@ function _rebuffer() {
     if (!Player.stationMode || !_current) { clearInterval(_rebufferTimer); _rebufferTimer = null; _rebuffering = false; return; }
     const ahead   = _bufferedAhead(audio);
     const waited   = performance.now() - started;
-    const full    = ahead >= REBUFFER_TARGET_S || audio.readyState >= 4;   // HAVE_ENOUGH_DATA
-    const quarter = waited >= REBUFFER_GIVEUP_MS && ahead >= REBUFFER_QUARTER_S;
-    if (full || quarter) {
+    if (rebufferReady(ahead, waited, audio.readyState)) {   // the full buffer, or a quarter after the wait
       clearInterval(_rebufferTimer);
       _rebufferTimer = null;
       _rebuffering = false;
@@ -490,7 +469,7 @@ function _wireAudioHealth() {
       return;
     }
     _reconnects++;
-    const delay = Math.min(RECONNECT_BASE_MS * 2 ** (_reconnects - 1), RECONNECT_MAX_MS);
+    const delay = reconnectDelay(_reconnects);
     clearTimeout(_reconnectTimer);
     _reconnectTimer = setTimeout(() => {
       if (Player.stationMode && _current) _tryPlay();
@@ -1214,7 +1193,7 @@ function _enterView(sview) {
   const gx = $('galaxy-view'); if (gx) gx.hidden = true;
   // …and the list's own chrome (Play all / Shuffle / crumb, the group filter,
   // the A–Z rail) — a library view sets them again.
-  for (const id of ['browse-header', 'group-filter-bar', 'az-rail']) {
+  for (const id of ['browse-header', 'group-filter-bar', 'az-rail', 'scene-panel']) {
     const el = $(id); if (el) el.hidden = true;
   }
   document.querySelectorAll('#nav-library li.active, #nav-smart li.active')
@@ -1257,10 +1236,21 @@ async function _renderSearch(q) {
   } catch (e) { _loading(`Station search failed: ${e.message}`); }
 }
 
+let _sviewBeforeSearch = null;   // the station list a search was started from
 function showSearchResults(q) {
   if (!q || !q.trim()) return;
+  if (_sview !== 'search') _sviewBeforeSearch = _sview;
   _enterView('search');
   _renderSearch(q.trim());
+}
+
+// The search box emptied while station results are showing: back to the
+// station list the search started from (search.js).
+function leaveSearch() {
+  const v = view();
+  if (!v || v.hidden || _sview !== 'search') return false;
+  show(_sviewBeforeSearch && _sviewBeforeSearch !== 'search' ? _sviewBeforeSearch : 'favorites');
+  return true;
 }
 
 function hide() {
@@ -1273,13 +1263,17 @@ function hide() {
     .forEach((li) => li.classList.remove('active'));
 }
 
-// Leaving Stations: any click on the other sidebar sections hides the view.
+// Leaving Stations: any click on the other sidebar sections hides the view,
+// and so does a library pick without a click (Enter/Space on an entry or a
+// folder row, the 1–6 / Alt+1–6 / H / D keys), which app.js's
+// _deactivateAllNav announces.
 document.addEventListener('click', (e) => {
   if (view()?.hidden !== false) return;
   if (e.target.closest('#nav-library li, #nav-smart li, #folder-tree li, .sidebar-playlist-list li')) {
     hide();
   }
 }, true);
+document.addEventListener('sb:library-pick', () => hide());
 
 // Now-playing titles pushed from the relay over the library WebSocket.
 function _onMeta(d) {
@@ -1349,7 +1343,7 @@ Player.on('statechange', () => {
 });
 
 export const Stations = {
-  show, hide, play, stop, showInfo, surf: _surfStation, showSearchResults,
+  show, hide, play, stop, showInfo, surf: _surfStation, showSearchResults, leaveSearch,
   // Diagnostics / tests
   get dial() { return _dial; },
   get live() { return _live; },

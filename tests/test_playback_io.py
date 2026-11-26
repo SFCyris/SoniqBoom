@@ -1282,7 +1282,7 @@ async def test_a_cancelled_non_live_libgme_render_keeps_its_slot_until_it_ends(m
     monkeypatch.setattr(gme_render, "is_available", lambda: True)
     monkeypatch.setattr(gme_render, "render_plan", lambda d, s, dur: (5.0, None))
 
-    def slow_wav(data, subsong, duration, fade_at_s=None):
+    def slow_wav(data, subsong, duration, fade_at_s=None, fade_len_s=None):
         gate.wait(5)
         return b""
     monkeypatch.setattr(gme_render, "render_wav", slow_wav)
@@ -1724,7 +1724,7 @@ async def test_play_path_file_work_runs_on_the_playback_threads(tmp_path, monkey
     monkeypatch.setattr(gme_render, "is_available", lambda: True)
     monkeypatch.setattr(gme_render, "render_plan", rec("plan", lambda d, s, dur: (1.0, None)))
     monkeypatch.setattr(gme_render, "render_pcm",
-                        rec("pcm", lambda data, sub, dur, sink, fade_at_s=None: 0))
+                        rec("pcm", lambda data, sub, dur, sink, fade_at_s=None, fade_len_s=None: 0))
     real_rb = Path.read_bytes
     monkeypatch.setattr(Path, "read_bytes",
                         lambda self: (names.__setitem__("read", threading.current_thread().name),

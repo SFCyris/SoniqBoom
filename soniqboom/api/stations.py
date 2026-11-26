@@ -36,6 +36,7 @@ from soniqboom.api.users import listener_uid
 from pydantic import BaseModel
 
 from soniqboom.core import forksafe, radiodir
+from soniqboom.core.search_values import QUERY_MAX_LEN
 from soniqboom.core.station_hub import StationHub, registry as _hub_registry
 
 log = logging.getLogger("soniqboom.stations")
@@ -123,7 +124,8 @@ async def favorites(uid: str = Depends(listener_uid)):
 
 
 @router.get("/search")
-async def search(q: str = Query(""), limit: int = Query(30, ge=1, le=100),
+async def search(q: str = Query("", max_length=QUERY_MAX_LEN),
+                 limit: int = Query(30, ge=1, le=100),
                  uid: str = Depends(listener_uid)):
     """Search stations by name (scene pack + favorites + Radio Browser)."""
     return _decorate(await radiodir.search_stations(q, limit, uid=uid), uid)

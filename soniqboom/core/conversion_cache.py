@@ -15,6 +15,31 @@ Directory layout:
 LRU metadata is kept in-memory.  WAV files live on disk.
 Eviction runs after every cache write: while total > max, pop the
 oldest entry and delete its file.
+
+Packed entries (cache entry format v1, ``PACK_SUFFIX``)
+------------------------------------------------------
+A finished render is compressed in the background, losslessly, to
+``<key>.sbwv`` beside its WAV (``pack_entry``; the worker ``start_packer``:
+one at a time, only while no render runs, stopped when one starts, its
+ffmpeg at the lowest CPU / I/O priority — its own reads of the WAV for the
+silence check and a float render's peak are ordinary Python): our header
+(magic ``SBWV``, ``PACK_VERSION``, the original WAV's size / mtime / MD5 and
+its header bytes verbatim) followed by a WavPack stream that ffmpeg's own
+wavpack codec writes and reads.  The decoded file is byte for byte the WAV
+it was made from, 32-bit float renders included (verified by decoding it
+before it is kept).  Once packed, the WAV stays as the entry's decoded copy
+("hot") until the cache needs the room: eviction drops the decoded copies of
+packed entries (oldest first; the newest ``_HOT_FLOOR_FRACTION`` of the
+budget, pinned ones and ones used in the last ``_HOT_RECENT_S`` kept) before
+it removes renders.  ``get_cached`` of a packed entry without its decoded
+copy decodes it back to ``<key>.wav`` first, so every consumer keeps reading
+a plain WAV (``open_cached_audio`` pins it for the reader); ``unpacking``
+hands the web stream the decode while it is written (first bytes in
+~35 ms).  The budget counts the bytes on disk (pack + decoded copy).  Code
+that predates packed entries adopts only ``*.wav``: it sees a packed-only
+entry as a miss and renders it again (it neither counts nor clears the
+packs); a reader that finds another version of the header drops the file (a
+miss, never garbage).
 """
 from __future__ import annotations
 
@@ -25,16 +50,22 @@ import hashlib
 import itertools
 import logging
 import os
+import re
+import secrets
 import shutil
+import struct
+import sys
 import threading
 import time
 import weakref
+import zlib
 from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import HTTPException
 
 from soniqboom.config import get_conversion_cache_dir, settings
+from soniqboom.core import render_options as _render_options
 # Aliased: this module already defines a public ``async def cache_stats()``
 # (imported by main.py / admin.py).  Without the alias that function shadows
 # this telemetry module at module scope, so ``cache_stats.miss`` resolves to
@@ -229,7 +260,14 @@ _pin_refs: dict[str, int] = {}
 _pending_purge: dict[str, str] = {}
 
 # ── In-memory LRU state ────────────────────────────────────────────────────
-_meta: dict[str, dict] = {}      # key → {path, size_bytes, format_type, created_at}
+# key → {path, size_bytes, format_type, created_at} — ``path`` is always the
+# entry's WAV path (``<key>.wav``), whether or not that file exists now;
+# ``size_bytes`` is what the entry holds on disk.  A packed entry also has
+# ``packed`` (True: ``<key>.sbwv`` holds it), ``packed_bytes``, ``hot``
+# (its decoded WAV exists), ``wav_bytes`` (the WAV's size, None until the
+# pack's header was read) and ``wav_mtime_ns``; ``stale`` marks an entry a
+# new store is replacing (a pack or decode of it in progress is dropped).
+_meta: dict[str, dict] = {}
 
 # Expose live entry count to the cache-stats telemetry (cascade viz).
 _cstats.register_size("conversion", lambda: len(_meta))
@@ -258,7 +296,9 @@ _state_lock = threading.RLock()
 # tracker 2: our own float WAV with libopenmpt's end fade, and modules ending
 # in a song-end loop stop where it first repeats (a 65:56 render of a 5:02
 # tune was played — and its length written back — while it stayed cached);
-# rev 1 was a 16-bit 44.1 kHz render that never shipped.
+# rev 1 was a 16-bit 44.1 kHz render that never shipped; 3: each subsong of a
+# module with several is a tune of its own — tune 0 (``sub0``) is its first
+# subsong, where it was every subsong played one after another.
 # adlib / imf 1: rendered at the OPL chip's own 49,716 Hz and resampled
 # (``stream._adlib_cmd``), not interpolated to 44.1 kHz by the emulator; 2:
 # without the header sizes adplay writes after the audio into a pipe (a click
@@ -269,7 +309,7 @@ _state_lock = threading.RLock()
 # the wrong player (a silent ``.soc``) or nothing usable; 2: Hippel COSO songs
 # played with their shared instrument file (``rip_repairs.coso_with_bank``) —
 # an older render played whatever followed the song as its instruments.
-_RENDER_REVS = {"sndh": 2, "gme": 3, "psf": 1, "tracker": 2, "adlib": 2, "imf": 2,
+_RENDER_REVS = {"sndh": 2, "gme": 3, "psf": 1, "tracker": 3, "adlib": 2, "imf": 2,
                 "uade": 2}
 
 
@@ -283,6 +323,7 @@ def _cache_key(
     target_rate: int | None = None,
     bitrate: int | None = None,
     variant: str | None = None,
+    tuned: bool = False,
 ) -> str:
     """Build the cache key.  ``duration`` overrides the SID default so a
     HVSC-supplied per-tune length yields a distinct key — without this
@@ -298,7 +339,10 @@ def _cache_key(
     a RENDERED WAV — which subsong / length it came from) also yield
     distinct entries; both append nothing when unset, so existing keys are
     unchanged.  For the subsong-carrying render types ``variant`` marks
-    another render of the same tune index (uade's subsong base)."""
+    another render of the same tune index (uade's subsong base).  ``tuned``
+    (``psf`` only): a multi-tune file the PSF route plays tune by tune
+    (GoatTracker, FamiTracker — ``stream._psf_tuned``) is keyed per tune,
+    ``sub{N}`` as the subsong-carrying types are."""
     parts = [track_id]
     if format_type == "sid":
         parts.append(f"sub{subsong}")
@@ -319,6 +363,13 @@ def _cache_key(
             parts.append(f"fc{_curve:g}")
         if getattr(settings, "sid_digiboost", False):
             parts.append("db")
+        # A fade over the end of the length (``render_options.sid_fade_s``),
+        # and a tune for two or three SID chips rendered in stereo
+        # (``variant`` "st", ``stream._sid_key_variant``): other renders than
+        # the mono, unfaded one the key named before 2.3.0.
+        parts.extend(_render_options.sid_key_parts())
+        if variant:
+            parts.append(variant)
     elif format_type == "midi":
         sf_hash = hashlib.sha256((soundfont_path or "").encode()).hexdigest()[:8]
         parts.append(f"sf{sf_hash}")
@@ -346,9 +397,21 @@ def _cache_key(
             # index holds the wrong tune.  Unset for everything else, so
             # existing keys are unchanged.
             parts.append(f"v{variant}")
+        # Render options in force (``core/render_options``): a tracker's Amiga
+        # resampler and loop count / fade, a libgme / kssrender tune's loop
+        # count / fade.  Nothing at "off" / the default endings.
+        if format_type == "tracker":
+            parts.extend(_render_options.tracker_key_parts())
+        elif format_type == "gme":
+            parts.extend(_render_options.chip_key_parts())
+        elif format_type == "uade":
+            # Paula's stereo since 2.3.0 (``render_options.UADE_STEREO_ARGS``)
+            parts.append(_render_options.UADE_KEY_PART)
     elif format_type in _RENDER_REVS:
         # A render without subsongs (PSF: one tune per rip) under a revision:
         # PSF rips stopped at their length tag before their fade was played.
+        if tuned:
+            parts.append(f"sub{subsong}")
         parts.append(f"r{_RENDER_REVS[format_type]}")
         if variant:
             # Another renderer's render of the rip (a Dreamcast DSF through
@@ -393,6 +456,8 @@ def sid_warm_eligible() -> bool:
         return False
     if getattr(settings, "sid_digiboost", False):
         return False
+    if _render_options.sid_key_parts():
+        return False           # (the WASM core renders no fade)
     return True
 
 
@@ -484,6 +549,11 @@ def get_vu_sidecar_path(track_id: str, subsong: int = 0,
                 # so match on the "<track_id>__sub<N>__" prefix — the trailing
                 # "__" keeps sub1 from also matching sub10/sub12.
                 if not cache_key.startswith(want_sid_prefix):
+                    continue
+            elif fmt in ("gme", "adlib", "imf"):
+                # libgme / AdLib renders get VU from api/voices.py (their
+                # libgme render's key only — a KSS kssrender played is not).
+                if cache_key != _cache_key(track_id, fmt, int(subsong)):
                     continue
             else:
                 continue
@@ -607,38 +677,1063 @@ def _wav_is_whole(path: Path, size: int) -> bool:
     return dlen == 0xFFFFFFFF or off + dlen <= size
 
 
+# ── Packed entries (WavPack, cache entry format v1) ─────────────────────────
+# See the module docstring.  ``<key>.sbwv`` = header (``_PACK_HEAD`` + its
+# CRC-32) + the WAV's bytes before its audio + its bytes after it (none for a
+# render: only WAVs whose ``data`` chunk ends the file are packed) + the
+# WavPack stream of the audio.  Any change to that layout takes a new
+# ``PACK_VERSION``: a reader drops a file of a version it doesn't know.
+PACK_SUFFIX = ".sbwv"
+PACK_VERSION = 1
+_PACK_MAGIC = b"SBWV"
+# magic, version, header length, offset of the WavPack stream, WAV size, data
+# offset (the WAV header bytes kept), data length, trailer length, sample
+# format code (``_RAW_FORMATS``), reserved, channels, rate, MD5 of the audio
+# bytes, the WAV's mtime (ns) — a decoded copy is given it back.
+_PACK_HEAD = struct.Struct("<4sHHIQIQIBBHI16sq")
+_PACK_HEAD_LEN = _PACK_HEAD.size + 4
+_PACK_TMP_SUFFIX = ".packing"
+_UNPACK_TMP_SUFFIX = ".unpacking"
+_RAW_FORMATS = {1: "u8", 2: "s16le", 3: "s24le", 4: "s32le", 5: "f32le"}
+_RAW_CODES = {v: k for k, v in _RAW_FORMATS.items()}
+_RAW_BYTES = {"u8": 1, "s16le": 2, "s24le": 3, "s32le": 4, "f32le": 4}
+# Cached transcodes (FLAC / MP3 / Ogg, the in-flight WAVs of real recordings)
+# are not packed: only renders.
+_UNPACKED_TYPES = frozenset({"transcoded"})
+# A render is packed no sooner than this after it was stored (its first
+# minutes of reads — seeks, VU, waveform, transcodes — find it untouched).
+_PACK_DELAY_S = 30.0
+# ffmpeg's wavpack ``compression_level``: 1 is WavPack's default mode — level
+# 3 ("very high") saved 2 % more on 22 real renders, encoded 5-10× slower and
+# decoded no faster.
+_PACK_LEVEL = 1
+# Under pressure, decoded copies of packed entries go first — except the
+# newest ones up to this fraction of the budget, and any used in the last
+# ``_HOT_RECENT_S`` (a reader may be about to open the path it was given).
+_HOT_FLOOR_FRACTION = 0.10
+_HOT_RECENT_S = 120.0
+_PACK_TIMEOUT_S = 900.0
+# How often a running pack asks whether a render started (``_run_bg``).
+_PREEMPT_POLL_S = 0.025
+_UNPACKABLE_MAX = 100_000
+
+# Called by the packer to ask whether a render is running (``api.stream``
+# sets it: a foreground or background render slot in use) — a pack waits,
+# and one running is stopped, while it says True.
+renders_busy = None
+# Called (blocking) with a float render's WAV path before it is packed —
+# ``api.stream`` sets ``render_peak``, whose ``<wav>.peak`` sidecar must be
+# measured while the WAV is there.
+pack_prepare_hook = None
+
+
+class PackInfo:
+    """A pack's header (``read_pack_info``)."""
+
+    __slots__ = ("wv_offset", "wav_size", "data_off", "data_len", "raw", "channels",
+                 "rate", "md5", "mtime_ns", "prefix", "suffix")
+
+    def __init__(self, *, wv_offset: int, wav_size: int, data_off: int, data_len: int,
+                 raw: str, channels: int, rate: int, md5: str, mtime_ns: int,
+                 prefix: bytes = b"", suffix: bytes = b"") -> None:
+        self.wv_offset, self.wav_size = int(wv_offset), int(wav_size)
+        self.data_off, self.data_len = int(data_off), int(data_len)
+        self.raw, self.channels, self.rate = raw, int(channels), int(rate)
+        self.md5, self.mtime_ns = md5, int(mtime_ns)
+        self.prefix, self.suffix = prefix, suffix
+
+
+class _PackError(RuntimeError):
+    pass
+
+
+class _PackTimeout(_PackError):
+    """A pack step ran past ``_PACK_TIMEOUT_S`` (the entry is not tried again
+    this run)."""
+
+
+def _pack_header(info: PackInfo) -> bytes:
+    fields = _PACK_HEAD.pack(
+        _PACK_MAGIC, PACK_VERSION, _PACK_HEAD_LEN, info.wv_offset, info.wav_size,
+        info.data_off, info.data_len, len(info.suffix), _RAW_CODES[info.raw], 0,
+        info.channels, info.rate, bytes.fromhex(info.md5) if info.md5 else b"\0" * 16,
+        info.mtime_ns)
+    return fields + zlib.crc32(fields).to_bytes(4, "little")
+
+
+def read_pack_info(path: "Path | str") -> "PackInfo | None":
+    """The header of the pack at ``path`` with the WAV bytes it keeps, or
+    None when it is missing, damaged (short, a CRC mismatch) or of another
+    ``PACK_VERSION`` — what a reader drops.  Any other read error (a share
+    that didn't answer) raises ``OSError``: the pack may be fine (blocking)."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_PACK_HEAD_LEN)
+            if len(head) < _PACK_HEAD_LEN:
+                return None
+            fields = head[:_PACK_HEAD.size]
+            if zlib.crc32(fields) != int.from_bytes(head[_PACK_HEAD.size:], "little"):
+                return None
+            (magic, version, head_len, wv_off, wav_size, data_off, data_len, suffix_len,
+             code, _res, channels, rate, md5, mtime_ns) = _PACK_HEAD.unpack(fields)
+            raw = _RAW_FORMATS.get(code)
+            if (magic != _PACK_MAGIC or version != PACK_VERSION or head_len != _PACK_HEAD_LEN
+                    or raw is None or channels < 1 or rate < 1
+                    or data_off + data_len + suffix_len != wav_size
+                    or wv_off != head_len + data_off + suffix_len):
+                return None
+            prefix = fh.read(data_off)
+            suffix = fh.read(suffix_len)
+            if len(prefix) != data_off or len(suffix) != suffix_len:
+                return None
+    except FileNotFoundError:
+        return None
+    return PackInfo(wv_offset=wv_off, wav_size=wav_size, data_off=data_off,
+                    data_len=data_len, raw=raw, channels=channels, rate=rate,
+                    md5=md5.hex(), mtime_ns=mtime_ns, prefix=prefix, suffix=suffix)
+
+
+def _pack_layout(path: Path) -> "tuple[int, int, str, int, int] | None":
+    """``(data offset, data length, raw format, channels, rate)`` of a WAV
+    whose audio a pack stores bit for bit — integer PCM of 8/16/24/32 bits or
+    32-bit float, its ``data`` chunk ending the file exactly (no trailer, no
+    streaming size) — else None: it stays a plain WAV.  Blocking."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos, fmt = 12, None
+    while pos + 8 <= len(head):
+        cid = head[pos:pos + 4]
+        clen = int.from_bytes(head[pos + 4:pos + 8], "little")
+        body = pos + 8
+        if cid == b"fmt " and clen >= 16 and body + 16 <= len(head):
+            tag, ch, rate, _bps, align, bits = struct.unpack_from("<HHIIHH", head, body)
+            if tag == 0xFFFE and clen >= 40 and body + 26 <= len(head):
+                tag = int.from_bytes(head[body + 24:body + 26], "little")
+            fmt = (tag, ch, rate, align, bits)
+        elif cid == b"data":
+            if fmt is None:
+                return None
+            tag, ch, rate, align, bits = fmt
+            raw = {(1, 8): "u8", (1, 16): "s16le", (1, 24): "s24le",
+                   (1, 32): "s32le", (3, 32): "f32le"}.get((tag, bits))
+            if (raw is None or not 1 <= ch <= 8 or not 1000 <= rate <= 768_000
+                    or align != ch * bits // 8 or clen <= 0
+                    or body + clen != size or clen % align):
+                return None
+            return body, clen, raw, ch, rate
+        pos = body + clen + (clen & 1)
+    return None
+
+
+def _ffmpeg() -> str:
+    return settings.ffmpeg_path or "ffmpeg"
+
+
+_WV_CODEC_OK: "dict[str, bool]" = {}
+
+
+def wavpack_available() -> bool:
+    """Does the ffmpeg in use have what packs need — the wavpack encoder and
+    decoder, the ``wv`` muxer and demuxer, the ``md5`` muxer?  Probed once
+    per binary (a changed ``ffmpeg_path`` is probed again; blocking)."""
+    ff = _ffmpeg()
+    got = _WV_CODEC_OK.get(ff)
+    if got is None:
+        import subprocess
+        from soniqboom.core import forksafe
+        codec = re.compile(rb"^\s*A\S*\s+wavpack\s", re.M)
+        try:
+            out = {k: forksafe.run([ff, "-hide_banner", "-" + k], capture_output=True,
+                                   timeout=20).stdout or b""
+                   for k in ("encoders", "decoders", "muxers", "demuxers")}
+            got = (bool(codec.search(out["encoders"])) and bool(codec.search(out["decoders"]))
+                   and bool(re.search(rb"^\s*D?E\s+wv\s", out["muxers"], re.M))
+                   and bool(re.search(rb"^\s*DE?\s+wv\s", out["demuxers"], re.M))
+                   and bool(re.search(rb"^\s*D?E\s+md5\s", out["muxers"], re.M)))
+        except (OSError, subprocess.SubprocessError):
+            got = False
+        if not got:
+            log.info("Conversion cache: %s has no wavpack codec — renders stay "
+                     "uncompressed", ff)
+        _WV_CODEC_OK[ff] = got
+    return got
+
+
+_BG_PREFIX: "list[str] | None" = None
+
+
+def _background_prefix() -> "list[str]":
+    """The command prefix that runs a pack's ffmpeg at the lowest priority:
+    macOS ``taskpolicy -b`` (background: efficiency cores, throttled I/O),
+    elsewhere ``ionice -c 3`` (idle I/O) and ``nice -n 19`` — each only when
+    it runs here.  Probed once (blocking)."""
+    global _BG_PREFIX
+    if _BG_PREFIX is not None:
+        return _BG_PREFIX
+    from soniqboom.core import forksafe
+    true = shutil.which("true") or "/usr/bin/true"
+
+    def _works(pre: "list[str]") -> bool:
+        try:
+            return forksafe.run(pre + [true], capture_output=True, timeout=10).returncode == 0
+        except Exception:                               # noqa: BLE001
+            return False
+    pre: "list[str]" = []
+    if sys.platform == "darwin" and os.path.exists("/usr/sbin/taskpolicy") \
+            and _works(["/usr/sbin/taskpolicy", "-b"]):
+        pre = ["/usr/sbin/taskpolicy", "-b"]
+    else:
+        ion = shutil.which("ionice")
+        if ion and _works([ion, "-c", "3"]):
+            pre += [ion, "-c", "3"]
+        nic = shutil.which("nice")
+        if nic and _works([nic, "-n", "19"]):
+            pre += [nic, "-n", "19"]
+    _BG_PREFIX = pre
+    return pre
+
+
+def _hot(entry: dict) -> bool:
+    """Is the entry's WAV on disk?  (Every entry but a packed one whose
+    decoded copy was dropped.)"""
+    return entry.get("hot", True)
+
+
+def _wav_size_of(entry: dict) -> int:
+    wb = entry.get("wav_bytes")
+    if wb is not None:
+        return int(wb)
+    return 0 if entry.get("packed") else int(entry.get("size_bytes", 0) or 0)
+
+
+def _entry_size(entry: dict) -> int:
+    """The bytes ``entry`` holds on disk: its pack and/or its WAV."""
+    n = int(entry.get("packed_bytes") or 0) if entry.get("packed") else 0
+    return n + (_wav_size_of(entry) if _hot(entry) else 0)
+
+
+def _resize_locked(entry: dict) -> None:
+    """(``_state_lock`` held) Re-count ``entry`` after its files changed."""
+    global _total_bytes
+    new = _entry_size(entry)
+    _total_bytes = max(0, _total_bytes + new - int(entry.get("size_bytes", 0) or 0))
+    entry["size_bytes"] = new
+
+
+# key → set once the decoded copy dropped for it has been unlinked: a decode
+# of that key finishing meanwhile waits for it (``_commit_unpack``), so the
+# late unlink never removes the new copy.  Under ``_state_lock``.
+_drops_pending: "dict[str, threading.Event]" = {}
+
+
+def _drop_hot_locked(entry: dict, key: "str | None" = None) -> "Path | None":
+    """(``_state_lock`` held) Forget a packed entry's decoded WAV; returns
+    the file to unlink outside the lock — then call ``_dropped(key)``.
+    Without ``key`` the file is already gone (nothing to unlink)."""
+    if not entry.get("packed") or not _hot(entry):
+        return None
+    entry["hot"] = False
+    _resize_locked(entry)
+    if key is not None:
+        _drops_pending[key] = threading.Event()
+    return Path(entry["path"])
+
+
+def _unlink_dropped(drops: "list[tuple[str, Path]]") -> None:
+    """Unlink decoded copies ``_drop_hot_locked`` dropped, each then marked
+    done (a decode of its key waiting in ``_commit_unpack`` goes on)."""
+    for key, p in drops:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        with _state_lock:
+            ev = _drops_pending.pop(key, None)
+        if ev is not None:
+            ev.set()
+
+
+def cached_wav_size(cache_key: str) -> "int | None":
+    """Size of the WAV a finished entry serves, without touching its LRU
+    position or the disk (a packed one's decoded size); None when not cached
+    or not known yet (a packed entry whose header the background pass after
+    start-up hasn't read)."""
+    with _state_lock:
+        e = _meta.get(cache_key)
+        if not e:
+            return None
+        n = _wav_size_of(e)
+    return n or None
+
+
+def packed_wav_stat(wav_path: "Path | str") -> "tuple[int, int] | None":
+    """``(size, mtime_ns)`` the WAV at ``wav_path`` has when decoded, for a
+    packed entry whose decoded copy isn't on disk now — what a sidecar tied to
+    the WAV (``<wav>.peak``) is judged against; None otherwise.  A pack whose
+    header start-up hasn't read yet is read here (blocking: a thread)."""
+    p = Path(wav_path)
+    with _state_lock:
+        e = _meta.get(p.stem)
+        if not e or not e.get("packed") or _hot(e) or e.get("path") != str(p):
+            return None
+        if e.get("wav_bytes") is not None and e.get("wav_mtime_ns") is not None:
+            return int(e["wav_bytes"]), int(e["wav_mtime_ns"])
+    try:
+        info = read_pack_info(p.with_suffix(PACK_SUFFIX))
+    except OSError:
+        return None
+    if info is None:
+        return None
+    _note_pack_info(e, info)
+    return info.wav_size, info.mtime_ns
+
+
+def is_packed(cache_key: str) -> bool:
+    """Is ``cache_key`` cached as a pack (with or without its decoded copy)?"""
+    with _state_lock:
+        e = _meta.get(cache_key)
+        return bool(e and e.get("packed"))
+
+
+# ── Decoding a packed entry back to its WAV ─────────────────────────────────
+
+class _Unpack:
+    """A packed entry being decoded back to ``<key>.wav`` (``_run_unpack``):
+    into ``tmp`` (``ready`` once it holds the WAV's header and ffmpeg runs),
+    ``data`` pulsed as it grows, ``done`` at the end — ``ok`` when the entry's
+    decoded copy is in place."""
+
+    __slots__ = ("key", "entry", "tmp", "size", "ready", "done", "data", "ok", "live", "task")
+
+    def __init__(self, key: str, entry: dict) -> None:
+        self.key, self.entry = key, entry
+        self.tmp: "Path | None" = None
+        self.size = 0
+        self.ok = False
+        self.ready, self.done, self.data = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        # The ``inflight`` a growing-file response of ``tmp`` reads: a decode
+        # that failed part-way ends the body short (never silence).
+        self.live = {"no_pad_on_failure": True, "clean_exit": None,
+                     "bytes_per_sec": 176_400}
+        self.task: "asyncio.Task | None" = None
+
+    def pulse(self) -> None:
+        self.data.set()
+        self.data.clear()
+
+
+_unpacks: "dict[str, _Unpack]" = {}
+_unpack_tasks: "set[asyncio.Task]" = set()
+
+
+def _start_unpack(cache_key: str) -> "_Unpack | None":
+    """The decode of packed entry ``cache_key`` — the one under way, else a
+    new one — or None when the entry isn't a pack without its decoded copy.
+    Event loop only."""
+    u = _unpacks.get(cache_key)
+    if u is not None and not u.done.is_set():
+        t = u.task
+        try:
+            same_loop = t is not None and not t.done() and t.get_loop() is asyncio.get_running_loop()
+        except RuntimeError:
+            same_loop = False
+        if same_loop:
+            return u
+    with _state_lock:
+        entry = _meta.get(cache_key)
+        if (entry is None or not entry.get("packed") or _hot(entry)
+                or entry.get("stale")):
+            return None
+    u = _Unpack(cache_key, entry)
+    _unpacks[cache_key] = u
+    u.task = asyncio.ensure_future(_run_unpack(u))
+    _unpack_tasks.add(u.task)
+    u.task.add_done_callback(_unpack_tasks.discard)
+    return u
+
+
+def _open_new_file(tmp: Path, head: bytes) -> int:
+    """A new file ``tmp`` holding ``head``, open for appending (blocking)."""
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o600)
+    try:
+        view = memoryview(head)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+    except BaseException:
+        os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    return fd
+
+
+def _note_pack_info(entry: dict, info: PackInfo) -> None:
+    with _state_lock:
+        if entry.get("wav_bytes") is None:
+            entry["wav_bytes"] = info.wav_size
+        if entry.get("wav_mtime_ns") is None:
+            entry["wav_mtime_ns"] = info.mtime_ns
+
+
+def _commit_unpack(u: _Unpack, tmp: Path, dest: Path, info: PackInfo) -> bool:
+    """Put the finished decode ``tmp`` in place as the entry's WAV — with the
+    original's mtime, so sidecars tied to it stay valid and start-up tells it
+    from a later render — unless the entry went or is being replaced
+    meanwhile.  A decoded copy of the key dropped a moment ago and not yet
+    unlinked is waited for first (its unlink would remove this one).  The
+    rename runs under ``_state_lock`` (a same-folder rename): the check that
+    no new render replaced the entry and the rename are one step (blocking)."""
+    try:
+        os.utime(tmp, ns=(time.time_ns(), info.mtime_ns))
+    except OSError:
+        pass
+    ok = False
+    deadline = time.monotonic() + 10.0
+    while True:
+        with _state_lock:
+            ev = _drops_pending.get(u.key)
+            if ev is None:
+                cur = _meta.get(u.key)
+                if (cur is u.entry and not cur.get("stale") and cur.get("packed")
+                        and not _hot(cur)):
+                    try:
+                        os.replace(str(tmp), str(dest))
+                        ok = True
+                    except OSError:
+                        ok = False
+                    if ok:
+                        cur["hot"] = True
+                        cur["wav_bytes"] = info.wav_size
+                        cur["wav_mtime_ns"] = info.mtime_ns
+                        _resize_locked(cur)
+                break
+        if time.monotonic() > deadline:
+            break
+        ev.wait(0.2)
+    if not ok:
+        tmp.unlink(missing_ok=True)
+    return ok
+
+
+async def _run_unpack(u: _Unpack) -> None:
+    """Decode ``u``'s pack into a temp file beside its WAV (header bytes
+    first, then ffmpeg's output, with block CRCs checked and any error
+    fatal), then move it into place.  A damaged pack is dropped with its
+    entry (the next play renders the tune again)."""
+    from soniqboom.core import forksafe, playback_io
+    import subprocess
+    dest = Path(u.entry["path"])
+    pack = dest.with_suffix(PACK_SUFFIX)
+    mk = playback_io.mount_key(dest)
+    fd, proc, damaged = -1, None, False
+    try:
+        info = await playback_io.run(mk, read_pack_info, pack)
+        if info is None:
+            damaged = True
+            raise _PackError("its header is unreadable")
+        _note_pack_info(u.entry, info)
+        u.size = info.wav_size
+        u.live["bytes_per_sec"] = max(1, info.rate * info.channels * _RAW_BYTES[info.raw])
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.{secrets.token_hex(4)}"
+                             f"{_UNPACK_TMP_SUFFIX}")
+        fd = await playback_io.run(mk, _open_new_file, tmp, info.prefix)
+        u.tmp = tmp
+        proc = await forksafe.spawn(
+            _ffmpeg(), "-v", "error", "-nostdin", "-threads", "0",
+            "-err_detect", "crccheck", "-xerror",
+            "-skip_initial_bytes", str(info.wv_offset), "-f", "wv", "-i", str(pack),
+            "-f", info.raw, "-c:a", "pcm_" + info.raw, "pipe:1",
+            stdin=subprocess.DEVNULL, stdout=fd, stderr=asyncio.subprocess.PIPE)
+        u.ready.set()
+        err_f = asyncio.ensure_future(proc.stderr.read())
+        wait_f = asyncio.ensure_future(proc.wait())
+        seen = len(info.prefix)
+        while True:
+            finished, _ = await asyncio.wait({wait_f}, timeout=0.01)
+            size = (await playback_io.run(mk, os.fstat, fd)).st_size
+            if size > seen:
+                seen = size
+                u.pulse()
+            if finished:
+                break
+        rc = wait_f.result()
+        err = await err_f
+        if rc != 0:
+            damaged = b"Invalid data" in err
+            raise _PackError(f"ffmpeg exited {rc}: {err[-300:].decode('utf-8', 'replace')}")
+        if info.suffix:
+            await playback_io.run(mk, os.write, fd, info.suffix)
+        size = (await playback_io.run(mk, os.fstat, fd)).st_size
+        if size != info.wav_size:
+            damaged = True
+            raise _PackError(f"decoded {size} bytes, the WAV had {info.wav_size}")
+        fd_, fd = fd, -1
+        await playback_io.run(mk, os.close, fd_)
+        u.ok = await playback_io.run(mk, _commit_unpack, u, tmp, dest, info)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:                            # noqa: BLE001
+        # (a read error that isn't damage — a share that didn't answer — keeps
+        # the pack: the next hit tries again)
+        log.warning("Conversion cache: decoding the packed render %s failed: %s",
+                    u.key, exc)
+        if damaged:
+            await asyncio.to_thread(_purge_entry, u.key, u.entry)
+    finally:
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if not u.ok and u.tmp is not None:
+            with contextlib.suppress(OSError):
+                u.tmp.unlink(missing_ok=True)
+        u.live["clean_exit"] = u.ok
+        u.ready.set()
+        u.done.set()
+        u.pulse()
+        if _unpacks.get(u.key) is u:
+            _unpacks.pop(u.key, None)
+    if u.ok:
+        await asyncio.to_thread(_maybe_evict, u.key)
+
+
+async def unpacking(cache_key: str) -> "_Unpack | None":
+    """For a streaming reader of the render ``cache_key``: the decode of its
+    pack while it is written (started here; ``tmp`` grows to ``size`` bytes,
+    ``data`` pulses, ``done`` ends it, ``live`` is the growing-file
+    response's ``inflight``) — or None when the entry isn't a pack without its
+    decoded copy, or the decode has already ended (read the cache as usual:
+    ``get_cached``).  Counts as a hit."""
+    u = _start_unpack(cache_key)
+    if u is None:
+        return None
+    with _state_lock:
+        if cache_key in _meta:
+            _lru[cache_key] = time.time()
+            _lru.move_to_end(cache_key)
+    _cstats.hit("conversion")
+    await u.ready.wait()
+    if u.done.is_set() or u.tmp is None:
+        return None
+    return u
+
+
+@contextlib.asynccontextmanager
+async def open_cached_audio(cache_key: str):
+    """``async with open_cached_audio(key) as wav:`` — the finished render of
+    ``key`` as a plain WAV path (a packed entry decoded first), pinned for the
+    block (never evicted, its decoded copy never dropped meanwhile); None
+    when it isn't cached.  For code that reads a cached render's audio
+    (loudness, waveform, VU, a transcode)."""
+    hold = PinHold(cache_key)
+    try:
+        yield await get_cached(cache_key)
+    finally:
+        hold.release()
+
+
+# ── Packing ──────────────────────────────────────────────────────────────────
+
+# key → when it may be packed (wall clock): renders stored this run and those
+# adopted at start-up still as WAV.  Under ``_state_lock``.
+_pack_queue: "OrderedDict[str, float]" = OrderedDict()
+# Keys whose WAV can't be packed (another layout, not bit-exact): not tried
+# again this run.
+_unpackable: "set[str]" = set()
+_packer_task: "asyncio.Task | None" = None
+
+
+def _queue_pack(cache_key: str, delay: float = _PACK_DELAY_S) -> None:
+    with _state_lock:
+        if cache_key in _unpackable:
+            return
+        _pack_queue[cache_key] = time.time() + delay
+        _pack_queue.move_to_end(cache_key)
+
+
+def _mark_unpackable(cache_key: str) -> None:
+    with _state_lock:
+        if len(_unpackable) >= _UNPACKABLE_MAX:
+            _unpackable.clear()
+        _unpackable.add(cache_key)
+        _pack_queue.pop(cache_key, None)
+
+
+def _busy() -> bool:
+    """Is a render (or a decode for a listener) running?  Packs wait."""
+    if _inflight or _unpacks:
+        return True
+    hook = renders_busy
+    if hook is not None:
+        try:
+            return bool(hook())
+        except Exception:                               # noqa: BLE001
+            return True
+    return False
+
+
+async def _run_bg(cmd: "list[str]", *, stdin, stdout, preempt) -> "tuple[int | None, bytes, bytes]":
+    """Run ``cmd`` (a pack step); ``(returncode, stdout, stderr)`` —
+    returncode None when ``preempt()`` asked it to stop (checked before it
+    starts and every ``_PREEMPT_POLL_S``): it was killed.  Past
+    ``_PACK_TIMEOUT_S`` it is killed and ``_PackTimeout`` raised."""
+    from soniqboom.core import forksafe
+    if preempt is not None and preempt():
+        return None, b"", b""                # a render started: not now
+    proc = await forksafe.spawn(*cmd, stdin=stdin, stdout=stdout,
+                                stderr=asyncio.subprocess.PIPE)
+    comm = asyncio.ensure_future(proc.communicate())
+    deadline = time.monotonic() + _PACK_TIMEOUT_S
+    try:
+        while True:
+            finished, _ = await asyncio.wait({comm}, timeout=_PREEMPT_POLL_S)
+            if finished:
+                out, err = comm.result()
+                return proc.returncode, out or b"", err or b""
+            late = time.monotonic() > deadline
+            if late or (preempt is not None and preempt()):
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await comm
+                if late:
+                    raise _PackTimeout(f"still running after {_PACK_TIMEOUT_S:.0f} s")
+                return None, b"", b""
+    except BaseException:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
+        raise
+
+
+def _pack_prepare(cache_key: str, wav: Path):
+    """What packing ``wav`` needs: ``(layout, stat, WAV header bytes)``;
+    "silent" for a silent render; None when it can't be packed (blocking)."""
+    lay = _pack_layout(wav)
+    if lay is None:
+        return None
+    try:
+        st = wav.stat()
+        with open(wav, "rb") as fh:
+            prefix = fh.read(lay[0])
+    except OSError:
+        return None
+    if len(prefix) != lay[0]:
+        return None
+    # A render cached before silent ones were refused may be silence: it is
+    # judged here (a packed entry's first hit isn't judged again this run).
+    if cache_key not in _judged:
+        from soniqboom.core.silence import wav_audible
+        try:
+            if wav_audible(wav) is False:
+                return "silent"
+        except Exception:                               # noqa: BLE001
+            pass
+    if lay[2] == "f32le" and pack_prepare_hook is not None:
+        try:
+            pack_prepare_hook(wav)
+        except Exception:                               # noqa: BLE001
+            log.debug("pack: peak of %s not measured", wav, exc_info=True)
+    return lay, st, prefix
+
+
+def _finish_pack_file(tmp: Path, header: bytes) -> int:
+    """Write the pack's final header and flush it to disk (the WAV may be
+    dropped later on the strength of it; blocking)."""
+    fd = os.open(str(tmp), os.O_WRONLY)
+    try:
+        os.pwrite(fd, header, 0)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return tmp.stat().st_size
+
+
+def _commit_pack(cache_key: str, entry: dict, tmp: Path, wav: Path, st) -> bool:
+    """Put the verified pack ``tmp`` in place for ``entry`` — unless the entry
+    went, is being replaced, or its WAV changed since it was read.  The file
+    work runs outside ``_state_lock`` (only this packer writes ``<key>.sbwv``;
+    a store replacing the entry marks it ``stale`` first and removes the old
+    pack, so a pack renamed in for a replaced entry is removed here; blocking)."""
+    dest = wav.with_suffix(PACK_SUFFIX)
+    try:
+        now = os.stat(wav)
+        if (now.st_size, now.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+            return False
+        with _state_lock:
+            cur = _meta.get(cache_key)
+            if cur is not entry or cur.get("stale") or cur.get("packed"):
+                return False
+        os.replace(str(tmp), str(dest))
+        packed_bytes = dest.stat().st_size
+    except OSError:
+        return False
+    with _state_lock:
+        cur = _meta.get(cache_key)
+        ok = cur is entry and not cur.get("stale") and not cur.get("packed")
+        if ok:
+            cur.update(packed=True, packed_bytes=packed_bytes, hot=True,
+                       wav_bytes=st.st_size, wav_mtime_ns=st.st_mtime_ns)
+            _resize_locked(cur)
+            if len(_judged) >= _JUDGED_MAX:
+                _judged.clear()
+            _judged.add(cache_key)
+        _pack_queue.pop(cache_key, None)
+        replaced = cur is not entry or bool(cur and cur.get("stale"))
+    if not ok and replaced:
+        with contextlib.suppress(OSError):
+            dest.unlink(missing_ok=True)
+    return ok
+
+
+async def _pack(cache_key: str, preempt) -> str:
+    """Pack one entry: "packed", "retry" (stopped for a render), "later"
+    (a file error — a full disk, say), "nocodec" (this ffmpeg can't) or
+    "skip" (nothing to do, or it can't be packed)."""
+    with _state_lock:
+        entry = _meta.get(cache_key)
+        if (entry is None or entry.get("packed") or entry.get("stale")
+                or not _hot(entry) or entry.get("format_type") in _UNPACKED_TYPES
+                or cache_key in _unpackable):
+            _pack_queue.pop(cache_key, None)
+            return "skip"
+        wav = Path(entry["path"])
+    if not getattr(settings, "conversion_cache_pack", True):
+        return "skip"
+    if not await asyncio.to_thread(wavpack_available):
+        return "nocodec"
+    prep = await asyncio.to_thread(_pack_prepare, cache_key, wav)
+    if prep == "silent":
+        await asyncio.to_thread(_purge_entry, cache_key)
+        with contextlib.suppress(OSError):
+            wav.with_suffix(".vu").unlink(missing_ok=True)
+        log.info("Cached render %s is silent — removed, it renders again", cache_key)
+        return "skip"
+    if prep is None:
+        _mark_unpackable(cache_key)
+        return "skip"
+    (data_off, data_len, raw, channels, rate), st, prefix = prep
+    info = PackInfo(wv_offset=_PACK_HEAD_LEN + data_off, wav_size=st.st_size,
+                    data_off=data_off, data_len=data_len, raw=raw, channels=channels,
+                    rate=rate, md5="", mtime_ns=st.st_mtime_ns, prefix=prefix)
+    tmp = wav.with_name(f".{wav.stem}{PACK_SUFFIX}.{os.getpid()}.{secrets.token_hex(4)}"
+                        f"{_PACK_TMP_SUFFIX}")
+    pre = await asyncio.to_thread(_background_prefix)
+    ff = _ffmpeg()
+    in_fd = out_fd = -1
+    t0 = time.monotonic()
+    try:
+        out_fd = await asyncio.to_thread(_open_new_file, tmp, _pack_header(info) + prefix)
+
+        def _open_audio() -> int:
+            fd = os.open(str(wav), os.O_RDONLY)
+            os.lseek(fd, data_off, os.SEEK_SET)
+            return fd
+        in_fd = await asyncio.to_thread(_open_audio)
+        # One read of the audio: the WavPack stream (into the pack after our
+        # header) and the MD5 of the audio as read (on stderr).
+        rc, _out, err = await _run_bg(
+            [*pre, ff, "-v", "error", "-nostdin", "-threads", "1",
+             "-f", raw, "-ar", str(rate), "-ac", str(channels), "-i", "pipe:0",
+             "-map", "0:a", "-c:a", "wavpack", "-compression_level", str(_PACK_LEVEL),
+             "-f", "wv", "pipe:1",
+             "-map", "0:a", "-c:a", "pcm_" + raw, "-f", "md5", "pipe:2"],
+            stdin=in_fd, stdout=out_fd, preempt=preempt)
+        fds, in_fd, out_fd = (in_fd, out_fd), -1, -1
+        await asyncio.to_thread(_close_all, fds)
+        if rc is None:
+            return "retry"
+        m = re.search(rb"MD5=([0-9a-f]{32})", err)
+        if rc != 0 or m is None:
+            raise _PackError(f"encode exited {rc}: {err[-300:].decode('utf-8', 'replace')}")
+        want = m.group(1).decode()
+        # The proof: the pack decodes (block CRCs checked) to the same audio.
+        rc, out, err = await _run_bg(
+            [*pre, ff, "-v", "error", "-nostdin", "-threads", "1",
+             "-err_detect", "crccheck", "-xerror",
+             "-skip_initial_bytes", str(info.wv_offset), "-f", "wv", "-i", str(tmp),
+             "-f", "md5", "-c:a", "pcm_" + raw, "pipe:1"],
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+            preempt=preempt)
+        if rc is None:
+            return "retry"
+        m = re.search(rb"MD5=([0-9a-f]{32})", out)
+        if rc != 0 or m is None or m.group(1).decode() != want:
+            log.warning("Conversion cache: the pack of %s did not decode to the same "
+                        "audio — kept as WAV", cache_key)
+            _mark_unpackable(cache_key)
+            return "skip"
+        info.md5 = want
+        await asyncio.to_thread(_finish_pack_file, tmp, _pack_header(info))
+        ok = await asyncio.to_thread(_commit_pack, cache_key, entry, tmp, wav, st)
+        if not ok:
+            return "skip"
+        log.debug("Conversion cache: packed %s (%d → %s bytes, %.2f s)", cache_key,
+                  st.st_size, cached_size(cache_key), time.monotonic() - t0)
+        await asyncio.to_thread(_maybe_evict)
+        return "packed"
+    except _PackError as exc:
+        log.warning("Conversion cache: packing %s failed: %s", cache_key, exc)
+        _mark_unpackable(cache_key)
+        return "skip"
+    except OSError as exc:
+        log.warning("Conversion cache: packing %s failed: %s", cache_key, exc)
+        return "later"
+    finally:
+        left = tuple(fd for fd in (in_fd, out_fd) if fd >= 0)
+        if left:
+            _close_all(left)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def _close_all(fds) -> None:
+    """Close each descriptor once, whatever the others do (blocking)."""
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def cached_size(cache_key: str) -> "int | None":
+    """The bytes ``cache_key`` holds on disk now (None: not cached)."""
+    with _state_lock:
+        e = _meta.get(cache_key)
+        return int(e.get("size_bytes", 0) or 0) if e else None
+
+
+async def pack_entry(cache_key: str, *, preempt=None) -> bool:
+    """Pack the cached render ``cache_key`` now (see the module docstring):
+    True when it is packed.  ffmpeg runs at the lowest priority
+    (``_background_prefix``); ``preempt()``, asked before each step and every
+    ``_PREEMPT_POLL_S`` while one runs, stops it (the entry stays as it was)."""
+    return await _pack(cache_key, preempt) == "packed"
+
+
+def _next_pack_key() -> "str | None":
+    """The queued entry to pack next: of those due, the one nearest the
+    eviction end of the LRU (packing it saves it from eviction), skipping
+    entries a reader holds."""
+    now = time.time()
+    best, best_t = None, None
+    with _state_lock:
+        for k, due in list(_pack_queue.items()):
+            if k not in _meta:
+                _pack_queue.pop(k, None)
+                continue
+            if due > now or _pin_refs.get(k, 0) > 0:
+                continue
+            t = _lru.get(k, 0.0)
+            if best_t is None or t < best_t:
+                best, best_t = k, t
+    return best
+
+
+def _check_adopted_packs() -> int:
+    """Read the header of every pack start-up adopted without reading it:
+    its WAV's size and mtime are filled in; a damaged pack, one of another
+    version, or one whose decoded copy doesn't match it is dropped (its WAV,
+    when there is one, stays as an unpacked entry).  Blocking; returns how
+    many were dropped."""
+    with _state_lock:
+        todo = [(k, e) for k, e in _meta.items() if e.get("packed") and e.get("unchecked")]
+    dropped = 0
+    for key, entry in todo:
+        pack = Path(entry["path"]).with_suffix(PACK_SUFFIX)
+        try:
+            info = read_pack_info(pack)
+        except OSError:
+            continue                    # (not read now: stays unchecked, tried again)
+        drop_pack = remove_entry = False
+        with _state_lock:
+            if _meta.get(key) is not entry:
+                continue
+            entry.pop("unchecked", None)
+            if info is None:
+                if _hot(entry):
+                    drop_pack = True
+                else:
+                    remove_entry = True
+            elif _hot(entry) and int(entry.get("wav_bytes") or -1) != info.wav_size:
+                drop_pack = True        # the WAV is another render: it wins
+            else:
+                entry["wav_bytes"] = info.wav_size
+                entry["wav_mtime_ns"] = info.mtime_ns
+            if drop_pack:
+                entry["packed"] = False
+                entry.pop("packed_bytes", None)
+                entry["wav_mtime_ns"] = None
+                _resize_locked(entry)
+        if remove_entry:
+            _purge_entry(key, entry)
+        if drop_pack or remove_entry:
+            dropped += 1
+            with contextlib.suppress(OSError):
+                pack.unlink(missing_ok=True)
+            if drop_pack:
+                _queue_pack(key, 0.0)
+    if dropped:
+        log.info("Conversion cache: dropped %d unreadable or outdated pack(s)", dropped)
+    return dropped
+
+
+def _any_unchecked() -> bool:
+    with _state_lock:
+        return any(e.get("unchecked") for e in _meta.values())
+
+
+async def _packer_loop() -> None:
+    """The packer: one entry at a time, only while no render runs, stopped
+    (and tried again later) when one starts.  Packs start-up adopted are
+    checked first (again every 10 min while a read of one failed)."""
+    await asyncio.sleep(1.0)
+    next_check = 0.0
+    while True:
+        key = None
+        try:
+            if next_check is not None and time.monotonic() >= next_check:
+                await asyncio.to_thread(_check_adopted_packs)
+                next_check = (time.monotonic() + 600.0
+                              if await asyncio.to_thread(_any_unchecked) else None)
+            if not getattr(settings, "conversion_cache_pack", True):
+                await asyncio.sleep(30.0)
+                continue
+            key = _next_pack_key()
+            if key is None:
+                await asyncio.sleep(2.0)
+                continue
+            if _busy():
+                await asyncio.sleep(1.0)
+                continue
+            got = await _pack(key, _busy)
+            if got == "retry":
+                _queue_pack(key, 10.0)
+            elif got == "later":
+                _queue_pack(key, 600.0)
+            elif got == "nocodec":
+                await asyncio.sleep(300.0)      # (a changed ffmpeg_path is probed again)
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                               # noqa: BLE001
+            log.exception("Conversion cache packer (%s)", key)
+            if key is not None:
+                _mark_unpackable(key)
+            await asyncio.sleep(5.0)
+
+
+def start_packer() -> None:
+    """Start the background packer on the running loop (start-up, after
+    ``warmup_from_disk``; again after an in-process restart).  Idempotent."""
+    global _packer_task
+    loop = asyncio.get_running_loop()
+    t = _packer_task
+    if t is not None and not t.done():
+        try:
+            if t.get_loop() is loop:
+                return
+        except RuntimeError:
+            pass
+    _packer_task = loop.create_task(_packer_loop())
+
+
+def stop_packer() -> None:
+    """Stop the background packer (shutdown): a pack in progress is killed
+    and its temp file removed; the entry stays as it was."""
+    global _packer_task
+    t, _packer_task = _packer_task, None
+    if t is not None and not t.done():
+        t.cancel()
+
+
 # ── Core cache operations ───────────────────────────────────────────────────
 
 async def get_cached(cache_key: str) -> Path | None:
-    """Look up a cache entry; return its disk path or None.
+    """Look up a cache entry; return its disk path (a complete WAV) or None.
 
-    On a hit, updates the LRU timestamp.
+    On a hit, updates the LRU timestamp.  A packed entry without its decoded
+    copy is decoded back to its WAV first (``_run_unpack``; callers arriving
+    meanwhile wait for the same decode).
     Self-heals if the metadata exists but the file is missing on disk.
     """
-    with _state_lock:
-        entry = _meta.get(cache_key)
-        if not entry:
-            _lru.pop(cache_key, None)
-            return None
-        path = Path(entry["path"])
-        fmt = entry.get("format_type") or ""
-    # The file check runs on the playback threads, never on the loop: the
-    # cache may sit on a NAS data dir (``core.playback_io``).
     from soniqboom.core import playback_io
-    exists_now = await playback_io.run(playback_io.mount_key(path), path.exists)
-    if exists_now:
+    for _round in range(3):
         with _state_lock:
-            if cache_key in _meta:
-                _lru[cache_key] = time.time()
-                _lru.move_to_end(cache_key)
+            entry = _meta.get(cache_key)
+            if not entry:
+                _lru.pop(cache_key, None)
+                return None
+            path = Path(entry["path"])
+            fmt = entry.get("format_type") or ""
+            hot = _hot(entry)
+            packed = bool(entry.get("packed"))
+        if not hot:
+            u = _start_unpack(cache_key)
+            if u is None:
+                continue                # decoded meanwhile, or being replaced: look again
+            # A hit: the entry moves to the recent end and is pinned while it
+            # decodes (an old entry sits at the eviction end), so neither it
+            # nor its fresh copy is evicted before this caller has it.
+            with _state_lock:
+                if cache_key in _meta:
+                    _lru[cache_key] = time.time()
+                    _lru.move_to_end(cache_key)
+            hold = PinHold(cache_key)
+            try:
+                await u.done.wait()
+            finally:
+                hold.release()
+            if u.ok:
+                _note_hit(cache_key, fmt, path)
+                return path             # (its audio was judged when it was packed)
+            continue                    # failed / dropped / replaced: look again
+        # The file check runs on the playback threads, never on the loop: the
+        # cache may sit on a NAS data dir (``core.playback_io``).
+        exists_now = await playback_io.run(playback_io.mount_key(path), path.exists)
+        if exists_now:
+            with _state_lock:
+                if cache_key in _meta:
+                    _lru[cache_key] = time.time()
+                    _lru.move_to_end(cache_key)
 
-    if not exists_now:
-        # Off-loop purge so a slow filesystem doesn't block the request.
-        await asyncio.to_thread(_purge_entry, cache_key)
-        return None
-    if await _silent_leftover(cache_key, fmt, path):
-        return None
-    return path
+        if not exists_now:
+            if packed:
+                # The decoded copy went (the pack is the entry): decode again.
+                with _state_lock:
+                    if _meta.get(cache_key) is entry:
+                        _drop_hot_locked(entry)
+                continue
+            # Off-loop purge so a slow filesystem doesn't block the request.
+            await asyncio.to_thread(_purge_entry, cache_key)
+            return None
+        if await _silent_leftover(cache_key, fmt, path):
+            return None
+        _note_hit(cache_key, fmt, path)
+        return path
+    return None
+
+
+def _note_hit(cache_key: str, fmt: str, path: Path) -> None:
+    """``on_hit`` for a hit (``core/loudness`` measures a render cached
+    before it existed).  Never raises."""
+    if on_hit is not None:
+        try:
+            on_hit(cache_key, fmt, path)
+        except Exception:                                   # noqa: BLE001
+            log.debug("on_hit hook failed for %s", cache_key, exc_info=True)
+
+
+# Called on the event loop as ``on_hit(cache_key, format_type, path)`` for a
+# cache hit (``core/loudness`` measures a render cached before it existed).
+# Must not raise or block.
+on_hit = None
 
 
 # Renders cached before silent ones were refused (``refuse_silent``) — by an
@@ -710,10 +1805,22 @@ async def store_cached(
     dest = _cache_path(cache_key, format_type)
     src_sidecar  = source_path.with_suffix(".vu")
     dest_sidecar = dest.with_suffix(".vu")
+    with _state_lock:
+        # This render replaces the key's entry: a pack or a decode of the old
+        # one in progress must not land over it (``_commit_pack`` /
+        # ``_commit_unpack``), and an unlink deferred for a pinned reader of
+        # the old file must not remove the new one (``unpin``).
+        old = _meta.get(cache_key)
+        if old is not None:
+            old["stale"] = True
+        pending = _pending_purge.pop(cache_key, None)
+        _unpackable.discard(cache_key)
 
     def _place_and_size() -> int:
         dest.parent.mkdir(parents=True, exist_ok=True)
         _move_into_place(source_path, dest)
+        # The old render's pack (if any) is not this render.
+        dest.with_suffix(PACK_SUFFIX).unlink(missing_ok=True)
         # Move the sidecar too if it exists — non-fatal if it doesn't.
         if src_sidecar.exists():
             try:
@@ -722,7 +1829,16 @@ async def store_cached(
                 pass
         return dest.stat().st_size
 
-    size_bytes = await asyncio.to_thread(_place_and_size)
+    try:
+        size_bytes = await asyncio.to_thread(_place_and_size)
+    except BaseException:
+        # Nothing replaced: the old entry (if any) stays what it was.
+        with _state_lock:
+            if old is not None and _meta.get(cache_key) is old:
+                old.pop("stale", None)
+            if pending is not None:
+                _pending_purge.setdefault(cache_key, pending)
+        raise
     now = time.time()
     _clear_render_failure(cache_key)
     _silent_keys.pop(cache_key, None)
@@ -744,16 +1860,30 @@ async def store_cached(
         _meta[cache_key] = {
             "path": str(dest),
             "size_bytes": size_bytes,
+            "wav_bytes": size_bytes,
             "format_type": format_type,
             "created_at": now,
         }
         _lru[cache_key] = now
         _lru.move_to_end(cache_key, last=not (cold and not prev))
         _total_bytes += size_bytes
+    if format_type not in _UNPACKED_TYPES:
+        _queue_pack(cache_key)
 
     # Eviction may unlink several files; do it off the event loop.
     await asyncio.to_thread(_maybe_evict, cache_key)
+    if on_stored is not None:
+        try:
+            on_stored(cache_key, format_type, dest, cold=cold)
+        except Exception:                                   # noqa: BLE001
+            log.debug("on_stored hook failed for %s", cache_key, exc_info=True)
     return dest
+
+
+# Called on the event loop as ``on_stored(cache_key, format_type, path,
+# cold=…)`` once ``store_cached`` has placed an entry (``core/loudness``
+# measures a render there).  Must not raise or block.
+on_stored = None
 
 
 async def register_existing(
@@ -798,6 +1928,7 @@ async def register_existing(
         _meta[cache_key] = {
             "path":        str(dest_path),
             "size_bytes":  size_bytes,
+            "wav_bytes":   size_bytes,
             "format_type": format_type,
             "created_at":  now,
         }
@@ -827,17 +1958,19 @@ def _unlink_cached(path_str: str) -> None:
     their deterministic path (``_find_orphan_sidecar``), and ``clear_cache``
     removes them on an explicit wipe, so they can't accumulate unbounded.
     A tracker render's ``<wav>.peak`` (``stream.render_peak`` — cheap to
-    measure again) goes with the WAV.
+    measure again) goes with the WAV, and so does the entry's pack.
     """
-    for p in (Path(path_str), Path(path_str).with_suffix(".peak")):
+    p0 = Path(path_str)
+    for p in (p0, p0.with_suffix(".peak"), p0.with_suffix(PACK_SUFFIX)):
         try:
             p.unlink(missing_ok=True)
         except Exception:
             pass
 
 
-def _purge_entry(cache_key: str) -> None:
-    """Remove a single cache entry from metadata.
+def _purge_entry(cache_key: str, expect: "dict | None" = None) -> None:
+    """Remove a single cache entry from metadata (``expect``: only when it is
+    still that entry — not a render that replaced it meanwhile).
 
     If the entry is currently pinned (``_pin_refs[key] > 0``) the file unlink
     is deferred — the entry stays out of ``_meta`` / ``_lru`` so future
@@ -847,8 +1980,11 @@ def _purge_entry(cache_key: str) -> None:
     global _total_bytes
     deferred = False
     with _state_lock:
+        if expect is not None and _meta.get(cache_key) is not expect:
+            return
         entry = _meta.pop(cache_key, None)
         _lru.pop(cache_key, None)
+        _pack_queue.pop(cache_key, None)
         if entry:
             size = entry.get("size_bytes", 0)
             if size > 0:
@@ -876,6 +2012,8 @@ def _maybe_evict(keep: "str | None" = None) -> None:
     Eviction is O(1) per item now that ``_lru`` is an ``OrderedDict`` —
     ``popitem(last=False)`` removes the least-recently-used key without
     scanning every entry, which was an O(N) cost per eviction previously.
+    (The decoded-copy pass below is one O(N) walk per call over budget:
+    0.4 ms at 3,000 entries.)
 
     Honours ``_pinned`` — a pinned key (typically the currently-playing
     track) is skipped while looking for an eviction victim, so a
@@ -887,11 +2025,19 @@ def _maybe_evict(keep: "str | None" = None) -> None:
     can both schedule this via ``asyncio.to_thread`` — without the lock,
     two threads doing ``_lru.popitem(last=False)`` would race on the same
     OrderedDict and could ``KeyError`` or double-evict.
+
+    Packed entries: before any render is removed, the decoded copies of
+    packed entries are dropped, oldest first, except those
+    ``_drop_hot_copies_locked`` keeps (the newest ones, in use, just used) —
+    the pack stays, a later play decodes it again.
     """
     global _total_bytes
     max_bytes = settings.conversion_cache_max_bytes
     victims: list[tuple[str, dict]] = []
+    dropped: "list[tuple[str, Path]]" = []
     with _state_lock:
+        if _total_bytes > max_bytes:
+            dropped = _drop_hot_copies_locked(max_bytes, keep)
         while _total_bytes > max_bytes and _lru:
             evict_key: str | None = None
             # First pass: pick the oldest unpinned key.  Refcount==0 means
@@ -927,8 +2073,48 @@ def _maybe_evict(keep: "str | None" = None) -> None:
             else:
                 immediate_unlinks.append(entry)
     # Unlink outside the lock so a slow disk doesn't block other callers.
+    _unlink_dropped(dropped)
     for entry in immediate_unlinks:
         _unlink_cached(entry["path"])
+
+
+def _drop_hot_copies_locked(max_bytes: int, keep: "str | None") -> "list[tuple[str, Path]]":
+    """(``_state_lock`` held) Drop decoded copies of packed entries, oldest
+    first, until the cache fits ``max_bytes``.  Kept: the entries at the
+    recent end of the LRU whose WAVs (packed or not) add up to
+    ``_HOT_FLOOR_FRACTION`` of it, one used in the last ``_HOT_RECENT_S``, a
+    pinned one, ``keep``, one being decoded, and one whose pack start-up
+    hasn't checked yet (its WAV may be the only good copy).  Returns
+    ``(key, file)`` to unlink with ``_unlink_dropped``.  One pass over the
+    LRU."""
+    floor = int(max_bytes * _HOT_FLOOR_FRACTION)
+    cands: "list[str]" = []
+    acc = 0
+    protecting = True
+    for k in reversed(_lru):            # newest first
+        e = _meta.get(k)
+        if e is None or not _hot(e):
+            continue
+        if protecting:
+            wb = _wav_size_of(e)
+            if acc + wb <= floor:
+                acc += wb
+                continue
+            protecting = False
+        if e.get("packed") and not e.get("unchecked"):
+            cands.append(k)
+    now = time.time()
+    out: "list[tuple[str, Path]]" = []
+    for k in reversed(cands):           # oldest first
+        if _total_bytes <= max_bytes:
+            break
+        if (k == keep or now - _lru.get(k, 0.0) < _HOT_RECENT_S
+                or _pin_refs.get(k, 0) > 0 or k in _unpacks or k in _drops_pending):
+            continue
+        p = _drop_hot_locked(_meta[k], k)
+        if p is not None:
+            out.append((k, p))
+    return out
 
 
 def pin(cache_key: str) -> int:
@@ -968,10 +2154,7 @@ def unpin(cache_key: str) -> int:
         else:
             _pin_refs[cache_key] = n
     if pending_path:
-        try:
-            Path(pending_path).unlink(missing_ok=True)
-        except Exception:
-            pass
+        _unlink_cached(pending_path)        # the WAV, its peak sidecar, its pack
     return n
 
 
@@ -1169,6 +2352,7 @@ async def get_or_render(
     bitrate: int | None = None,
     variant: str | None = None,
     *,
+    tuned: bool = False,
     cold: bool = False,
     interest=None,
 ) -> tuple[Path, bool]:
@@ -1191,7 +2375,7 @@ async def get_or_render(
     key = _cache_key(
         track_id, format_type, subsong, soundfont_path,
         duration=duration, codec=codec, target_rate=target_rate,
-        bitrate=bitrate, variant=variant,
+        bitrate=bitrate, variant=variant, tuned=tuned,
     )
 
     # Fast path: cache hit without acquiring the per-key lock.
@@ -1350,9 +2534,14 @@ _detached_renders: set[asyncio.Task] = set()
 
 
 async def find_shorter_sid_entry(
-    track_id: str, subsong: int, target_dur: int,
+    track_id: str, subsong: int, target_dur: int, tail: str = "",
 ) -> tuple[Path, int] | None:
-    """Find any cached SID entry for this track with a shorter duration."""
+    """Find any cached SID entry for this track with a shorter duration.
+
+    ``tail``: what the wanted key has after its ``dur<D>`` part (fidelity,
+    fade, stereo — ``_cache_key``); only an entry with the same tail is the
+    same render cut shorter (a plain mono render is no shorter version of a
+    2SID tune's stereo one)."""
     prefix = f"{track_id}__sub{subsong}__dur"
     # Snapshot under the state lock — otherwise an in-flight
     # ``_maybe_evict`` on a worker thread can mutate ``_meta`` mid-iteration
@@ -1363,23 +2552,33 @@ async def find_shorter_sid_entry(
             if key.startswith(prefix)
         ]
     best: tuple[Path, int] | None = None
+    best_key = None
     for key, entry in candidates:
+        rest = key[len(prefix):]
+        if tail:
+            if not rest.endswith(tail):
+                continue
+            rest = rest[:-len(tail)]
         try:
-            dur = int(key.split("__dur")[-1])
+            dur = int(rest)
         except (ValueError, IndexError):
             continue
         if dur >= target_dur:
             continue
         # path.exists() is a sync syscall; the cache lives locally so this
         # is microseconds, but if it ever moves to a slow share this is the
-        # spot to switch to asyncio.to_thread.
+        # spot to switch to asyncio.to_thread.  (A packed entry counts: it is
+        # decoded below.)
         path = Path(entry["path"])
-        if path.exists():
+        if entry.get("packed") or path.exists():
             if best is None or dur > best[1]:
                 best = (path, dur)
+                best_key = key
 
-    if best:
-        best_key = f"{track_id}__sub{subsong}__dur{best[1]}"
+    if best and best_key is not None:
+        if is_packed(best_key):
+            got = await get_cached(best_key)        # (its decoded copy; LRU touched)
+            return (got, best[1]) if got is not None else None
         with _state_lock:
             if best_key in _lru:
                 _lru[best_key] = time.time()
@@ -1474,6 +2673,8 @@ def render_state(track_id: str, subsong: int | None = None) -> str:
 async def is_cache_ready(cache_key: str) -> bool:
     if cache_key in _bg_renders or cache_key in _inflight:
         return False
+    if is_packed(cache_key):
+        return True                  # (a status check never decodes a pack)
     cached = await get_cached(cache_key)
     return cached is not None
 
@@ -1493,11 +2694,19 @@ async def cache_stats() -> dict:
     with _state_lock:
         by_type: dict[str, int] = dict.fromkeys(FORMAT_TYPES, 0)
         by_type_bytes: dict[str, int] = dict.fromkeys(by_type, 0)
+        packed = packed_bytes = hot = hot_bytes = wav_bytes = 0
         for entry in _meta.values():
             ft = entry.get("format_type", "")
             if ft in by_type:
                 by_type[ft] += 1
                 by_type_bytes[ft] += int(entry.get("size_bytes", 0) or 0)
+            wav_bytes += _wav_size_of(entry)
+            if entry.get("packed"):
+                packed += 1
+                packed_bytes += int(entry.get("packed_bytes") or 0)
+                if _hot(entry):
+                    hot += 1
+                    hot_bytes += _wav_size_of(entry)
         return {
             "total_bytes": _total_bytes,
             "entry_count": len(_meta),
@@ -1505,6 +2714,16 @@ async def cache_stats() -> dict:
             "pinned_count": len(_pin_refs),
             "by_type_bytes": by_type_bytes,
             "by_type": by_type,
+            # Packed (WavPack) entries: how many, their packs' bytes, how many
+            # of them also hold their decoded WAV and its bytes; ``wav_bytes``:
+            # what every entry would take as plain WAV (unknown packed sizes
+            # count 0 until read); ``pack_queue``: renders waiting to be packed.
+            "packed_count": packed,
+            "packed_bytes": packed_bytes,
+            "decoded_count": hot,
+            "decoded_bytes": hot_bytes,
+            "wav_bytes": wav_bytes,
+            "pack_queue": len(_pack_queue),
         }
 
 
@@ -1553,9 +2772,9 @@ def _sweep_stale_subsong_renders(base: Path) -> int:
         if not sub.is_dir():
             continue
         for f in sub.rglob("*"):
-            if f.suffix not in (".wav", ".vu") or not _stale_subsong_key(f.stem):
+            if f.suffix not in (".wav", ".vu", PACK_SUFFIX) or not _stale_subsong_key(f.stem):
                 continue
-            if f.suffix == ".wav":
+            if f.suffix in (".wav", PACK_SUFFIX):
                 stale_variants.add(rendered_transcode_variant(f.stem))
             try:
                 f.unlink(missing_ok=True)
@@ -1604,14 +2823,14 @@ def _sweep_unrevised_renders(base: Path) -> int:
             continue
         tag = f"__r{rev}"
         for f in sub.rglob("*"):
-            if f.suffix not in (".wav", ".vu"):
+            if f.suffix not in (".wav", ".vu", PACK_SUFFIX):
                 continue
             stem = f.stem
             if stem.endswith(".partial"):
                 stem = stem[: -len(".partial")]
             if tag in stem:
                 continue
-            if f.suffix == ".wav":
+            if f.suffix in (".wav", PACK_SUFFIX):
                 stale_variants.add(rendered_transcode_variant(stem))
             try:
                 f.unlink(missing_ok=True)
@@ -1641,15 +2860,17 @@ def _sweep_unrevised_renders(base: Path) -> int:
 def _sweep_unfinished_writes(base: Path) -> int:
     """Remove what a process that ended part-way left in the cache: copies
     in progress (``_move_into_place``'s ``.copying`` temps), the cast pipe's
-    ``<key>.wav.partial`` (``cast_pipe.render_stream``) and a SID upload's
-    temp (``tracks``' SID WAV upload).  Run at the
+    ``<key>.wav.partial`` (``cast_pipe.render_stream``), a SID upload's
+    temp (``tracks``' SID WAV upload) and a pack or a decode of one in
+    progress (``_PACK_TMP_SUFFIX`` / ``_UNPACK_TMP_SUFFIX``).  Run at the
     start, before anything writes the cache."""
     removed = 0
     for fmt in FORMAT_TYPES:
         sub = base / fmt
         if not sub.is_dir():
             continue
-        for pat in (f"*{_COPY_TMP_SUFFIX}", "*.wav.partial", "*.wav.upload"):
+        for pat in (f"*{_COPY_TMP_SUFFIX}", "*.wav.partial", "*.wav.upload",
+                    f"*{_PACK_TMP_SUFFIX}", f"*{_UNPACK_TMP_SUFFIX}"):
             for f in sub.rglob(pat):
                 try:
                     f.unlink()
@@ -1662,7 +2883,8 @@ def _sweep_unfinished_writes(base: Path) -> int:
 
 
 def warmup_from_disk() -> int:
-    """Rebuild ``_meta`` / ``_lru`` / ``_total_bytes`` from on-disk WAVs.
+    """Rebuild ``_meta`` / ``_lru`` / ``_total_bytes`` from on-disk WAVs and
+    packs.
 
     The cache state is in-memory; without this, every server restart leaves
     previously-rendered WAVs orphaned on disk, so the next play re-renders
@@ -1671,6 +2893,16 @@ def warmup_from_disk() -> int:
     ``_sweep_stale_subsong_renders``), and so are unfinished writes
     (``_sweep_unfinished_writes``); a WAV shorter than its header declares
     is removed, not adopted (``_wav_is_whole``).
+
+    A pack without its WAV (``<key>.sbwv``) is adopted by its size alone —
+    its header is read after start-up (``_check_adopted_packs``).  A WAV
+    beside its pack is the entry's decoded copy when it is no newer than the
+    pack (a decoded copy carries its original's mtime) and the pack's header
+    (read here: the WAV may later be dropped on the strength of it) matches
+    it; a newer WAV is a later render (another version's, say) and wins, and
+    so does a WAV whose pack is damaged, of another version or of another
+    size: the pack is removed.  WAVs not packed yet are queued for the
+    packer.
 
     Returns the number of entries adopted."""
     global _total_bytes
@@ -1686,6 +2918,12 @@ def warmup_from_disk() -> int:
             sub = base / fmt
             if not sub.exists():
                 continue
+            packs: "dict[str, tuple[Path, os.stat_result]]" = {}
+            for pk in sub.rglob("*" + PACK_SUFFIX):
+                try:
+                    packs[pk.stem] = (pk, pk.stat())
+                except OSError:
+                    continue
             for wav in sub.rglob("*.wav"):
                 # ``foo.partial.wav`` is a half-written render left behind by
                 # a crashed ffmpeg / sidplayfp.  Adopting it as a real cache
@@ -1700,6 +2938,7 @@ def warmup_from_disk() -> int:
                     continue
                 key = wav.stem
                 if key in _meta:
+                    packs.pop(key, None)
                     continue  # already adopted (idempotent)
                 try:
                     st = wav.stat()
@@ -1716,17 +2955,63 @@ def warmup_from_disk() -> int:
                     except OSError:
                         pass
                     continue
-                _meta[key] = {
+                entry = {
                     "path": str(wav),
                     "size_bytes": st.st_size,
+                    "wav_bytes": st.st_size,
                     "format_type": fmt,
                     # mtime is the closest proxy to "last-touched"; the LRU
                     # entry below uses the same value so subsequent eviction
                     # decisions are sensible from the first request.
                     "created_at": st.st_mtime,
                 }
-                _lru[key] = st.st_mtime
-                _total_bytes += st.st_size
+                seen = st.st_mtime
+                pk = packs.pop(key, None)
+                info = None
+                if pk is not None and st.st_mtime_ns <= pk[1].st_mtime_ns:
+                    # A decoded copy or the pack's own source — the pack's
+                    # header read now (the WAV may be dropped on the strength
+                    # of it): one with another version or size is dropped.
+                    try:
+                        info = read_pack_info(pk[0])
+                        if info is None or info.wav_size != st.st_size:
+                            info = None
+                        else:
+                            entry.update(packed=True, packed_bytes=pk[1].st_size, hot=True,
+                                         wav_mtime_ns=info.mtime_ns)
+                    except OSError:     # not read now: kept, checked later
+                        info = False
+                        entry.update(packed=True, packed_bytes=pk[1].st_size, hot=True,
+                                     wav_mtime_ns=st.st_mtime_ns, unchecked=True)
+                    if entry.get("packed"):
+                        entry["size_bytes"] = st.st_size + pk[1].st_size
+                        seen = max(seen, pk[1].st_mtime)
+                if pk is not None and not entry.get("packed"):
+                    # a later render (newer than its pack), or a pack that
+                    # doesn't match the WAV: the WAV wins
+                    try:
+                        pk[0].unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                _meta[key] = entry
+                _lru[key] = seen
+                _total_bytes += entry["size_bytes"]
+                if not entry.get("packed") and fmt not in _UNPACKED_TYPES:
+                    _pack_queue[key] = 0.0
+                adopted += 1
+            for key, (pk, pst) in packs.items():
+                if key in _meta:
+                    continue
+                _meta[key] = {
+                    "path": str(pk.with_suffix(".wav")),
+                    "size_bytes": pst.st_size,
+                    "format_type": fmt,
+                    "created_at": pst.st_mtime,
+                    "packed": True, "packed_bytes": pst.st_size, "hot": False,
+                    "wav_bytes": None, "wav_mtime_ns": None, "unchecked": True,
+                }
+                _lru[key] = pst.st_mtime
+                _total_bytes += pst.st_size
                 adopted += 1
         # Order _lru by mtime so the oldest entries are first (LRU candidates).
         if adopted:
@@ -1801,17 +3086,26 @@ async def purge_tracks(track_ids) -> int:
         _silent_keys.pop(k, None)
 
     def _sidecars() -> None:
+        # One listing per format and id prefix folder, not a stat and a glob
+        # per id and format (a local scan purges every file it found changed).
         base = get_conversion_cache_dir()
+        by_dir: dict[str, set] = {}
         for tid in ids:
-            for fmt in FORMAT_TYPES:
-                d = base / fmt / tid[:2]
-                if not d.is_dir():
+            by_dir.setdefault(tid[:2], set()).add(tid)
+        for fmt in FORMAT_TYPES:
+            for pre, tids in by_dir.items():
+                d = base / fmt / pre
+                try:
+                    names = os.listdir(d)
+                except OSError:
                     continue
-                for p in [d / f"{tid}.vu", *d.glob(f"{tid}__*.vu")]:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                for name in names:
+                    # ``<id>.vu`` or ``<id>__<variant>.vu``
+                    if name.endswith(".vu") and name[:-3].split("__", 1)[0] in tids:
+                        try:
+                            (d / name).unlink(missing_ok=True)
+                        except OSError:
+                            pass
     await asyncio.to_thread(_sidecars)
     return len(victims)
 
@@ -1875,7 +3169,7 @@ async def clear_cache(types: list[str] | None = None) -> dict:
         for sub in selected:
             d = cache_dir / sub
             if d.exists():
-                for pat in ("*.wav", "*.vu"):
+                for pat in ("*.wav", "*.vu", "*" + PACK_SUFFIX, "*.peak"):
                     for f in d.rglob(pat):
                         try:
                             f.unlink(missing_ok=True)
@@ -1889,6 +3183,7 @@ async def clear_cache(types: list[str] | None = None) -> dict:
         if selected == all_types:
             _meta.clear()
             _lru.clear()
+            _pack_queue.clear()
             _total_bytes = 0
         else:
             # Surgical purge: only remove meta entries whose format_type
@@ -1897,6 +3192,7 @@ async def clear_cache(types: list[str] | None = None) -> dict:
                 if _meta[key].get("format_type") in selected:
                     _meta.pop(key, None)
                     _lru.pop(key, None)
+                    _pack_queue.pop(key, None)
             _total_bytes = sum(int(e.get("size_bytes", 0) or 0)
                                for e in _meta.values())
     log.info("Conversion cache cleared (%s): %d files",

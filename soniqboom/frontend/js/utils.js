@@ -75,11 +75,13 @@ function _dockToastHost() {
 }
 
 // Would a click at the bar's centre reach it?  An offer toast there doesn't
-// count (it is what docking moves away); plain toasts aren't hit at all.
+// count (it is what docking moves away); plain toasts aren't hit at all.  Nor
+// does a confirm dialog fading out (.pl-modal-out, removed ~150 ms later): the
+// toast its action raises ("Cleared 6 tracks · Undo") belongs above the bar.
 function _barTakesClicks(bar, r) {
   if (typeof document.elementsFromPoint !== 'function') return true;
   const hit = document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2)
-    .find((el) => !_toastHost.contains(el));
+    .find((el) => !_toastHost.contains(el) && !el.closest?.('.pl-modal-out'));
   return !hit || bar.contains(hit);
 }
 
@@ -316,7 +318,38 @@ export const ADLIB_FORMAT_NAMES = new Set([
   'AdLib IMF', 'AdLib ROL', 'Creative Music', 'EdLib', 'Reality AdLib',
   'LucasArts AdLib', 'Sierra AdLib', 'DOSBox OPL', 'HSC AdLib', 'RIX OPL',
   'AdLib Tracker 2', 'AdLib', "Bob's AdLib", "Ken's AdLib", 'AMUSIC AdLib',
+  // (the rest of AdPlug's formats — metadata.py _ADLIB_VERIFY_NAMES — and
+  // those whose suffix another engine owns — ADLIB_SHARED_FORMATS)
+  'XMS-Tracker', 'Digital-FM', 'Mlat AdLib Tracker', 'AdLib MUS', 'AdLib MIDIPlay',
+  'MKJamz', 'BoomTracker', 'TwinTeam', 'MPU-401 Trakker', 'Master Tracker', 'Raw AdLib',
+  'Surprise! AdLib Tracker', 'XAD AdLib', 'BMF AdLib Tracker', 'LOUDNESS', 'PALLADIX',
+  'Ultima 6 Music', 'eXtra Simple Music', 'Beni Tracker', 'AdLib MSC', 'JBM AdLib',
+  'God of Thunder', 'Note Sequencer', 'HERAD', 'AdLib IMS', 'AdLib SNG', 'DeFy AdLib Tracker',
 ]);
+
+/**
+ * The ZX Spectrum (SAM Coupé, Amstrad CPC) tracker modules zxtune123 plays on
+ * the one-tune route (PSF_FORMAT_NAMES).  Names mirror metadata.py ZX_FORMATS.
+ */
+export const ZX_FORMAT_NAMES = new Set([
+  'Pro Tracker 3', 'Pro Tracker 2', 'Pro Tracker 1', 'Sound Tracker', 'Sound Tracker 3',
+  'Sound Tracker Pro', 'ASC Sound Master', 'SQ-Tracker', 'Pro Sound Creator',
+  'Pro Sound Maker', 'Global Tracker', 'Fast Tracker (ZX)', 'VTX (AY)', 'PSG (AY)',
+  'AYC (Amstrad CPC)', 'Chip Tracker (ZX)', 'Sample Tracker', 'Digital Studio',
+  'SQ Digital Tracker', 'Digital Music Maker', 'Extreme Tracker', 'ProDigi Tracker',
+  'TFM Music Maker', 'TurboFM', 'E-Tracker (SAM Coupé)',
+]);
+
+/**
+ * The MIDI family: Standard MIDI files and the game MIDI formats midirender
+ * plays (XMI, DMX MUS, HMI / HMP, GMF, KLM).  Names mirror metadata.py
+ * MIDI_VARIANT_FORMATS / GAME_MIDI_FORMATS.  (A game MIDI song scanned without
+ * midirender stores no length: its first play stores it.)
+ */
+export const GAME_MIDI_FORMAT_NAMES = new Set([
+  'XMIDI', 'DMX MUS', 'HMI MIDI', 'HMP MIDI', 'GMF MIDI', 'KLM',
+]);
+export const MIDI_FORMAT_NAMES = new Set(['MIDI', 'RIFF MIDI', ...GAME_MIDI_FORMAT_NAMES]);
 
 /**
  * Chip / FM formats rendered server-side (libgme console chiptunes + AdPlug
@@ -357,8 +390,8 @@ export const UADE_FORMAT_NAMES = new Set(['AHX', 'HivelyTracker']);
 export const ATARI_FORMAT_NAMES = new Set(['SNDH', 'YM', 'SC68']);
 export const PSF_FORMAT_NAMES = new Set([
   'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (Dreamcast)', 'NCSF', 'S98', 'V2M', 'MDX',
-  'SunVox', 'MGSDRV', 'GoatTracker', 'FamiTracker', 'DefleMask', 'C64 Sidplayer', 'Sawteeth',
-  ...XMP_FORMAT_NAMES,
+  'SunVox', 'MGSDRV', 'GoatTracker', 'FamiTracker', 'DefleMask', 'Furnace', 'C64 Sidplayer',
+  'Sawteeth', ...XMP_FORMAT_NAMES, ...ZX_FORMAT_NAMES,
 ]);
 
 /**
@@ -421,6 +454,91 @@ export function subsongTuneToWire(tune, start, count) {
   if (t === s) return 0;
   if (s !== 1 && t === 1) return s - 1;
   return t - 1;
+}
+
+// ── Volume leveling: ReplayGain tags, else the measured loudness ───────────
+// A file's own ReplayGain tags level it (Per track / Per album / Auto); a
+// track without them is levelled by the loudness the server MEASURED
+// (core/loudness.py: EBU R128 of the render or the file) — ``loudness`` on the
+// track, ``{tune key: [LUFS, true peak(, sample peak)]}`` — as a track gain of
+// LEVELING_REF_LUFS − LUFS dB (ReplayGain 2.0's −18 LUFS reference).  The tune
+// key is the render's tune index (``stream.tune_index``): the wire for SID /
+// SNDH (0 for a bare play), else the wire, or for a bare play the file's
+// default tune (``default_subsong``).
+export const LEVELING_REF_LUFS = -18;
+
+export function loudnessTuneKey(t) {
+  if (!t) return '0';
+  const w = Number.isInteger(t.subsong) && t.subsong >= 0 ? t.subsong : null;
+  const fam = String(t.format || '').split('/')[0].trim().toUpperCase();
+  if (fam === 'SID' || fam === 'SNDH') return String(w ?? 0);
+  if (w !== null) return String(w);
+  const d = t.default_subsong;
+  return String(Number.isInteger(d) && d >= 0 ? d : 0);
+}
+
+function _loudEntry(e) {
+  return Array.isArray(e) && e.length >= 2 && e.every((v) => typeof v === 'number' && Number.isFinite(v))
+      && e[1] > 0 ? e : null;
+}
+
+/** The measured loudness entry of the tune ``t`` plays, or null. */
+export function measuredLoudness(t) {
+  const m = t && t.loudness;
+  if (!m || typeof m !== 'object') return null;
+  return _loudEntry(m[loudnessTuneKey(t)]);
+}
+
+function _rgDb(val) {
+  if (val === null || val === undefined) return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  const m = String(val).match(/(-?\d+(\.\d+)?)/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+/**
+ * The linear gain the player's ReplayGain node applies to track ``t``.
+ * ``mode``: 'off' | 'track' | 'album' | 'auto' ('auto' = album gain while the
+ * queue plays an album in order — ``albumRun`` — else track gain).
+ * ``render``: an overloaded float render's 1 / peak (render-status ``peak``),
+ * applied with tags or with no gain at all; a measured loudness was taken of
+ * that render and its true-peak cap covers it.  ``measured``: an entry learnt
+ * this page load, when the track object has none.
+ * Tags: the mode's gain, else the other one, each with its OWN peak (else the
+ * other peak) as the clip cap 0.99 / peak.  Measured: REF − LUFS, capped at
+ * 0.99 / true peak.  Always within −60 … +12 dB (0.001 … 3.98).
+ */
+export function levelingGain(t, mode, { render = 1, measured = null, albumRun = false } = {}) {
+  const rf = Number.isFinite(render) && render > 0 ? render : 1;
+  if (mode === 'off' || !t) return rf;
+  const eff = mode === 'auto' ? (albumRun ? 'album' : 'track') : mode;
+  const albumDb = _rgDb(t.replaygain_album_gain);
+  const trackDb = _rgDb(t.replaygain_track_gain);
+  const albumPeak = _rgDb(t.replaygain_album_peak);
+  const trackPeak = _rgDb(t.replaygain_track_peak);
+  let db = null, peak = null, factor = rf;
+  if (eff === 'album') {
+    if (albumDb !== null) { db = albumDb; peak = albumPeak; }
+    else                  { db = trackDb; peak = trackPeak; }
+  } else {
+    if (trackDb !== null) { db = trackDb; peak = trackPeak; }
+    else                  { db = albumDb; peak = albumPeak; }
+  }
+  if (db !== null && (peak === null || peak === undefined)) {
+    peak = trackPeak !== null ? trackPeak : (albumPeak !== null ? albumPeak : null);
+  }
+  if (db === null) {
+    const e = measuredLoudness(t) || _loudEntry(measured);
+    if (!e) return rf;                   // nothing to level by: unity (but an overloaded render's)
+    db = LEVELING_REF_LUFS - e[0];
+    peak = e[1];
+    factor = 1;
+  }
+  let linear = Math.pow(10, db / 20);
+  if (peak !== null && peak > 0) linear = Math.min(linear, 0.99 / peak);
+  linear = Math.max(0.001, Math.min(linear, 3.98));
+  const out = linear * factor;
+  return Number.isFinite(out) ? out : 1.0;
 }
 
 /** Render-only duration semantics, name-based OR genre-based (uade). */
@@ -628,8 +746,8 @@ function _computeArtPlaceholderEmoji(track) {
   // SID / PSID
   if (fmtUp === 'SID' || fmtUp === 'PSID') return '\u{1F579}\uFE0F'; // 🕹️
 
-  // MIDI
-  if (fmtUp === 'MID' || fmtUp === 'MIDI') return '\u{1F3BC}';       // 🎼
+  // MIDI (and the game MIDI formats)
+  if (fmtUp === 'MID' || MIDI_FORMAT_NAMES.has(fmt)) return '\u{1F3BC}'; // 🎼
 
   // Tracker — primary check via mutagen format name (exact, case-sensitive)
   if (TRACKER_FORMAT_NAMES.has(fmt)) return '\u{1F4BE}';              // 💾

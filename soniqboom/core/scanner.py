@@ -319,11 +319,16 @@ def _release_pool(executor) -> None:
     """A scan pool whose work is done: shut down (its workers exit once
     idle) in a daemon thread — the caller is the event loop, and a pool a
     stop killed meanwhile may hold its lock for good.  A stopped pool is
-    left alone."""
+    left alone.  A release thread that can't be started is logged, not
+    raised (callers run this in their cleanup)."""
     if executor is None or _pool_stopped(executor):
         return
-    threading.Thread(target=lambda: executor.shutdown(wait=False), daemon=True,
-                     name="scan-pool-release").start()
+    try:
+        threading.Thread(target=lambda: executor.shutdown(wait=False), daemon=True,
+                         name="scan-pool-release").start()
+    except RuntimeError:
+        # ("can't start new thread": the pool is left as it is, not shut down)
+        log.warning("A scan pool could not be released (no thread)", exc_info=True)
 
 
 def _unread_file(requeue: deque, file_iter, avoid=()) -> Path | None:
@@ -1194,6 +1199,19 @@ def _scan_ended(cb, changed: bool) -> "tuple[bool, list] | None":
     return (True, dirs) if (chg or shown) else None
 
 
+def _count_scan_down(cb, changed: bool) -> "tuple[bool, list] | None":
+    """A local scan that counted itself running (``_run_scan_body``) ends:
+    count it down, progress idle once no scan runs, then ``_scan_ended``
+    (whose frame it returns)."""
+    global _scan_count
+    _scan_count = max(0, _scan_count - 1)
+    if _scan_count == 0:
+        _progress.running      = False
+        _progress.embedding    = False
+        _progress.current_file = ""
+    return _scan_ended(cb, changed)
+
+
 async def _send_scan_end(end: "tuple[bool, list] | None") -> None:
     """Send the frame ``_scan_ended`` asked for (never raises).  A scan that
     started meanwhile (the caller awaited in between) opened a new busy
@@ -1803,6 +1821,13 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                                                     if archive.rejected_by_bytes(inner_name, shown, _inner_head):
                                                         continue
                                                     files.append(Path(f"{full}::{member}::{shown}"))
+                                                else:           # mod.Astra_1 → mod.Astra_1.mod
+                                                    shown = archive.owned_prefix_name(
+                                                        inner_name, _inner_head,
+                                                        inner_zf.getinfo(inner_name).file_size,
+                                                        taken=inner_zf.NameToInfo)
+                                                    if shown is not None:
+                                                        files.append(Path(f"{full}::{member}::{shown}"))
                                         continue
                                     except zipfile.BadZipFile:
                                         pass            # not a zip: maybe a module named *.zip
@@ -1823,6 +1848,16 @@ def _find_audio_files(directories: list[str], scan_zips: bool = True,
                                     _shown.add(shown)
                                 elif archive.sniffable(member):
                                     _plain.append(member)
+                                else:
+                                    # Named by a prefix only the archive map reads
+                                    # (``mod.Astra_1`` → ``mod.Astra_1.mod``) — when
+                                    # its bytes hold such a module.
+                                    shown = archive.owned_prefix_name(
+                                        member, _head_of, zf.getinfo(member).file_size,
+                                        taken=zf.NameToInfo)
+                                    if shown is not None:
+                                        files.append(Path(f"{full}::{shown}"))
+                                        _shown.add(shown)
                             # Members only their bytes name (``Antom`` → ``Antom.ftm``),
                             # as the archive layer reads them back.
                             for _disp in archive.sniffed_members(
@@ -2622,6 +2657,10 @@ def _extract_one(path: Path, isolate: bool = False) -> tuple[Path, TrackMeta | s
         # Stamp mtime — for ZIP files, use the outer archive's mtime
         actual_path = Path(path_str.split('::')[0]) if '::' in path_str else path
         meta.mtime = actual_path.stat().st_mtime
+        if '::' not in path_str and not (meta.sid_md5 or meta.file_md5):
+            # (what tells this file from another when it moves — track_moves)
+            from soniqboom.core.track_moves import content_key
+            meta.content_key = content_key(path_str)
 
         return path, meta, _scan_thumb(getattr(meta, "cover_art", None)), None
     except Exception as exc:
@@ -3770,7 +3809,8 @@ _REEXTRACT_VOLATILE = frozenset(_KEEP_ON_REEXTRACT) | {"mtime", "file_size"}
 # didn't compute): that is new information and is written.
 _POST_SCAN_FIELDS = frozenset(("cover_art", "duration", "duration_rev", "stil", "hvsc_lengths",
                                "subsongs", "start_subsong", "default_subsong",
-                               "sid_md5", "file_md5"))
+                               "sid_md5", "file_md5", "loudness", "loudness_source", "loudness_v",
+                               "tune_slots"))
 # Post-scan fields whose 0 is a real value (a tune index, a render revision), not "unset".
 _POST_SCAN_INDEX_FIELDS = frozenset(("start_subsong", "default_subsong", "duration_rev"))
 _SMALL_COMMIT = 2500     # commit deltas up to this size merge into the live sorted indexes
@@ -3925,7 +3965,7 @@ async def _run_duplicate_detection_incremental(delta: "dict[str, dict | None]") 
 
 
 _FP_KEY = "archive_listing_fp:"
-_ARCHIVE_LISTING_VERSION = 4      # bump when archive discovery rules change
+_ARCHIVE_LISTING_VERSION = 5      # bump when archive discovery rules change
 # 2: re-list every archive once — Linux scans lost members to forked workers
 #    sharing the server's open archive (archive._forget_inherited_archives),
 #    and an automatic scan lists only the members already indexed.
@@ -3933,14 +3973,21 @@ _ARCHIVE_LISTING_VERSION = 4      # bump when archive discovery rules change
 #    Music, and LHA archives lhafile turns down (the embedded reader).
 # 4: DefleMask ``.dmf`` members (Furnace; ``archive._dmf_plays``) and Sawteeth
 #    ``.st`` ones (``archive._st_plays``).
+# 5: local ZIP members named by a prefix uade leaves to another engine, when
+#    they hold such a module (``mod.Astra_1`` → ``mod.Astra_1.mod``,
+#    ``archive.owned_prefix_name``).
 
 
 def _content_named(members) -> bool:
     """Does an archive's member list (virtual paths) hold a member whose name
-    only its bytes decide (``archive.needs_content_naming``)?"""
+    only its bytes decide (``archive.needs_content_naming``) — or one named as
+    an archive (``archive.container_named``: ``AB.zip::abk.mod.zip``, which
+    scans before 1.10.0 indexed as an AMOS module; ``abk.mod.zip.abk``, as
+    the archive layer listed it)?  (Only listed again: its bytes decide.)"""
     for m in members or ():
-        last = str(m).rsplit("::", 1)[-1]
-        if archive.needs_content_naming(re.split(r"[\\/]", last)[-1]):
+        last = re.split(r"[\\/]", str(m).rsplit("::", 1)[-1])[-1]
+        if (archive.needs_content_naming(last) or archive.container_named(last)
+                or archive.container_named(last.rpartition(".")[0])):
             return True
     return False
 
@@ -4047,6 +4094,454 @@ async def _carry_healed_smb_paths(scan_root: str, ghost_pairs, purge: set,
     log.info("Scan of %s: %d track(s) stored under a broken path keep their user data "
              "under the right one (%s)", scan_root, len(mapping), counts)
     return len(mapping)
+
+
+# ── Moved files and folders that are missing for now ────────────────────────
+# A scan that no longer lists a stored file decides, before deleting its row,
+# whether it moved (``_hand_over_user_data``: the same file under a new path —
+# ``core/track_moves``) or is only missing for now (``_settle_orphans``).
+
+# How long a track whose folder is missing (gone, or reading empty while its
+# scan root still lists files) stays in the library as unavailable before it is
+# deleted like any removed file: the first scan that found the folder missing
+# set ``store.ABSENT_FIELD``; a later scan that still finds it missing at least
+# this long after deletes it.  Two weeks: long enough for a NAS that is down
+# for maintenance, a USB drive left unplugged over a holiday or a share whose
+# server is away — the tracks come back with their user data when the folder
+# does — and short enough that the tracks of a folder deleted on purpose stop
+# showing as unavailable after a while.  Time the server was not running
+# counts too (two scans this far apart both found the folder missing).
+ABSENT_GRACE_S = 14 * 86400
+
+
+def _missing_folders(dirs) -> set:
+    """(blocking) The folders of ``dirs`` that are gone, read empty (nothing
+    but hidden entries — an unmounted mount point) or can't be read now."""
+    out = set()
+    for d in dirs:
+        try:
+            if not os.path.isdir(d):
+                out.add(d)
+                continue
+            with os.scandir(d) as it:
+                if not any(not e.name.startswith(".") for e in it):
+                    out.add(d)
+        except OSError:
+            out.add(d)
+    return out
+
+
+async def _settle_orphans(store, ids) -> "tuple[list[str], set[str]]":
+    """Of the orphans ``ids`` (stored rows whose files a scan no longer lists,
+    under a root that still lists files — not moved files, those were handed
+    over): those whose folder is missing now (``_missing_folders``) stay, as
+    unavailable, until a scan lists them again or they have been missing for
+    ``ABSENT_GRACE_S``.  Returns ``(the ids to mark missing now, the ids to
+    delete)`` — the others are missing already and wait.  A folder check that
+    doesn't answer (a stalled mount) keeps them all.  A share's rows are
+    never kept (its scan has its own rules)."""
+    now = time.time()
+    ids = list(ids)
+    if len(ids) > 20_000:                   # (reads only: off the loop)
+        folders, gone = await asyncio.to_thread(_group_orphans, store._tracks, ids, now)
+    else:
+        folders, gone = _group_orphans(store._tracks, ids, now)
+    if not folders:
+        return [], gone
+    try:
+        missing = await _in_daemon_thread(_missing_folders, list(folders),
+                                          timeout=_EXTRACT_STUCK_S)
+    except asyncio.TimeoutError:
+        log.warning("Scan: %d folder(s) of files no longer listed did not answer — "
+                    "their tracks are kept for now", len(folders))
+        missing = set(folders)
+    mark: list[str] = []
+    for d, tids in folders.items():
+        if d in missing:
+            mark.extend(tids)               # missing for now: kept, marked
+        else:
+            gone.update(tids)               # the folder holds files: these were deleted
+    return mark, gone
+
+
+def _group_orphans(tracks: dict, ids, now: float) -> "tuple[dict, set]":
+    """(may run in a thread: reads only) ``_settle_orphans``' first step:
+    ``({folder: [ids not marked missing yet]}, ids to delete)`` — a row
+    already marked waits (nothing to check) until its period is over (then
+    it goes, whatever its folder holds now); a share's row goes."""
+    from soniqboom.core.store import ABSENT_FIELD
+    folders: dict[str, list[str]] = {}
+    gone: set[str] = set()
+    for tid in ids:
+        t = tracks.get(tid)
+        if t is None:
+            continue
+        since = t.get(ABSENT_FIELD)
+        if since:
+            try:
+                if now - float(since) >= ABSENT_GRACE_S:
+                    gone.add(tid)
+            except (TypeError, ValueError):
+                gone.add(tid)
+            continue
+        p = str(t.get("path") or "").split("::", 1)[0]
+        if not p or is_remote_path(p):
+            gone.add(tid)
+            continue
+        folders.setdefault(os.path.dirname(p), []).append(tid)
+    return folders, gone
+
+
+# The rows added this long ago at most are new candidates of a move whose
+# old half a later pass finds (``_recent_ids``), at most this many.
+_RECENT_MOVE_S = 7 * 86400
+_RECENT_MOVE_MAX = 50_000
+
+
+def _recent_ids(store, exclude) -> list:
+    """The ids of the rows added in the last ``_RECENT_MOVE_S`` (newest
+    first, at most ``_RECENT_MOVE_MAX``; the store's added-at order), less
+    ``exclude`` — none while a batch section holds that order back."""
+    if store._batch_mode or store._sorted_dirty:
+        return []
+    cutoff = time.time() - _RECENT_MOVE_S
+    out: list = []
+    lst = store._sorted_added_at
+    for i in range(len(lst) - 1, -1, -1):
+        key, tid = lst[i]
+        if key == math.inf:
+            continue                        # (no time: not known to be new)
+        if key < cutoff or len(out) >= _RECENT_MOVE_MAX:
+            break
+        if tid not in exclude:
+            out.append(tid)
+    return out
+
+
+def _move_rows(tracks: dict, old_ids, new_rows: dict, recent, ratings=None,
+               play_stats=None) -> tuple:
+    """(may run in a thread: reads only) ``_find_moves``' matching.  A stored
+    row from ``recent`` takes an old row's place only when it was added after
+    it (a copy indexed with it is a duplicate, not where it went) and holds
+    no rating or plays of its own (nothing of its own is overwritten)."""
+    from soniqboom.core import catalogue, track_moves
+    olds = {t: tracks[t] for t in old_ids if t in tracks}
+    news = dict(new_rows)
+    for t in recent:
+        r = tracks.get(t)
+        if r is None or t in olds:
+            continue
+        p = str(r.get("path") or "")
+        # (a file of the library's own folders — never a share's or an online
+        #  collection's tune that happens to hold the same bytes)
+        if p and not is_remote_path(p) and not catalogue.is_catalogue_path(p):
+            news.setdefault(t, r)
+    found = track_moves.match_moves(olds, news)
+    ratings = ratings or {}
+    plays = [m for m in (play_stats or {}).values() if isinstance(m, dict)]
+
+    def _added(row) -> float:
+        try:
+            return float(row.get("added_at") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    for o, n in list(found.items()):
+        if n in new_rows:
+            continue
+        if (_added(news[n]) <= _added(olds[o]) or n in ratings
+                or any(n in m for m in plays)):
+            del found[o]
+    return found, olds
+
+
+async def _find_moves(store, old_ids, new_rows: dict, recent=()) -> tuple:
+    """``(old id → new id, the old rows)``: ``track_moves.match_moves`` of the
+    stored rows ``old_ids`` against ``new_rows`` (not stored yet) and the
+    stored rows ``recent`` — off the loop when they are many."""
+    args = (store._tracks, list(old_ids), dict(new_rows), list(recent),
+            store._ratings, store._play_stats)
+    if len(old_ids) + len(new_rows) + len(recent) > 5000:
+        return await asyncio.to_thread(_move_rows, *args)
+    return _move_rows(*args)
+
+
+async def _mark_absent(store, mark: list, back) -> None:
+    """Write the missing-folder marks: ``mark`` missing since now, ``back``
+    (listed again) present — in slices, a turn for the loop after each.
+    Tells the web clients (``availability``)."""
+    from soniqboom.core.store import ABSENT_FIELD
+    now = int(time.time())
+    gone = [(tid, {ABSENT_FIELD: now}) for tid in mark if tid in store._tracks]
+    came = [(tid, {ABSENT_FIELD: None}) for tid in back
+            if (store._tracks.get(tid) or {}).get(ABSENT_FIELD)]
+    items = gone + came
+    if not items:
+        return
+    for i in range(0, len(items), 500):
+        store.update_track_fields_batch(items[i:i + 500])
+        await asyncio.sleep(0)
+    if gone:
+        log.info("Scan: %d track(s) in folders missing for now are kept as unavailable "
+                 "(deleted if still missing after %d days)", len(gone),
+                 ABSENT_GRACE_S // 86400)
+    if came:
+        log.info("Scan: %d track(s) of folders that were missing are back", len(came))
+    try:
+        from soniqboom.core import availability
+        availability.notify_changed()
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+async def _hand_over_user_data(mapping: dict, why: str, *, old_rows: "dict | None" = None,
+                               carry: bool = True) -> int:
+    """Moved files (``mapping`` old id → new id, the new rows stored): the new
+    row takes over what the old one carried (``track_moves.carried_fields``,
+    unless ``carry`` is False — the caller wrote it into the new row), then
+    the rating, every user's plays and history, playlist entries and waveform
+    (``store.remap_track_ids``), the Subsonic stars, queues and bookmarks
+    (``SubsonicState.remap_track_ids``) and parked playlist entries follow.
+    The caller deletes the old rows (or leaves them to their root).  Returns
+    the files handed over."""
+    from soniqboom.core import track_moves
+    from soniqboom.core.store import PARKED_PLAYLIST_IDS
+    store = get_store()
+    mapping = {o: n for o, n in (mapping or {}).items()
+               if isinstance(o, str) and isinstance(n, str) and o != n and n in store._tracks}
+    if not mapping:
+        return 0
+    if carry:
+        updates = []
+        for o, n in mapping.items():
+            old = (old_rows or {}).get(o) or store._tracks.get(o) or {}
+            fields = track_moves.carried_fields(old, store._tracks[n])
+            if fields:
+                updates.append((n, fields))
+        # (``added_at`` re-keys sorted lists: many writes go in a batch section,
+        #  whose exit merges them in with turns for the loop)
+        big = len(updates) > 200
+        if big:
+            store.enter_batch_mode()
+        try:
+            for i in range(0, len(updates), 500):
+                store.update_track_fields_batch(updates[i:i + 500])
+                if big:
+                    await asyncio.sleep(0)
+        finally:
+            if big:
+                await asyncio.shield(_async_exit_batch_mode(store))
+    counts = store.remap_track_ids(mapping)
+    try:
+        from soniqboom.core.subsonic_state import get_state
+        await get_state().remap_track_ids(mapping)
+    except Exception:                                   # noqa: BLE001
+        log.debug("Subsonic stars / queues of moved files not moved", exc_info=True)
+    parked = store.get_config(PARKED_PLAYLIST_IDS) or []
+    if isinstance(parked, list) and any(p in mapping for p in parked):
+        store.set_config(PARKED_PLAYLIST_IDS, sorted({mapping.get(p, p) for p in parked}))
+    log.info("%s: %d moved / renamed file(s) keep their user data under the new path (%s)",
+             why, len(mapping), counts)
+    return len(mapping)
+
+
+def _rerooted_sources(store, root: str) -> list:
+    """The roots whose files the files of ``root`` (a root added, or scanned)
+    may be, found again under another address: ``[(old root, kept rows or
+    None)]`` — None: its rows in the library.  For a share: another address
+    of the same share (``track_moves.share_key``) that is offline or being
+    removed, or was removed (its rows with user data kept:
+    ``track_moves.REMOVED_ROOTS_KEY``).  For a folder: one being removed or
+    removed (never one that is only offline — that may be a second copy on
+    a drive that is unplugged), and never one inside or around it."""
+    from soniqboom.core import track_moves
+    remote = is_remote_path(root)
+    key = track_moves.share_key(root) if remote else None
+
+    def _fits(r: str) -> bool:
+        if r == root or is_remote_path(r) != remote:
+            return False
+        if remote:
+            return track_moves.share_key(r) == key
+        return not (_strictly_below(r, root) or _strictly_below(root, r))
+    try:
+        from soniqboom.core import removals
+        removing = set(removals.registry(store))
+    except Exception:                                   # noqa: BLE001
+        removing = set()
+    dead: set = set()
+    if remote:
+        try:
+            from soniqboom.core import availability
+            dead = {p for p, _k in availability._dead_roots(store).values()}
+        except Exception:                               # noqa: BLE001
+            dead = set()
+    out: list = [(r, None) for r in sorted((removing | dead) & (set(store._scan_dirs) | removing))
+                 if _fits(r)]
+    reg = track_moves.prune_ghosts(store.get_config(track_moves.REMOVED_ROOTS_KEY))
+    out += [(r, v["rows"]) for r, v in sorted(reg.items()) if _fits(r)]
+    return out
+
+
+def _match_rerooted(tracks: dict, root: str, srcs: list, new_rows: dict) -> tuple:
+    """(may run in a thread: reads only) ``_rerooted_moves``' matching."""
+    from soniqboom.core import track_moves
+    cands: dict = defaultdict(list)
+    for nid, row in new_rows.items():
+        rel = track_moves.rel_of(root, str(row.get("path") or ""))
+        if rel is None:
+            continue
+        for r, kept in srcs:
+            if kept is None:
+                oid = track_moves.track_id_for(r, rel)
+                old = tracks.get(oid)
+            else:
+                old = track_moves.ghost_row(rel, kept.get(rel))
+                oid = old.get("id") if old else None
+            if old is None or not oid or oid == nid:
+                continue
+            if track_moves.same_file_elsewhere(old, row):
+                cands[nid].append((oid, old, r, rel))
+    for nid, c in list(cands.items()):
+        # (a root being removed is also in the removed roots' registry while
+        #  its purge runs: one old row, found twice)
+        seen: dict = {}
+        for cand in c:
+            seen.setdefault(cand[0], cand)
+        cands[nid] = list(seen.values())
+    picked = [c[0] for c in cands.values() if len(c) == 1]
+    uses = Counter(oid for oid, _o, _r, _rel in picked)
+    mapping: dict = {}
+    olds: dict = {}
+    where: dict = {}
+    for nid, c in cands.items():
+        if len(c) != 1:
+            continue
+        oid, old, r, rel = c[0]
+        if uses[oid] != 1:
+            continue                            # (two new files for one old: unclear)
+        mapping[oid] = nid
+        olds[oid] = old
+        where[oid] = (r, rel)
+    return mapping, olds, where
+
+
+async def _rerooted_moves(store, root: str, new_rows: dict) -> int:
+    """New rows of ``root`` that are the files of another address of the same
+    share (or of a folder being removed / removed: ``_rerooted_sources``) at
+    the same path below it — the same size, and the same checksum or (none
+    on one side) modification time — take over their user data
+    (``_hand_over_user_data``); each only when exactly one old row fits.  The
+    kept rows of a removed root that were taken are dropped from the
+    registry, and so is ``root``'s own entry (added again under its own
+    address: its ids, and its user data, are its own).  Returns the files
+    handed over."""
+    from soniqboom.core import track_moves
+    reg0 = store.get_config(track_moves.REMOVED_ROOTS_KEY)
+    srcs = _rerooted_sources(store, root) if new_rows else []
+    mapping: dict = {}
+    olds: dict = {}
+    where: dict = {}
+    if srcs:
+        if len(new_rows) > 5000:
+            mapping, olds, where = await asyncio.to_thread(
+                _match_rerooted, store._tracks, root, srcs, dict(new_rows))
+        else:
+            mapping, olds, where = _match_rerooted(store._tracks, root, srcs, new_rows)
+    # (only rows stored now — a commit may have left some out; only the kept
+    #  rows of the pairs handed over are used up)
+    mapping = {o: n for o, n in mapping.items() if n in store._tracks}
+    consumed: dict = defaultdict(set)
+    for o in mapping:
+        r, rel = where[o]
+        consumed[r].add(rel)
+    n = await _hand_over_user_data(mapping, f"Scan of {root}", old_rows=olds) if mapping else 0
+    if isinstance(reg0, dict) and reg0:
+        reg = track_moves.prune_ghosts(store.get_config(track_moves.REMOVED_ROOTS_KEY))
+        if root in store._scan_dirs:
+            reg.pop(root, None)             # (listed again: its own ids hold its data)
+        for r, rels in consumed.items():
+            v = reg.get(r)
+            if v is not None and rels:
+                rows = {k: e for k, e in v["rows"].items() if k not in rels}
+                if rows:
+                    reg[r] = {**v, "rows": rows}
+                else:
+                    reg.pop(r, None)
+        if reg != reg0:
+            store.set_config(track_moves.REMOVED_ROOTS_KEY, reg)
+    return n
+
+
+def _ids_with_user_data(store, counts: bool = False):
+    """The track ids anything of a user's names: a rating, any user's plays
+    or history, a playlist entry, a Subsonic star / queue entry / bookmark.
+    ``counts``: ``(those ids, ({id: plays of every user}, the ids given
+    something on purpose — a rating, a playlist entry, a Subsonic
+    reference))``."""
+    from soniqboom.core.store import _entry_tid
+    given = set(store._ratings)
+    for pl in (store._playlists or {}).values():
+        if isinstance(pl, dict):
+            given.update(_entry_tid(e) for e in (pl.get("track_ids") or ()))
+    try:
+        from soniqboom.core.subsonic_state import get_state
+        given |= get_state().referenced_track_ids()
+    except Exception:                                   # noqa: BLE001
+        log.debug("Subsonic references not read", exc_info=True)
+    plays: dict = {}
+    for m in (store._play_stats or {}).values():
+        if isinstance(m, dict):
+            for tid, st in m.items():
+                c = st.get("count", 0) if isinstance(st, dict) else 0
+                plays[tid] = plays.get(tid, 0) + (c if isinstance(c, int) else 0)
+    ids = given | set(plays)
+    for h in (store._history or {}).values():
+        if isinstance(h, list):
+            ids.update(e.get("track_id") for e in h if isinstance(e, dict))
+    ids.discard(None)
+    given.discard(None)
+    return (ids, (plays, given)) if counts else ids
+
+
+def remember_removed_root(store, root: str, ids) -> int:
+    """A root's tracks are deleted with it (Settings → Remove / Disconnect
+    with its tracks): keep the identity and the carried fields of its rows
+    that hold user data (``track_moves.REMOVED_ROOTS_KEY``), so the same
+    files added again under another address of the share take it over
+    (``_rerooted_moves``).  Returns the rows kept."""
+    from soniqboom.core import track_moves
+    users, plays = _ids_with_user_data(store, counts=True)
+    picked: list = []
+    for tid in ids:
+        t = store._tracks.get(tid)
+        if t is None:
+            continue
+        own = bool(t.get("user_edited") or t.get("health"))
+        if tid not in users and not own:
+            continue
+        rel = track_moves.rel_of(root, str(t.get("path") or ""))
+        if rel is not None:
+            # (what is kept when there are too many: what the user gave the
+            #  track — a rating, a playlist entry, a star, an edit — then the
+            #  most played)
+            picked.append((own or tid in plays[1], plays[0].get(tid, 0), rel, t))
+    if not picked:
+        return 0
+    picked.sort(key=lambda x: (not x[0], -x[1]))
+    rows = {rel: track_moves.ghost_entry(t)
+            for _g, _n, rel, t in picked[:track_moves.GHOST_MAX_ROWS]}
+    reg = track_moves.prune_ghosts(store.get_config(track_moves.REMOVED_ROOTS_KEY))
+    prev = (reg.get(root) or {}).get("rows") or {}
+    merged = {**prev, **rows}
+    if len(merged) > track_moves.GHOST_MAX_ROWS:
+        merged = rows
+    reg[root] = {"at": int(time.time()), "rows": merged}
+    reg = track_moves.prune_ghosts(reg)
+    store.set_config(track_moves.REMOVED_ROOTS_KEY, reg)
+    kept = len((reg.get(root) or {}).get("rows") or {})
+    log.info("Removed %s: %d track(s) with user data remembered for a re-add under "
+             "another address (%d left out)", root, kept, len(picked) - kept)
+    return kept
 
 
 def _listing_fingerprint() -> str:
@@ -4494,20 +4989,42 @@ async def _run_scan(
     folder watcher) limits a root to those files/folders: discovery, the
     unchanged-file check and orphan pruning then cost what changed, not the
     whole library.  The scan's extraction pools are released however it
-    ends — done, failed or cancelled (a stop)."""
+    ends — done, failed or cancelled (a stop) — and a scan that failed or
+    was cancelled after counting itself running is counted down (only
+    such a one: a scan failing before that never touches the count).  A
+    failure is logged here; a counted-down one with no progress callback
+    then sends the frame ``_scan_ended`` asks for (pages re-read: what it
+    wrote before failing is unknown).  A stop sends none."""
     pools: list = []
+    counted: list = []          # non-empty while the scan counts as running
+    epoch = _run_epoch
+    failed = False
     try:
-        return await _run_scan_body(directories, on_progress, scope, light, pools)
+        return await _run_scan_body(directories, on_progress, scope, light, pools, counted)
+    except Exception:
+        failed = True
+        log.exception("Scan failed with unhandled error")
+        raise
     finally:
+        # Counted down first (synchronous, before anything that can raise or
+        # yield) — unless a later server run reset the scan state: this is
+        # then an earlier run's coroutine, closed only now.
+        _end = (_count_scan_down(on_progress, True)
+                if counted and epoch == _run_epoch else None)
         seen: set = set()
         for pool in pools:
             if id(pool) not in seen:
                 seen.add(id(pool))
                 _release_pool(pool)
+        if failed and on_progress is None:
+            await _send_scan_end(_end)
 
 
-async def _run_scan_body(directories, on_progress, scope, light, pools: list) -> bool:
-    """``_run_scan``'s work; every extraction pool it makes is added to ``pools``."""
+async def _run_scan_body(directories, on_progress, scope, light, pools: list,
+                         counted: list) -> bool:
+    """``_run_scan``'s work; every extraction pool it makes is added to
+    ``pools``; ``counted`` holds an entry from counting itself running
+    (``_scan_count``) until it counts itself down at its end."""
     global _progress, _scan_count, _prog_batch_entered
     _changed = False
     _hvsc_new = False          # HVSC auto-configured by THIS scan → apply even if nothing changed
@@ -4747,6 +5264,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         _progress = ScanProgress(total=total, running=True,
                                  last_plan=dict(_progress.last_plan) if scope else {})
     _scan_count += 1
+    counted.append(True)                        # (from here a raise or stop is counted down)
     _scan_began(on_progress, [str(d) for d in directories])   # (resolved by start_scan)
     # Remember the resolved dirs this scan covers — survives completion (unlike
     # ``current_dirs``, cleared the instant the scan ends) so the scan-complete
@@ -4781,6 +5299,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     _deferred: bool = len(store._tracks) > 0
     _pending_tracks: list[dict] = []   # accumulated new/changed track dicts
     _pending_deleted: set[str]  = set()  # accumulated orphan ids to prune
+    _back_ids: set[str] = set()        # tracks of folders that were missing, listed again
     if not _deferred:
         store.enter_batch_mode()   # defer O(n) sorted-list rebuilds during scan
         # This enter has no try/finally over the Phase-1 span, so a mid-Phase-1
@@ -5448,6 +5967,10 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         #      its live siblings prove the enumeration is real.  A genuinely
         #      emptied root is cleared explicitly via "remove folder".
         expected_ids = set(track_ids_for_files.values())
+        if store._absent_ids:
+            # (files of folders that were missing, listed again: present —
+            # written at the commit, ``_mark_absent``)
+            _back_ids |= expected_ids & store._absent_ids
         if _scoped is not None:
             # The deferred store is untouched since the lookup above; a
             # progressive write only ADDS this scan's own (expected) ids.
@@ -5563,6 +6086,8 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         # just (re-)extracted.  An upsert always wins over a delete.
         if _pending_deleted:
             _pending_deleted -= {t["id"] for t in _pending_tracks}
+        from soniqboom.core import track_moves as _tm
+        _made_stale: list[str] = []
         # A re-extracted file whose metadata equals the stored track (touched,
         # rewritten identically, copied over itself) only needs its mtime/size
         # refreshed: no re-index, and it is not a library change.  A genuinely
@@ -5572,6 +6097,8 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
         _material: list[dict] = []
         _old_versions: dict[str, "dict | None"] = {}
         for _i, _td in enumerate(_pending_tracks):
+            if _tm.file_changed(store._tracks.get(_td["id"]), _td):
+                _made_stale.append(_td["id"])
             _old, _patch = _classify_reextract(store, _td)
             if _patch is not None:
                 _touch.append((_td["id"], _patch))
@@ -5580,6 +6107,65 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                 _material.append(_td)
             if _i % 2000 == 1999:
                 await asyncio.sleep(0)
+        # A file that changed on disk (another size, checksum or time) no
+        # longer plays what was made from it: its renders, transcodes, VU data
+        # and waveform go before the commit — as a share's scan does.
+        if _made_stale:
+            await _purge_made_from(_made_stale)
+        # Moved / renamed files (a folder renamed, tunes an HVSC update moved,
+        # a move the watcher saw): a row no longer listed and a new row that
+        # are the same file (``track_moves.match_moves``) — the new row takes
+        # over what the old one carried here, and its user data at the commit.
+        # The two halves of a move may also come in two passes (the watcher
+        # scans a folder still receiving events later; a walk with a read error
+        # prunes nothing): the rows kept as missing are old candidates too, and
+        # while rows are no longer listed, the rows added lately are new ones
+        # (``_recent_ids``).
+        _new_rows = {_td["id"]: _td for _td in _material if _old_versions.get(_td["id"]) is None}
+        _moved: dict = {}                  # → new rows of this pass (carried here)
+        _moved_post: dict = {}             # → rows stored by an earlier pass
+        _gone_rows: dict = {}
+        _seen_now = {_td["id"] for _td in _pending_tracks}
+        _absent_old = (store._absent_ids - _back_ids - _seen_now) if _new_rows else set()
+        if _pending_deleted or _absent_old:
+            _recent = (_recent_ids(store, _pending_deleted | _absent_old | _seen_now)
+                       if _pending_deleted else [])
+            if _new_rows or _recent:
+                _all, _gone_rows = await _find_moves(
+                    store, _pending_deleted | _absent_old, _new_rows, _recent)
+                _moved = {o: n for o, n in _all.items() if n in _new_rows}
+                _moved_post = {o: n for o, n in _all.items() if n not in _new_rows}
+            for _o, _n in _moved.items():
+                _new_rows[_n].update(_tm.carried_fields(_gone_rows[_o], _new_rows[_n]))
+        # The other rows no longer listed: deleted, or kept as unavailable while
+        # their folder is missing (``_settle_orphans``).  (Moved rows go.)
+        _absent_mark: list[str] = []
+        _rest = _pending_deleted - set(_moved) - set(_moved_post)
+        _gone_now: set = set()
+        if _rest:
+            _absent_mark, _gone_now = await _settle_orphans(store, _rest)
+        _pending_deleted = set(_moved) | set(_moved_post) | _gone_now
+        _taken = set(_moved.values())
+        _by_root: dict[str, dict] = {}
+        if _new_rows:
+            _root_of = {path_hash(r): r for r in dir_files}
+            for _nid, _td in _new_rows.items():
+                _r = _root_of.get(_td.get("scan_root_hash"))
+                if _r is not None and _nid not in _taken:
+                    _by_root.setdefault(_r, {})[_nid] = _td
+
+        async def _hand_over_moves() -> None:
+            """(after the upserts, before the deletes)"""
+            if _moved:
+                await _hand_over_user_data(_moved, "Scan", carry=False)
+            if _moved_post:
+                await _hand_over_user_data(_moved_post, "Scan", old_rows=_gone_rows)
+            for _r, _rows in _by_root.items():
+                try:
+                    await _rerooted_moves(store, _r, _rows)
+                except Exception:                       # noqa: BLE001 — never fails the scan
+                    log.warning("Scan: handing user data over from another address of %s "
+                                "failed", _r, exc_info=True)
         for _tid in _pending_deleted:
             _old_versions[_tid] = store._tracks.get(_tid)
         for i in range(0, len(_touch), 500):          # cheap: no index is touched
@@ -5602,6 +6188,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                     for i in range(0, len(_material), 25):
                         store.upsert_tracks_batch(_drop_removed_roots(_material[i : i + 25]))
                         await asyncio.sleep(0)
+                    await _hand_over_moves()
                     await _carry_renamed_members(_pending_deleted)
                     _del = list(_pending_deleted)
                     for i in range(0, len(_del), 50):
@@ -5623,6 +6210,7 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                         for i in range(0, len(_material), WRITE_CHUNK):
                             store.upsert_tracks_batch(_drop_removed_roots(_material[i : i + WRITE_CHUNK]))
                             await asyncio.sleep(0)
+                        await _hand_over_moves()
                         if _pending_deleted:
                             await _carry_renamed_members(_pending_deleted)
                             _del = list(_pending_deleted)
@@ -5648,10 +6236,33 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
                 # Nothing changed (incremental re-scan, all files skipped) — the live
                 # store is already correct, so do NO work at all: no rebuild, no swap.
                 log.debug("Scan: no track changes — skipping commit (live unchanged)")
+            # Tracks of folders missing for now, and of folders back again
+            # (no library change: their rows stay; ``availability`` lists them).
+            await _mark_absent(store, [t for t in _absent_mark if t not in _pending_deleted],
+                         _back_ids)
     else:
         await _async_exit_batch_mode(store)
         _prog_batch_entered = False   # progressive batch section closed cleanly
         _changed = _changed or bool(all_track_ids)
+        # (a first scan into an empty library: a folder removed with its
+        #  tracks and added again elsewhere takes its kept user data back)
+        _want = [r for r in dir_files if _rerooted_sources(store, r)] if all_track_ids else []
+        if _want:
+            _hs = {path_hash(r): r for r in _want}
+            _by_root_p: dict[str, dict] = {}
+            for _i, _tid in enumerate(all_track_ids):
+                _t = store._tracks.get(_tid)
+                _r = _hs.get((_t or {}).get("scan_root_hash"))
+                if _r is not None:
+                    _by_root_p.setdefault(_r, {})[_tid] = _t
+                if _i % 5000 == 4999:
+                    await asyncio.sleep(0)
+            for _r, _rows in _by_root_p.items():
+                try:
+                    await _rerooted_moves(store, _r, _rows)
+                except Exception:                       # noqa: BLE001 — never fails the scan
+                    log.warning("Scan: handing user data over from another address of %s "
+                                "failed", _r, exc_info=True)
 
     if scope and _changed:
         from soniqboom.core.data import path_hash as _ph
@@ -5746,12 +6357,8 @@ async def _run_scan_body(directories, on_progress, scope, light, pools: list) ->
     except Exception:                                   # noqa: BLE001 — never fails the scan
         log.warning("Queueing the nested roots' own scans failed", exc_info=True)
 
-    _scan_count = max(0, _scan_count - 1)
-    if _scan_count == 0:
-        _progress.running      = False
-        _progress.embedding    = False
-        _progress.current_file = ""
-    _end = _scan_ended(on_progress, _changed)
+    counted.clear()                             # (counted down here, not by _run_scan)
+    _end = _count_scan_down(on_progress, _changed)
 
     if on_progress:
         await on_progress(_progress)
@@ -5783,8 +6390,9 @@ _prog_batch_entered: bool = False
 
 def _reset_scan_state() -> None:
     """``begin_run``: the scan state a previous server run in this process
-    left behind — its event loop closed under a running scan (cancelled, so
-    no ``finally`` of the scan code counted it down), its pause event bound
+    left behind — its event loop closed under a running scan (one still
+    pending then never counted itself down: ``_run_scan`` leaves a later
+    run's count alone), its pause event bound
     to that loop — back to idle; a batch level the progressive first-scan
     path left open is unwound (as ``_drain_scan_queue`` does after a crash)."""
     global _pause_event, _scan_count, _scan_task, _progress, _prog_batch_entered
@@ -6524,7 +7132,7 @@ def _schedule_folder_album_pass() -> None:
 async def _drain_scan_queue() -> None:
     """Run scans sequentially until the queue is empty."""
     global _scan_task, _current_scan_dirs, _current_scan_scoped, _current_scan_light
-    global _scan_count, _progress, _prog_batch_entered
+    global _prog_batch_entered
     any_changed = False
     while _scan_queue:
         dirs_set, cb, scope, light = _scan_queue.pop(0)
@@ -6537,18 +7145,9 @@ async def _drain_scan_queue() -> None:
             any_changed = bool(await _run_scan(list(dirs_set), cb, scope=scope,
                                                light=_current_scan_light)) or any_changed
         except Exception:
-            log.exception("Scan failed with unhandled error")
-            # Ensure progress state is always cleaned up so the UI
-            # doesn't show "scanning" forever.
-            _scan_count = max(0, _scan_count - 1)
-            if _scan_count == 0:
-                _progress.running      = False
-                _progress.embedding    = False
-                _progress.current_file = ""
-            # (what it wrote before failing is unknown: pages re-read)
-            _end = _scan_ended(cb, True)
-            if cb is None:
-                await _send_scan_end(_end)
+            # (``_run_scan`` has logged it, and counted it down if it had
+            #  counted itself running, so the UI doesn't show "scanning"
+            #  forever.)
             # The progressive first-scan path enters batch mode with no
             # try/finally over its Phase-1 span, so a mid-Phase-1 raise leaks
             # exactly ONE batch level (``_prog_batch_entered``), which would
@@ -7695,20 +8294,25 @@ async def start_remote_scan(
     # order) meant (a) /admin/scan/status showed the PREVIOUS scan's
     # final state for the entire phase ("not progressing"), and (b) the
     # dedupe gate above couldn't see a walk-phase scan, so a double
-    # trigger started a parallel walk against the same share.
+    # trigger started a parallel walk against the same share.  The pool
+    # comes first (it raises once the server is stopping: nothing counted
+    # yet); from the registration on, everything that can fail or yield is
+    # inside the ``try`` whose ``finally`` undoes it — else the share would
+    # stay "in progress" for the dedupe gate until a restart.
+    epoch = _run_epoch                          # (this server run's — see the finally)
+    executor = _process_pool(SCAN_WORKERS)
     _scan_count += 1
     _scan_began(on_progress, [scan_root])
     _current_remote_dirs.add(scan_root)
     if not _progress.running:
         _progress = ScanProgress(total=0, running=True)
     _progress.current_file = f"Discovering files in {scan_root}…"
-    if on_progress:
-        await on_progress(_progress)
 
-    executor = _process_pool(SCAN_WORKERS)
     batch_state = {"entered": False}
     plan: dict = {}
     try:
+        if on_progress:
+            await on_progress(_progress)
         plan = await _remote_scan_body(
             share_id, scan_root, source, on_progress,
             dir_mtime_cap=dir_mtime_cap, executor=executor,
@@ -7728,28 +8332,36 @@ async def start_remote_scan(
         # re-creating the exact zombie state this wrapper exists to
         # prevent.  Only after the flags are safe do we attempt the
         # (shielded) awaits, each swallowing BaseException so a
-        # cancellation can't abort the remaining cleanup steps.
+        # cancellation can't abort the remaining cleanup steps.  (The pool
+        # is released after the flags.)  For a scan of an earlier server run
+        # in this process (``begin_run`` reset the scan state while it ran)
+        # this finally leaves what the new run owns alone — its flags,
+        # counts and pages (and the post-scan passes below are skipped); its
+        # pool and batch level are its own.
+        _current = epoch == _run_epoch
+        _lib_changed, _end = False, None
+        if _current:
+            _current_remote_dirs.discard(scan_root)
+            _scan_count = max(0, _scan_count - 1)
+            if _scan_count == 0:
+                _progress.running = False
+                _progress.embedding = False
+                _progress.current_file = ""
+                # Snap processed up to total ONLY when the last scan finishes
+                # (see the parallel-scan display bug note in _run_scan).
+                if _progress.processed < _progress.total:
+                    _progress.processed = _progress.total
+            # (a freshness poll that added, changed or removed tracks changed
+            # the library — open pages re-read: ``_send_scan_end`` below;
+            # re-read files found unchanged are no change.  The body counts
+            # what the store took in ``batch_state`` — also when it died
+            # half-way — and puts it in its plan; a plan without that count
+            # says what it planned.)
+            _lib_changed = (bool(plan.get("extract") or plan.get("ghosts"))
+                            if plan and "changed" not in plan
+                            else bool(batch_state.get("changed")))
+            _end = _scan_ended(on_progress, _lib_changed)
         _release_pool(executor)
-        _current_remote_dirs.discard(scan_root)
-        _scan_count = max(0, _scan_count - 1)
-        if _scan_count == 0:
-            _progress.running = False
-            _progress.embedding = False
-            _progress.current_file = ""
-            # Snap processed up to total ONLY when the last scan finishes
-            # (see the parallel-scan display bug note in _run_scan).
-            if _progress.processed < _progress.total:
-                _progress.processed = _progress.total
-        # (a freshness poll that added, changed or removed tracks changed the
-        # library — open pages re-read: ``_send_scan_end`` below; re-read
-        # files found unchanged are no change.  The body counts what the
-        # store took in ``batch_state`` — also when it died half-way — and
-        # puts it in its plan; a plan without that count says what it
-        # planned.)
-        _lib_changed = (bool(plan.get("extract") or plan.get("ghosts"))
-                        if plan and "changed" not in plan
-                        else bool(batch_state.get("changed")))
-        _end = _scan_ended(on_progress, _lib_changed)
         if batch_state["entered"]:
             try:
                 # shield: on cancellation the await raises immediately but
@@ -7758,7 +8370,7 @@ async def start_remote_scan(
             except BaseException:
                 log.exception(
                     "exit_batch_mode failed after remote scan of %s", scan_root)
-        if on_progress:
+        if on_progress and _current:
             try:
                 await on_progress(_progress)
             except BaseException:
@@ -7768,6 +8380,8 @@ async def start_remote_scan(
                 await _send_scan_end(_end)
             except BaseException:
                 pass
+    if epoch != _run_epoch:
+        return plan                             # (an earlier run's scan: see the finally)
     # Reached on the normal and handled-exception paths (a cancellation
     # re-raises out of the finally above and never gets here).  ``plan`` is
     # this scan's own plan, or {} if the body died before building one.
@@ -7806,9 +8420,20 @@ async def _purge_made_from(track_ids: "list[str]") -> None:
         get_store().forget_waveforms(track_ids)
         import sys as _sys
         st = _sys.modules.get("soniqboom.api.stream")
+        ids = set(track_ids)
         if st is not None:
             for tid in track_ids:
                 st._RANGED_INFO_DONE.discard(tid)
+                # (per-file facts read from the old content: a rewritten uade
+                # module's subsong base, a SID's start song)
+                st._UADE_BASE_MEMO.pop(tid, None)
+                st._SID_START_SONG.pop(tid, None)
+        cr = _sys.modules.get("soniqboom.core.cast_render")
+        if cr is not None:
+            # (cast's memo of a chip render's cache key: the old content's key
+            # would pin the wrong entry while the new render plays)
+            for k in [k for k in list(cr._CHIP_KEYS) if k[0] in ids]:
+                cr._CHIP_KEYS.pop(k, None)
     except Exception:
         log.debug("purging what was made from changed files failed", exc_info=True)
 
@@ -8246,6 +8871,7 @@ async def _remote_scan_body(
     # share, or moved: one add, one purge) never reached the index.
     from soniqboom.api.fstree import root_commit as _root_commit
     _browse_added = [0]                 # tracks this scan added (for the disk copy, below)
+    _scan_new_ids: set[str] = set()     # … their ids (moved files: ``_hand_over_user_data``)
 
     async def _flush():
         nonlocal track_buffer, art_buffer
@@ -8269,6 +8895,8 @@ async def _remote_scan_body(
                         else:
                             material.append(td)
                             _old_versions.setdefault(td["id"], _old)
+                            if _old is None:
+                                _scan_new_ids.add(td["id"])
                     if touch:
                         store.update_track_fields_batch(touch)
                     if material:
@@ -8970,6 +9598,19 @@ async def _remote_scan_body(
             purge_ids = ghost_ids
             protected = 0
         try:
+            if purge_ids and _scan_new_ids:
+                # Files moved / renamed on the share: the same file under a
+                # new path (``track_moves.match_moves``) keeps its user data.
+                from soniqboom.core import track_moves as _tm
+                _olds = {t: store._tracks[t] for t in purge_ids if t in store._tracks}
+                _news = {t: store._tracks[t] for t in _scan_new_ids if t in store._tracks}
+                if len(_olds) + len(_news) > 5000:          # (reads only: off the loop)
+                    _moved = await asyncio.to_thread(_tm.match_moves, _olds, _news)
+                else:
+                    _moved = _tm.match_moves(_olds, _news)
+                if _moved:
+                    await _hand_over_user_data(_moved, f"Scan of {scan_root}")
+                    _scan_new_ids.difference_update(_moved.values())
             if purge_ids:
                 await _carry_renamed_members(purge_ids)
                 await _carry_healed_smb_paths(scan_root, ghost_pairs, set(purge_ids),
@@ -9011,6 +9652,17 @@ async def _remote_scan_body(
             )
         except Exception as exc:
             log.warning("Ghost cleanup for %s failed: %s", scan_root, exc)
+
+    # The share added again under another address (or a removed one's files
+    # found here): its new rows take the old address's user data
+    # (``_rerooted_moves``).
+    try:
+        _rows_new = ({t: store._tracks[t] for t in _scan_new_ids if t in store._tracks}
+                     if _scan_new_ids and _rerooted_sources(store, scan_root) else {})
+        await _rerooted_moves(store, scan_root, _rows_new)
+    except Exception:                                   # noqa: BLE001 — never fails the scan
+        log.warning("Handing user data over from another address of %s failed", scan_root,
+                    exc_info=True)
 
     # A scan that added as many tracks as it purged (a move: the add in a
     # flush, the purge above) leaves the share's count as it was, so the
@@ -9299,6 +9951,18 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
 
     gone = [t["id"] for p_str, t in existing.items()
             if p_str not in found and not _in_failed_archive(p_str, _failed_archives)]
+    # (tracks of folders that were missing, listed again — ``_mark_absent``)
+    _back = [t["id"] for p_str, t in existing.items() if p_str in found and t.get("absent_since")]
+    # A file that changed on disk no longer plays what was made from it (as a
+    # scan's commit: ``_purge_made_from``).
+    from soniqboom.core import track_moves as _tm
+    _made_stale = [t.id for t in ready
+                   if _tm.file_changed(store.get_track(t.id),
+                                       {"file_size": t.file_size, "mtime": t.mtime,
+                                        "sid_md5": t.sid_md5, "file_md5": t.file_md5})]
+    if _made_stale:
+        await _purge_made_from(_made_stale)
+
     def _sub_state() -> "tuple[str, bool]":
         # (a realpath and a stat — a network drive: off the loop)
         return str(Path(sub).expanduser().resolve()), bool(gone) and Path(sub).is_dir()
@@ -9335,6 +9999,7 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
                 "checked": n_checked, "errors": errors, "skipped": True}
     stopped = False
     unchanged = 0
+    _new_ids: list[str] = []
     # (the old root of a track this pass re-tags too: nested roots — and the
     #  root owning this one's folder while this one is being removed)
     _olds = {(store._tracks.get(t.id) or {}).get("scan_root_hash") for t in ready} - {None, ""}
@@ -9365,6 +10030,7 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
                     continue
                 if _prev is None:
                     added += 1
+                    _new_ids.append(td["id"])
                 else:
                     updated += 1
                 _old_versions.setdefault(td["id"], _prev)
@@ -9377,11 +10043,32 @@ async def _drill_down_apply(store, root, sub, to_scan, existing, found, walk_err
             await asyncio.sleep(0)
         if not stopped and _root_removed():
             stopped = True
+        _absent_mark: list[str] = []
         if prune and not stopped:
             from soniqboom.core.data import delete_track_ids
+            # Moved files hand their user data to their new rows; the rest are
+            # deleted, or kept as unavailable while their folder is missing
+            # (``_settle_orphans``).
+            # (as a scan's commit: the rows kept as missing are old candidates,
+            #  the rows added lately new ones — ``_recent_ids``)
+            _seen = set(_back) | {t.id for t in ready}
+            _absent_old = (store._absent_ids - _seen) if _new_ids else set()
+            _here = {t: store._tracks[t] for t in _new_ids if t in store._tracks}
+            _cands = (_recent_ids(store, set(gone) | _absent_old | _seen | set(_here))
+                      if gone else [])
+            _moved, _olds = await _find_moves(store, set(gone) | _absent_old, _here, _cands)
+            if _moved:
+                await _hand_over_user_data(_moved, f"Refresh of {sub}", old_rows=_olds)
+            _absent_mark, _gone_now = await _settle_orphans(
+                store, [t for t in gone if t not in _moved])
+            gone = [t for t in gone if t in _gone_now] + list(_moved)
             for _tid in gone:
                 _old_versions.setdefault(_tid, store._tracks.get(_tid))
-            removed = await delete_track_ids(gone)
+            if gone:
+                await _carry_renamed_members(gone)
+            removed = await delete_track_ids(gone) if gone else 0
+        if not stopped:
+            await _mark_absent(store, _absent_mark, _back)
         if _old_versions and not stopped:
             await _refresh_browse_after_commit(store, _old_versions)
     return {"added": added, "updated": updated, "removed": removed,

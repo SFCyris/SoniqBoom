@@ -682,3 +682,76 @@
 @media (prefers-reduced-motion: reduce) {
   :root[data-ui-style="retro"] #ti-panel :is(.ti-sub-row.playing, .ti-sub-abtn:active, .ti-nav-btn:active, .ti-close:active) { transform: none; }
 }
+
+/* ── CSDb section of a SID (Scene tab; js/csdb_view.js) ──────────────────────
+   Reuses the Scene tab's blocks; only the screenshot row is its own: the C64
+   screenshot at its pixel shape (320×200, never wider than the pane), shown
+   once it has loaded. */
+#ti-panel .ti-csdb-top { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+#ti-panel .ti-csdb-shot {
+  flex: 0 1 240px; min-width: 0; max-width: min(100%, 320px); width: 240px; height: auto;
+  aspect-ratio: auto 16 / 10; image-rendering: pixelated;
+  border-radius: 3px; border: 1px solid var(--border); background: #000;
+  opacity: 0; transition: opacity 0.2s;
+}
+#ti-panel .ti-csdb-shot.loaded { opacity: 1; }
+#ti-panel .ti-csdb-sum { flex: 1 1 160px; min-width: 0; }
+#ti-panel .ti-csdb-rating { margin-top: 6px; font-size: 13px; font-weight: 600; color: var(--accent); }
+#ti-panel .ti-csdb-shot-cap { margin-top: 4px; }
+#ti-panel .ti-csdb-sub { margin-top: 12px; }
+#ti-panel .ti-csdb-rels .ti-scene-disco-m { overflow-wrap: anywhere; }
+/* Retro hi-fi: the screenshot is a photo pasted on the J-card; the rating is
+   printed in the card's accent ink */
+:root[data-ui-style="retro"] #ti-panel .ti-csdb-shot {
+  border-radius: 1px; border-color: color-mix(in srgb, var(--ti-ink-2) 55%, transparent);
+  box-shadow: 2px 2px 0 color-mix(in srgb, var(--ti-ink) 18%, transparent);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-csdb-rating { color: var(--ti-ink-accent); font-family: var(--ti-face); letter-spacing: 0.04em; }
+@media (prefers-reduced-motion: reduce) { #ti-panel .ti-csdb-shot { transition: none; } }
+
+/* ── Voices pane, Retro: a VFD window per voice, Mute / Solo keys with a lamp
+   (amber while engaged) ───────────────────────────────────────────────────── */
+:root[data-ui-style="retro"] #ti-panel .ti-voices-list {
+  --ti-scope-ink: var(--ti-vfd);
+  --ti-scope-dim: color-mix(in srgb, var(--ti-vfd) 20%, transparent);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-voice-scope {
+  background: var(--ti-vfd-glass);
+  border: 1px solid #000; border-radius: 3px;
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.8);
+}
+:root[data-ui-style="retro"] #ti-panel :is(.ti-voice-n, .ti-voice-name, .ti-voices-status, .ti-voices-note) {
+  font-family: var(--ti-face); letter-spacing: 0.04em;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-voice-name { color: var(--ti-print); text-transform: uppercase; font-weight: 700; }
+:root[data-ui-style="retro"] #ti-panel :is(.ti-voice-n, .ti-voices-status, .ti-voices-note) { color: var(--ti-print-2); }
+:root[data-ui-style="retro"] #ti-panel :is(.ti-voice-btn, .ti-voices-reset) {
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  border-radius: 4px;
+  border: 1px solid var(--ti-key-edge);
+  background: var(--ti-key-bg);
+  box-shadow: var(--ti-key-shadow);
+  color: var(--ti-key-text);
+  font-family: var(--ti-face); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+}
+:root[data-ui-style="retro"] #ti-panel .ti-voice-btn { width: 34px; }
+:root[data-ui-style="retro"] #ti-panel .ti-voice-btn::before {
+  content: ''; flex: none;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--ti-lamp-off); box-shadow: var(--ti-lamp-off-shadow);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-voice { grid-template-columns: 22px minmax(56px, 104px) minmax(0, 1fr) 34px 34px; }
+:root[data-ui-style="retro"] #ti-panel :is(.ti-voice-btn, .ti-voices-reset):hover {
+  background: var(--ti-key-bg-hover); color: var(--ti-key-text); border-color: var(--ti-key-edge);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-voice-btn[aria-pressed="true"] {
+  background: var(--ti-key-pressed); color: var(--ti-key-text); border-color: var(--ti-key-edge);
+  box-shadow: inset 0 2px 3px rgba(0,0,0,0.55), 0 1px 0 rgba(255,255,255,0.06);
+}
+:root[data-ui-style="retro"] #ti-panel .ti-voice-btn[aria-pressed="true"]::before {
+  background: var(--ti-lamp-hold);
+  box-shadow: 0 0 5px 1px color-mix(in srgb, var(--ti-lamp-hold) 55%, transparent);
+}
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-voice-btn[aria-pressed="true"] { box-shadow: inset 0 2px 3px rgba(0,0,0,0.25); }
+:root[data-theme="light"][data-ui-style="retro"] #ti-panel .ti-voice-btn[aria-pressed="true"]::before { box-shadow: 0 0 0 1px rgba(0,0,0,0.45); }
+

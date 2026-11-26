@@ -190,7 +190,7 @@ RENDERER_NAMES = frozenset({
     "psgplay", "sc68", "ym2wav", "hvl2wav", "openmpt123", "gme", "ffmpeg",
     "metaflac", "lha", "kssrender", "dsfrender", "milkyrender", "mlrender", "mdxrender",
     "gt2reloc", "sunvoxrender", "furnace", "furnace-headless", "xmprender",
-    "sawteethrender",
+    "sawteethrender", "oplvoices",
 })
 _IN_CMD_RE = re.compile(r"soniqboom-render-([0-9a-f]{8})-(\d+)-([0-9a-f]{8})(?=/)")
 

@@ -34,7 +34,9 @@
  */
 import { Player } from './player.js';
 import { Library } from './library.js';
-import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, subsongStartOf } from './utils.js';
+import { artPlaceholderEmoji, Toast, probeAdlibDurations, subsongWireToTune, subsongStartOf, trapFocus } from './utils.js';
+import { confirmKeyAction, confirmInitialFocus } from './confirm_keys.js';
+import { newPlaylistEntries, remapSelection, remapIndex, movedSelection } from './playlist/edit_view.js';
 import { createVirtualList } from './vlist.js';
 import { offlineKind, offlineBadgeHTML } from './offline.js';
 import { healthBadgeHTML } from './health.js';
@@ -103,45 +105,73 @@ let _anchorIdx    = null;        // Shift-click anchor
 // title/okLabel options).  If admin.js later overrides ``__sbConfirm`` with
 // a richer dialog the playlist will pick that up automatically because the
 // callers read ``window.__sbConfirm`` lazily on each invocation.
-function _inlineConfirm(message, { title = 'Confirm', okLabel = 'OK' } = {}) {
+// Keys (confirm_keys.js): Enter / Space answer for the FOCUSED button only, so
+// Enter on a focused Cancel cancels; Escape cancels; a destructive confirm
+// (``dangerColor``, the default — as Settings' styledConfirm) opens on Cancel.
+// The dialog owns its keys (app.js's Space = play/pause never sees them) and
+// Tab stays inside it.
+function _inlineConfirm(message, { title = 'Confirm', okLabel = 'OK', dangerColor = true } = {}) {
   return new Promise((resolve) => {
+    const prevFocus = (document.activeElement instanceof HTMLElement) ? document.activeElement : null;
     const backdrop = document.createElement('div');
     backdrop.className = 'pl-modal-backdrop';
     const dialog = document.createElement('div');
     dialog.className = 'pl-modal-dialog';
+    dialog.setAttribute('role', 'alertdialog');
+    dialog.tabIndex = -1;          // (a click on its text keeps the focus — and its keys — in it)
+    dialog.setAttribute('aria-modal', 'true');
     dialog.innerHTML = `
       <div class="pl-modal-title"></div>
       <div class="pl-modal-body"
            style="padding:6px 0 14px;color:var(--text2,#bbb);font-size:13px"></div>
       <div class="pl-modal-actions">
-        <button class="pl-modal-btn pl-modal-cancel">Cancel</button>
-        <button class="pl-modal-btn pl-modal-ok"></button>
+        <button type="button" class="pl-modal-btn pl-modal-cancel">Cancel</button>
+        <button type="button" class="pl-modal-btn pl-modal-ok"></button>
       </div>
     `;
     // textContent assignments — message/title come from caller code, but we
     // still avoid HTML interpolation as a defence-in-depth measure.
-    dialog.querySelector('.pl-modal-title').textContent = title;
-    dialog.querySelector('.pl-modal-body').textContent  = message;
+    const titleEl = dialog.querySelector('.pl-modal-title');
+    const bodyEl  = dialog.querySelector('.pl-modal-body');
+    titleEl.textContent = title;
+    bodyEl.textContent  = message;
+    titleEl.id = `pl-confirm-title-${++_inlineConfirmSeq}`;
+    bodyEl.id  = `pl-confirm-body-${_inlineConfirmSeq}`;
+    dialog.setAttribute('aria-labelledby', titleEl.id);
+    dialog.setAttribute('aria-describedby', bodyEl.id);
     dialog.querySelector('.pl-modal-ok').textContent    = okLabel;
     backdrop.appendChild(dialog);
     document.body.appendChild(backdrop);
     const btnOk  = dialog.querySelector('.pl-modal-ok');
     const btnCan = dialog.querySelector('.pl-modal-cancel');
-    btnOk.focus();
+    const release = trapFocus(dialog);
+    confirmInitialFocus(dangerColor, btnOk, btnCan).focus();
+    let done = false;
     function finish(value) {
+      if (done) return;
+      done = true;
+      release();
       backdrop.classList.add('pl-modal-out');
       setTimeout(() => backdrop.remove(), 150);
+      if (prevFocus && prevFocus.isConnected) { try { prevFocus.focus(); } catch (_) {} }
       resolve(value);
     }
     btnOk.addEventListener('click',  () => finish(true));
     btnCan.addEventListener('click', () => finish(false));
     backdrop.addEventListener('click', (e) => { if (e.target === backdrop) finish(false); });
     dialog.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') finish(false);
-      if (e.key === 'Enter')  finish(true);
+      const act = confirmKeyAction(e.key, document.activeElement, btnOk, btnCan);
+      // (Tab: the trap, on this element too.  Every key stays in the dialog —
+      // the page's shortcuts must not act behind it.)
+      e.stopPropagation();
+      if (act === null) return;
+      e.preventDefault();                      // (no native click on top of ours)
+      if (act === 'ok') finish(true);
+      else if (act === 'cancel') finish(false);
     });
   });
 }
+let _inlineConfirmSeq = 0;
 
 // Guarantee a global confirm helper at module load.  If admin.js later
 // installs its richer ``__sbConfirm`` we leave it alone — admin.js runs
@@ -222,7 +252,8 @@ async function refresh() {
   if (!panel.classList.contains('hidden')) {
     if (_activeId) {
       const pl = _playlists.find(p => p.id === _activeId);
-      pl ? await _openPlaylist(_activeId, pl.name, false) : _showListView();
+      // (a re-read after an edit: the list keeps its scroll and selection)
+      pl ? await _openPlaylist(_activeId, pl.name, false, { keepView: true }) : _showListView();
     } else {
       _renderListView();
     }
@@ -345,9 +376,13 @@ function _renderListView() {
 }
 
 // ── Track view ────────────────────────────────────────────────────────────────
-async function _openPlaylist(id, name, _focusPanel = true) {
+// ``keepView``: the open playlist read again after an edit (refresh) — its
+// scroll position and selected rows stay (the rows found again by their entry,
+// playlist/edit_view.js); a playlist opened anew starts at its top, unselected.
+async function _openPlaylist(id, name, _focusPanel = true, { keepView = false } = {}) {
+  const keepWanted = keepView && _activeId === id && !tracksEl.hidden;
   _activeId = id;
-  _clearSelection();
+  if (!keepWanted) _clearSelection();
   // Load BEFORE swapping the panel header — on failure we keep the list
   // view visible so the user sees the existing playlists rather than a
   // "0 tracks" empty-state that looks identical to a real empty playlist.
@@ -374,6 +409,10 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   // slower load isn't overwritten by A's tracks (a later re-render would paint
   // A's tracks under B's header) or panel.
   if (_activeId !== id) return;
+  // (what the listener sees right now — scrolled or selected while it loaded too)
+  const keep = keepWanted
+    ? { tracks: _activeTracks, sel: new Set(_selectedIdxs), anchor: _anchorIdx, top: tracksEl.scrollTop }
+    : null;
   _activeTracks = loadedTracks;   // commit only after confirming we're still current
   const summary = _playlists.find(p => p.id === id) || {};
   _activeRO = !!(loadedData && loadedData.read_only);
@@ -404,7 +443,15 @@ async function _openPlaylist(id, name, _focusPanel = true) {
   dropZone.classList.remove('drop-zone-disabled');
   dropZone.textContent = 'Drop tracks here to add';
 
-  _renderTracks({ toTop: true });
+  if (keep) {
+    _selectedIdxs = remapSelection(keep.tracks, keep.sel, _activeTracks);
+    _anchorIdx = remapIndex(keep.tracks, keep.anchor, _activeTracks);
+    _renderTracks();
+    // (the virtual list keeps scrollTop; put it back in case a shorter list clamped it)
+    if (tracksEl.scrollTop !== keep.top) tracksEl.scrollTop = keep.top;
+  } else {
+    _renderTracks({ toTop: true });
+  }
   _updateSidebarActive();
 }
 
@@ -835,8 +882,13 @@ tracksEl.addEventListener('drop', async (e) => {
     if (rest.every((t, k) => t === previousOrder[k])) { _endPlDrag(); return; }
 
     const tops = _rowTops();
+    const selBefore = { sel: new Set(_selectedIdxs), anchor: _anchorIdx };
     _activeTracks = rest;
-    _clearSelection();
+    // The selection follows its rows to their new places — dragged with them
+    // or not (playlist/edit_view.js).
+    _selectedIdxs = movedSelection(previousOrder, rest, selBefore.sel);
+    const anchorAt = movedSelection(previousOrder, rest, new Set(Number.isInteger(selBefore.anchor) ? [selBefore.anchor] : []));
+    _anchorIdx = anchorAt.size ? [...anchorAt][0] : null;
     _endPlDrag();
     _renderTracks();
     _flipFrom(tops);
@@ -850,7 +902,12 @@ tracksEl.addEventListener('drop', async (e) => {
     } catch (err) {
       // Revert the optimistic local order and re-render so the displayed
       // state matches what's actually on the server.
-      if (_activeId === id) { _activeTracks = previousOrder; _clearFlip(); _renderTracks(); }
+      if (_activeId === id) {
+        _activeTracks = previousOrder;
+        _selectedIdxs = selBefore.sel;          // (the selection as it was before the drag)
+        _anchorIdx = selBefore.anchor;
+        _clearFlip(); _renderTracks();
+      }
       console.warn('Drag-reorder save failed:', err);
       Toast.error("Reorder couldn't be saved — order reverted.");
     }
@@ -1043,7 +1100,10 @@ async function _removeTrack(playlistId, track) {
   // (id, subsong) so removing one tune doesn't drop the other tunes of the file.
   _activeTracks = _activeTracks.filter(t => !(t.id === track.id && _plSubKey(t) === subKey));
   plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
-  _clearSelection();
+  // (the other selected rows stay selected, found again by their entry)
+  const selBefore = { sel: new Set(_selectedIdxs), anchor: _anchorIdx };
+  _selectedIdxs = remapSelection(prev, _selectedIdxs, _activeTracks);
+  _anchorIdx = remapIndex(prev, _anchorIdx, _activeTracks);
   _renderTracks();
   try {
     await _api(`/playlists/${playlistId}/tracks`, {
@@ -1054,6 +1114,8 @@ async function _removeTrack(playlistId, track) {
     refresh();                             // sync sidebar count in the background
   } catch (err) {
     _activeTracks = prev;                  // rollback — the optimistic UI must not lie
+    _selectedIdxs = selBefore.sel;         // (…and the selection on the rows it was on)
+    _anchorIdx = selBefore.anchor;
     plActiveCt.textContent = `${_activeTracks.length} track${_activeTracks.length !== 1 ? 's' : ''}`;
     _renderTracks();
     console.warn('Failed to remove track:', err);
@@ -1150,18 +1212,29 @@ function _promptName(title = 'New playlist name', { okLabel = 'Create', value = 
   });
 }
 
-async function createPlaylist() {
+// ``entries``: what the new playlist starts with — bare ids or {id, subsong}
+// (a picked tune), passed as is (POST /playlists takes ``track_ids``).  The
+// Add-to-playlist menu's "+ New playlist…" creates the playlist WITH the
+// tracks it was opened for; ``onDone`` runs once it exists (the library
+// clears its selection then, as after adding to an existing playlist).
+async function createPlaylist(entries = null, onDone = null) {
   const name = await _promptName();
   if (!name?.trim()) return;
+  const trackIds = newPlaylistEntries(entries);
   try {
     const pl = await _api('/playlists', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name.trim() }),
+      body: JSON.stringify(trackIds.length ? { name: name.trim(), track_ids: trackIds } : { name: name.trim() }),
     });
+    if (onDone) { try { onDone(); } catch (_) {} }
     await refresh();
     open();
     await _openPlaylist(pl.id ?? pl.playlist_id, name.trim());
+    if (trackIds.length) {
+      const n = Array.isArray(pl.tracks) ? pl.tracks.length : (pl.track_count ?? trackIds.length);
+      Toast.ok(`Created “${name.trim()}” with ${n} track${n === 1 ? '' : 's'}.`);
+    }
   } catch (err) {
     console.warn('Failed to create playlist:', err);
     Toast.error('Could not create playlist — the server rejected the request.');
@@ -1480,7 +1553,7 @@ function _showAddDropdownWith(anchorEl, getEntries, onDone) {
       dd.innerHTML = `<div class="playlist-dd-empty">No playlists — click + New.</div>
         <div class="playlist-dd-item playlist-dd-create">+ Create new playlist</div>`;
       dd.querySelector('.playlist-dd-create').addEventListener('click', () => {
-        _closeAddDropdown(); createPlaylist();
+        _closeAddDropdown(); createPlaylist(getEntries(), onDone);
       });
     } else {
       playlists.forEach(pl => {
@@ -1497,7 +1570,7 @@ function _showAddDropdownWith(anchorEl, getEntries, onDone) {
       const create = document.createElement('div');
       create.className = 'playlist-dd-item playlist-dd-create';
       create.textContent = '+ New playlist…';
-      create.addEventListener('click', () => { _closeAddDropdown(); createPlaylist(); });
+      create.addEventListener('click', () => { _closeAddDropdown(); createPlaylist(getEntries(), onDone); });
       dd.appendChild(create);
     }
 

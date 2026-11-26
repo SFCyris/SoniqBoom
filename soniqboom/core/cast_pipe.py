@@ -119,9 +119,12 @@ def _build_cmd(
     bit_depth: int | None = None,
     stdin_wav: bool = False,
     gain: float = 1.0,
+    width: int = 100,
 ) -> list[str]:
     """Build the ffmpeg command for a streaming transcode (``gain`` < 1: an
-    overloaded render's ``stream.render_gain``, applied first).
+    overloaded render's ``stream.render_gain``, applied first; ``width``: a
+    retro tune's stereo width, percent — ``render_options.ffmpeg_width_filter``,
+    100 = as rendered).
 
     ``codec`` is the target codec: mp3 / flac / ogg / opus / aac / wav.
     ``protocol``, when provided, lets us pick the right container per
@@ -170,6 +173,9 @@ def _build_cmd(
     filters: list[str] = []
     if gain < 1.0:
         filters.append(f"volume={gain:.6f}")
+    from soniqboom.core.render_options import ffmpeg_width_filter
+    if ffmpeg_width_filter(width):
+        filters.append(ffmpeg_width_filter(width))
     if src_ext in _DSD_EXTS:
         # Full DSD → PCM filter chain.  The highpass strips DC bias the
         # delta-sigma demodulator leaves on near-silence DSD segments
@@ -295,6 +301,7 @@ async def render_stream(
     bit_depth: int | None = None,
     src_feed: "AsyncIterator[bytes] | None" = None,
     gain: float = 1.0,
+    width: int = 100,
 ) -> AsyncIterator[bytes]:
     """Yield chunks of transcoded audio as ffmpeg produces them.
 
@@ -342,7 +349,7 @@ async def render_stream(
         src_path, codec=codec, bitrate_kbps=bitrate_kbps,
         sample_rate=sample_rate, ffmpeg_path=ffmpeg_path,
         protocol=protocol, bit_depth=bit_depth, stdin_wav=src_feed is not None,
-        gain=gain,
+        gain=gain, width=width,
     )
     log.debug("stream-as-render spawning: %s", " ".join(cmd))
 

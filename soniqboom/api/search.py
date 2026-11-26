@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from soniqboom.api.tracks import json_bytes, json_route, public_track, public_tracks
 from soniqboom.api.users import optional_listener_uid
 from soniqboom.core import search_values
+from soniqboom.core.search_values import QUERY_MAX_LEN
 from soniqboom.core.data import (_parse_tag_query, and_predicates, ft_search, ft_search_dicts,
                                   get_track, search_indexes_for, with_uid)
 from soniqboom.core.store import _tokenize_text
@@ -29,10 +30,10 @@ def _esc_tag(value: str) -> str:
 
 # The numeric range operators: ``year:``, ``track:``, ``disc:`` (``disk:`` is
 # ``disc:``), ``length:``, ``rating:``, ``plays:``, ``bitdepth:``,
-# ``samplerate:``, ``bitrate:``, ``bpm:``, ``tunes:``, ``channels:`` — and the
-# time specs of ``added:`` / ``played:``.
+# ``samplerate:``, ``bitrate:``, ``bpm:``, ``tunes:``, ``channels:``, ``place:``
+# (a compo placing) — and the time specs of ``added:`` / ``played:``.
 _RANGE_FIELDS = (r'(?:year|track|disc|disk|length|rating|plays|added|played'
-                 r'|bitdepth|samplerate|bitrate|bpm|tunes|channels)')
+                 r'|bitdepth|samplerate|bitrate|bpm|tunes|channels|place)')
 
 # Spaces inside a numeric filter — ``year: 2000``, ``year:< 2000``,
 # ``track: >= 3``, ``track: -3``, ``year:1990 - 2000``, ``length:3:00 - 4:00``
@@ -40,17 +41,36 @@ _RANGE_FIELDS = (r'(?:year|track|disc|disk|length|rating|plays|added|played'
 # filtered nothing.
 # Only where the operator name starts a token (or follows an exclusion's
 # ``-``): not inside ``multi-track: 2``.
+# (``\s*(?:op\s*)?`` — not ``\s*op?\s*``: two ``\s*`` side by side split
+# a run of spaces every way before failing — quadratic, 1.4 s for
+# ``year:`` + 16,000 spaces.)
 _RANGE_OP_SPACE_RE = re.compile(
-    r'(?<!\w)(?<!\w-)(' + _RANGE_FIELDS + r'):\s*([<>]=?|-)?\s*(?=\d)', re.IGNORECASE)
+    r'(?<!\w)(?<!\w-)(' + _RANGE_FIELDS + r'):\s*(?:([<>]=?|-)\s*)?(?=\d)', re.IGNORECASE)
 _RANGE_RANGE_SPACE_RE = re.compile(
     r'(?<!\w)(?<!\w-)(' + _RANGE_FIELDS
     + r':[\d:.\-]*\d(?:khz|kbps|hz|[smhk])?)(?:\s+-\s*|\s*-\s+)(?=\d)',
     re.IGNORECASE)
 # A unit after a space — ``samplerate:44.1 khz``, ``bitrate:128 kbps``,
-# ``samplerate:44.1khz-96 khz`` — joined to its number.
+# ``samplerate:44.1khz-96 khz`` — joined to its number (``_join_units``).
 _UNIT_SPACE_RE = re.compile(
     r'(?<!\w)(?<!\w-)((?:samplerate|bitrate):\S*?\d)\s+(khz|kbps|hz|k)\b', re.IGNORECASE)
+# ``_UNIT_SPACE_RE`` as ``_join_units`` scans with it: the number is the last
+# character of its run of non-spaces, so every ``samplerate:`` / ``bitrate:``
+# of one run matches or none does, and the second alternative skips the rest
+# of a run that doesn't — else each of them scanned to the run's end,
+# quadratic in its length (0.26 s for 16,000 characters of
+# ``samplerate:samplerate:…``).
+_UNIT_SPACE_SCAN_RE = re.compile(
+    r'(?<!\w)(?<!\w-)(?:((?:samplerate|bitrate):\S*?\d)\s+(khz|kbps|hz|k)\b'
+    r'|(?:samplerate|bitrate):\S*)', re.IGNORECASE)
 _QUOTED_RE = re.compile(r'("[^"]*")')
+
+
+def _join_units(text: str) -> str:
+    """``_UNIT_SPACE_RE.sub(r'\\1\\2', text)`` — ``samplerate:44.1 khz`` →
+    ``samplerate:44.1khz`` — in linear time (``_UNIT_SPACE_SCAN_RE``)."""
+    return _UNIT_SPACE_SCAN_RE.sub(
+        lambda m: m.group(0) if m.group(1) is None else m.group(1) + m.group(2), text)
 
 
 def _tighten_ranges(q: str) -> str:
@@ -62,9 +82,9 @@ def _tighten_ranges(q: str) -> str:
     pieces = _QUOTED_RE.split(q)
     for i in range(0, len(pieces), 2):                  # (odd pieces: the quoted ones)
         p = _RANGE_OP_SPACE_RE.sub(lambda m: m.group(1) + ':' + (m.group(2) or ''), pieces[i])
-        p = _UNIT_SPACE_RE.sub(r'\1\2', p)
+        p = _join_units(p)
         p = _RANGE_RANGE_SPACE_RE.sub(r'\1-', p)
-        pieces[i] = _UNIT_SPACE_RE.sub(r'\1\2', p)
+        pieces[i] = _join_units(p)
     return "".join(pieces)
 
 
@@ -118,7 +138,8 @@ _OPERATORS = frozenset(("artist", "album_artist", "album", "game", "genre", "yea
                         "length", "added", "rating", "plays", "played",
                         "folder", "path", "group", "party", "status", "composer",
                         "title", "lossless", "bitdepth", "samplerate", "bitrate",
-                        "source", "bpm", "tunes", "chip", "dup", "channels", "has"))
+                        "source", "bpm", "tunes", "chip", "dup", "channels", "has",
+                        "place", "compo"))
 # Any operator name followed by ``:`` (a negated one, ``-format:``, too).
 _OPERATOR_RE = re.compile(
     r'\b(' + '|'.join(sorted(_OPERATORS, key=len, reverse=True)) + r'):', re.IGNORECASE)
@@ -128,8 +149,13 @@ _OPERATOR_RE = re.compile(
 # to the first space outside quotes — but after a comma the next word is the
 # next value (``format:flac, alac``) unless it is an exclusion (``-live``);
 # an unclosed quote: to the first space.
+# The name starts after no word character (``(?<!\w)``): a match that began
+# inside a word would have begun at the word's start, so this changes no
+# match, but without it every position of a long word scanned the rest of the
+# word for a ``:`` — quadratic (1.05 s for a 16,000-letter word, 15 s for
+# 60,000, all of it blocking the event loop).
 _VALUE_RUN = r'(?:"[^"]*"|[^\s"])+'
-_TERM_RE = re.compile(r'(?:(?<!\S)(-))?(\w+):(' + _VALUE_RUN
+_TERM_RE = re.compile(r'(?:(?<!\S)(-))?(?<!\w)(\w+):(' + _VALUE_RUN
                       + r'(?:(?<=,)\s+(?!-[^\W\d_])' + _VALUE_RUN + r')*|\S+)')
 # Operator terms and the free text's quoted runs, left to right: a term inside
 # a quoted run of the free text (``"song year:1999 remaster"``) is part of the
@@ -173,14 +199,19 @@ def _has_exclusion(q: str) -> bool:
 
 
 def _escape_text(text: str) -> str:
-    """Free text as the tag query carries it: ``-``, ``:`` and ``/``
-    backslash-escaped (``_parse_tag_query`` reads them back)."""
-    return text.replace("-", "\\-").replace(":", "\\:").replace("/", "\\/")
+    """Free text as the tag query carries it: ``\\``, ``-``, ``:`` and ``/``
+    backslash-escaped (``_parse_tag_query`` reads them back).  Unescaped, a
+    backslash was eaten: ``AC\\DC`` read back as ``ACDC`` (``\\D`` → ``D``),
+    which finds no "AC\\DC".  It goes first, or it would double the backslashes
+    the other three escapes add."""
+    return (text.replace("\\", "\\\\").replace("-", "\\-").replace(":", "\\:")
+            .replace("/", "\\/"))
 
 
 # Operators whose value is text matched as is (a word start / a substring):
 # the tag field has the operator's name.
-_TEXT_OPERATORS = frozenset(("folder", "path", "group", "party", "composer", "title"))
+_TEXT_OPERATORS = frozenset(("folder", "path", "group", "party", "composer", "title",
+                             "compo"))
 
 
 # Operators that take a word of a fixed list → that list.
@@ -215,7 +246,7 @@ def _operator_term(field: str, value: str) -> str | None:
     if field in ('lossless', 'dup'):
         v = search_values.yes_no(value)
         return None if v is None else f"@{field}:{{{v}}}"
-    if field in ('bitdepth', 'bpm', 'tunes', 'channels'):
+    if field in ('bitdepth', 'bpm', 'tunes', 'channels', 'place'):
         v = _plain_number(value)
         return None if v is None else _range_tag(field, v)
     if field == 'samplerate':
@@ -322,7 +353,15 @@ def _parse_advanced_query(q: str) -> str | None:
       status:VALUE — broken, glitched (a listener's mark), corrupt, partial,
       unplayable, empty (found at scan or play), cantplay (broken, corrupt or
       unplayable: what "Tracks that can't be played" covers),
-      composer:VALUE / title:VALUE — a word start in the composer / the title,
+      composer:VALUE / title:VALUE — a word start in the composer / the title;
+      composer: also finds every tune of a scene musician known by a name
+      the value starts a word of — any spelling of it, a handle, a real name
+      (``core/composers``: composer:hubbard finds the SIDs crediting Rob
+      Hubbard in their artist field, composer:"romeo knight" the tunes
+      credited to Reyn Ouwehand when Demozoo says he is Romeo Knight),
+      place:VALUE — the place a tune took in its party competition (place:1
+      won), in the forms of year: (place:<=3); compo:VALUE — a word start in
+      the competition's name (compo:"amiga music"); both from Demozoo,
       lossless:yes / lossless:no (also y / n, true / false, 1 / 0) — the
       lossless badge,
       bitdepth:VALUE, samplerate:VALUE (Hz; 44.1k, 44.1khz and — a number
@@ -336,6 +375,11 @@ def _parse_advanced_query(q: str) -> str | None:
       data), channels:VALUE — in the forms of year:; no BPM never matches,
       chip:6581 / chip:8580 (a SID tune's chip model; "6581/8580" matches
       both), chip:2sid / chip:3sid (a SID file with two / three chips),
+      chip:sid / paula / ym2149 / ay / opl / pokey / spc700 / 2a03 / gameboy
+      / huc6280 / ym2612 / ym2151 / spu / scsp / aica — the sound chip a
+      retro format is written for, by its platform (also by other names:
+      chip:amiga, chip:adlib, chip:nes, chip:snes …;
+      ``search_values.CHIPS``),
       dup:yes / dup:no — in a duplicate group (of two or more tracks) or not,
       has:stil / has:game — HVSC STIL text, a game name.
     A quoted run of two or more words in the free text is a phrase:
@@ -446,7 +490,7 @@ def _uid_of(uid) -> str | None:
 
 @router.get("")
 async def search(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=QUERY_MAX_LEN),
     limit: int = Query(50, ge=1, le=200),
     uid: str | None = Depends(optional_listener_uid),
 ):
@@ -469,7 +513,7 @@ async def search(
 
 @json_route(router, "/quick")
 async def quick_search(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=QUERY_MAX_LEN),
     limit: int = Query(8, ge=1, le=20),
     uid: str | None = Depends(optional_listener_uid),
 ):
@@ -494,7 +538,7 @@ _PAGE_SORT_KEYS = frozenset(("added", "year", "duration", "bpm", "title", "artis
 
 @json_route(router, "/page")
 async def search_page(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=QUERY_MAX_LEN),
     rs: str | None = Query(None, max_length=64),
     offset: int = Query(0, ge=0),
     limit: int = Query(200, ge=1, le=5000),
@@ -645,11 +689,12 @@ async def filter_tracks(
     plays_max: int | None = None,
     added: str | None = None,
     played: str | None = None,
-    q: str | None = None,
+    q: Annotated[str | None, Query(max_length=QUERY_MAX_LEN)] = None,
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     playable: bool = False,
     after: str | None = None,
+    order: str | None = Query(None, pattern="^(platform|compo)$"),
     uid: str | None = Depends(optional_listener_uid),
     untagged: Annotated[str | None, Query(pattern="^(artist|album_artist|album|genre)$")] = None,
 ):
@@ -684,6 +729,12 @@ async def filter_tracks(
     ``untagged``: only tracks whose tag of that name is blank — with ``artist``
     / ``album_artist``, the drill-down of that artist's "[No Album]" row
     (``/library/albums?artist=…``), whose count is the length of this list.
+
+    ``order``: ``platform`` — a composer page's order (``composers.
+    page_order``: platform by size, format, year, title); ``compo`` — party
+    tunes newest party first, by competition and place
+    (``scene_discovery.party_order``: the compo winners).  Without it, a
+    party's tracks come compo by compo and the rest in the library's order.
     """
     from soniqboom.core import availability
     from soniqboom.core.store import get_store
@@ -692,6 +743,19 @@ async def filter_tracks(
     # (Duplicates hidden: a group whose primary can't play is listed by its
     # best playable member — the browse counts agree.)
     swap = availability.primary_swap(store)
+
+    hide_any = bool(store.get_config("filter_duplicates", False))
+
+    def _ordered(preds: dict):
+        from soniqboom.core import composers, scene_discovery
+
+        def fetch(off, lim):
+            ids = [i for i in store.filter_track_ids(filter_duplicates=hide_any, swap=swap, **preds)
+                   if not (excl and i in excl)]
+            ids = (composers.page_order(store, ids) if order == "platform"
+                   else scene_discovery.party_order(store, ids))
+            return [store._meta_dict(i) for i in ids[off:off + lim]]
+        return fetch
 
     async def _reply(fetch):
         if playable:
@@ -726,6 +790,8 @@ async def filter_tracks(
         extra = with_uid(extra, _uid_of(uid))
         await search_indexes_for(extra)
         hide = bool(store.get_config("filter_duplicates", False))
+        if order:
+            return await _reply(_ordered(extra))
         if party:
             # A party's tracks in competition order: each compo (A–Z, the
             # tracks of no known compo last), its entries by place (unplaced
@@ -787,6 +853,8 @@ async def filter_tracks(
     if untagged:
         parsed = and_predicates(parsed, {"untagged": untagged})
     await search_indexes_for(parsed)
+    if order:
+        return await _reply(_ordered(parsed))
     hide_dups = bool(store.get_config("filter_duplicates", False))
     return await _reply(lambda off, lim: store.filter_tracks(
         **parsed, limit=lim, offset=off, filter_duplicates=hide_dups, exclude=excl,
@@ -843,7 +911,7 @@ async def similar_tracks(track_id: str, k: int = Query(10, ge=1, le=50)):
 
 @router.get("/query/semantic")
 async def semantic_query(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=QUERY_MAX_LEN),
     k: int = Query(10, ge=1, le=50),
 ):
     """Semantic search — not available in Python-only mode."""

@@ -160,6 +160,8 @@ class DLNAServer:
         # response would silently disappear before the unicast reply was
         # sent.  We add() each scheduled task and remove via done callback.
         self._pending_replies: set[asyncio.Task] = set()
+        # searcher IP → (LOCATION for it, when it was worked out)
+        self._location_memo: dict[str, tuple[str, float]] = {}
         self._stopped = asyncio.Event()
         self._started = False
 
@@ -339,6 +341,42 @@ class DLNAServer:
         self._pending_replies.add(task)
         task.add_done_callback(self._pending_replies.discard)
 
+    def location_for(self, searcher_ip: str | None) -> str:
+        """The device-description URL for a control point at
+        ``searcher_ip``: on our address of the interface the kernel routes
+        to it (UDP ``connect``: no packet is sent), so a server on several
+        networks (Wi-Fi and Ethernet, a VPN, Docker networks) answers each
+        with an address it can reach — every Browse link then follows the
+        host the control point used (``request.base_url``).  The startup
+        address (``base_url``) when the route can't be read or is loopback
+        for a remote searcher."""
+        if not searcher_ip:
+            return self.device_desc_url
+        hit = self._location_memo.get(searcher_ip)
+        now = time.monotonic()
+        if hit is not None and now - hit[1] < 60.0:
+            return hit[0]
+        url = self.device_desc_url
+        try:
+            import ipaddress
+            from urllib.parse import urlsplit
+            if ipaddress.ip_address(searcher_ip).version != 4:
+                raise ValueError("not IPv4")       # (the SSDP socket is IPv4)
+            parts = urlsplit(self.base_url)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((searcher_ip, 9))
+                ip = s.getsockname()[0]
+            if ip and ip != "0.0.0.0" and (not ip.startswith("127.")
+                                           or searcher_ip.startswith("127.")):
+                port = f":{parts.port}" if parts.port else ""
+                url = f"{parts.scheme}://{ip}{port}/dlna/device.xml"
+        except (OSError, ValueError):
+            pass
+        if len(self._location_memo) > 1024:
+            self._location_memo.clear()
+        self._location_memo[searcher_ip] = (url, now)
+        return url
+
     def _send_msearch_reply(self, st: str, addr: tuple[str, int]) -> None:
         """Send a unicast HTTP/1.1 200 reply to an M-SEARCH source."""
         usn = self._usn_for(st)
@@ -347,7 +385,7 @@ class DLNAServer:
             f"CACHE-CONTROL: max-age={self.max_age}\r\n"
             f"DATE: {self._http_date()}\r\n"
             f"EXT:\r\n"
-            f"LOCATION: {self.device_desc_url}\r\n"
+            f"LOCATION: {self.location_for(addr[0] if addr else None)}\r\n"
             f"SERVER: {self.server_string}\r\n"
             f"ST: {st}\r\n"
             f"USN: {usn}\r\n"

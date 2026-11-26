@@ -101,7 +101,7 @@ _clean_renderers(){
   local bindir removed=0 name bin
   bindir="$(brew --prefix 2>/dev/null || echo /usr/local)/bin"
   for name in zxtune123 sidplayfp psgplay uade123 sc68 kssrender dsfrender milkyrender mlrender mdxrender \
-              gt2reloc sunvoxrender furnace-headless xmprender sawteethrender; do
+              gt2reloc sunvoxrender furnace-headless xmprender sawteethrender midirender; do
     bin="$bindir/$name"
     if [ -L "$bin" ]; then
       warn "  $name is Homebrew-managed (symlink) — skipping (use 'brew reinstall $name')"
@@ -150,8 +150,9 @@ Usage: install.sh [--slim] [--no-collections] [--no-scene-info]
                 won't play: the PSF family — PSF, PSF2, USF, GSF, 2SF, NCSF, SSF
                 (PlayStation / N64 / GBA / DS / Saturn rips; Dreamcast DSF rips
                 play through dsfrender) — S98 and Farbrausch V2 (.v2m) files,
-                MED 2-4 modules and VGM files that use a chip other than the
-                Sega PSG / YM2612.  Re-run without --slim to add them.
+                the ZX Spectrum tracker modules (.pt3, .stc, .asc, …), MED 2-4
+                modules and VGM files that use a chip other than the Sega PSG /
+                YM2612.  Re-run without --slim to add them.
   --rebuild     Delete the from-source renderers, then run the install so they
                 are rebuilt from scratch (combine with --slim to skip zxtune).
   --no-collections
@@ -171,7 +172,7 @@ Usage: install.sh [--slim] [--no-collections] [--no-scene-info]
 --clean/--rebuild affect ONLY the renderers install.sh builds from source —
 zxtune123, sidplayfp, psgplay (+ their bundled libraries), kssrender, dsfrender,
 milkyrender, mlrender, mdxrender, gt2reloc, sunvoxrender, furnace-headless,
-xmprender, sawteethrender, on Linux
+xmprender, sawteethrender, midirender, on Linux
 also the source-built uade123/sc68, and the build-on-first-use ym2wav/hvl2wav.
 Homebrew-managed players (macOS: fluidsynth, openmpt123, adplay, sc68, uade123)
 are left untouched; use `brew reinstall <name>` to rebuild those.
@@ -1082,7 +1083,8 @@ _install_native() {
   shift 4
   if command -v "$bin" &>/dev/null; then
     home="$(mktemp -d)"
-    if [ -z "$stamp" ] || env -u XDG_CONFIG_HOME HOME="$home" "$bin" --version 2>/dev/null \
+    if [ -z "$stamp" ] || env -u XDG_CONFIG_HOME HOME="$home" CFFIXED_USER_HOME="$home" \
+        "$bin" --version 2>/dev/null \
         | grep -qF "$stamp"; then
       rm -rf "$home"
       info "$bin already installed: $(command -v "$bin")"
@@ -1171,6 +1173,37 @@ SAWTEETH_STAMP="$(sed -n 's/^#define SAWTEETHRENDER_VERSION "\([^"]*\)".*/\1/p' 
 _install_native "Sawteeth songs" sawteethrender "sawteethrender ${SAWTEETH_STAMP:-1.1}" \
   "$SCRIPT_DIR/soniqboom/native/sawteethrender/build.sh"
 
+# oplvoices — the per-channel meters and the voice mixer (mute / solo, scopes)
+# of AdLib / OPL tunes: AdPlug's player through its Nuked OPL3 core
+# (soniqboom/native/oplvoices), compiled here against libadplug (Homebrew
+# adplug; Debian / Ubuntu libadplug-dev).  Without it AdLib tunes still play.
+if [ "$PLATFORM" != "macos" ] && command -v apt-get &>/dev/null \
+    && ! pkg-config --exists adplug 2>/dev/null \
+    && { [ "$(id -u)" = "0" ] || command -v sudo &>/dev/null; }; then
+  run_pkg apt-get install -y --no-install-recommends libadplug-dev libbinio-dev || true
+fi
+OPLVOICES_STAMP="$(sed -n 's/^#define OPLVOICES_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/oplvoices/oplvoices.cpp" | head -1)"
+# (the stamp names the AdPlug it was built against: a new AdPlug rebuilds it)
+_install_native "AdLib / OPL per-channel meters" oplvoices \
+  "oplvoices ${OPLVOICES_STAMP:-1.0} ($(pkg-config --modversion adplug 2>/dev/null))" \
+  "$SCRIPT_DIR/soniqboom/native/oplvoices/build.sh"
+
+# midirender — MIDI-family songs on an OPL3 or OPN2 FM synth (libADLMIDI /
+# libOPNMIDI) or an MT-32 (libmt32emu, munt — with the user's own ROMs, set
+# in Settings), and the game MIDI formats (XMI, DMX MUS, HMI / HMP, GMF): the
+# three libraries at the Docker image's pinned releases (SHA-256 checked),
+# built with CMake.  Needs a C++14 compiler.
+MIDIRENDER_STAMP="$(sed -n 's/^#define MIDIRENDER_VERSION "\([^"]*\)".*/\1/p' \
+  "$SCRIPT_DIR/soniqboom/native/midirender/midirender.c" | head -1)"
+ADLMIDI_VERSION="$(_dockerfile_arg ADLMIDI_VERSION)"
+_install_native "XMI / MUS / HMI songs and the OPL3 / OPN2 / MT-32 MIDI synths" midirender \
+  "midirender ${MIDIRENDER_STAMP:-1.0} (libADLMIDI ${ADLMIDI_VERSION:-1.6.2.1}" \
+  "$SCRIPT_DIR/soniqboom/native/midirender/build.sh" \
+  ADLMIDI_VERSION="${ADLMIDI_VERSION:-1.6.2.1}" ADLMIDI_SHA256="$(_dockerfile_arg ADLMIDI_SHA256)" \
+  OPNMIDI_VERSION="$(_dockerfile_arg OPNMIDI_VERSION)" OPNMIDI_SHA256="$(_dockerfile_arg OPNMIDI_SHA256)" \
+  MUNT_VERSION="$(_dockerfile_arg MUNT_VERSION)" MUNT_SHA256="$(_dockerfile_arg MUNT_SHA256)"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # zxtune123 (PSF console-music family: PSF/PSF2/USF/GSF/2SF/SSF/DSF/NCSF;
 # S98 FM dumps, Farbrausch V2 songs)
@@ -1192,7 +1225,7 @@ ZXTUNE_LINUX_URL="https://storage.zxtune.ru/builds/public/r5112/linux/${ZXARCH}/
 if command -v zxtune123 &>/dev/null && zxtune123 --version &>/dev/null; then
   info "zxtune123 already installed: $(command -v zxtune123)"
 elif [ "$SLIM" = "1" ]; then
-  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF; Dreamcast DSF plays through dsfrender), S98 and V2M files, MED 2-4 modules and VGM files using chips other than the Sega PSG / YM2612 won't play.  Re-run without --slim to add them."
+  info "--slim: skipping zxtune123 — the PSF family (PSF, PSF2, USF, GSF, 2SF, NCSF, SSF; Dreamcast DSF plays through dsfrender), S98 and V2M files, the ZX Spectrum tracker modules, MED 2-4 modules and VGM files using chips other than the Sega PSG / YM2612 won't play.  Re-run without --slim to add them."
 elif [ "$PLATFORM" = "linux" ] && [ -n "$ZXARCH" ]; then
   ZX_TMP="$(mktemp -d)"
   if curl -sfL --max-time 300 "$ZXTUNE_LINUX_URL" -o "$ZX_TMP/zx.tar.gz" \
@@ -1365,7 +1398,7 @@ _ver_line() { printf '  %-18s %s\n' "$1" "$2"; }
 _ver_line "python" "$("$VENV/bin/python" --version 2>&1)"
 for _bin in ffmpeg sidplayfp fluidsynth openmpt123 uade123 adplay lha sc68 psgplay \
     kssrender dsfrender milkyrender mlrender mdxrender gt2reloc sunvoxrender \
-    furnace-headless xmprender sawteethrender zxtune123; do
+    furnace-headless xmprender sawteethrender midirender zxtune123; do
   if ! command -v "$_bin" &>/dev/null; then
     _ver_line "$_bin" "not installed"
   elif [ "$_bin" = gt2reloc ]; then

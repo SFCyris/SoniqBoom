@@ -671,6 +671,8 @@ def bucket_group(store, dir_hash: str) -> str:
                     except Exception:    # noqa: BLE001 — naming must never fail a build
                         name = ""
                     _GROUP_NAMES[g] = name or f"Folder {g[:6]}"
+    if not path:
+        return g                    # (unresolved: not memoised — its lookup may come)
     if len(_GROUP_OF) >= _FOLDER_NAMES_MAX:
         _GROUP_OF.clear()
     _GROUP_OF[dir_hash] = g
@@ -699,6 +701,7 @@ _FAMILY_LABELS = {
     "pokey": "Atari 8-bit", "genesis": "Mega Drive", "pce": "PC Engine", "vgm": "VGM",
     "s98": "S98", "v2": "V2", "x68000": "X68000", "sunvox": "SunVox",
     "sawteeth": "Sawteeth", "deflemask": "DefleMask",
+    "zxdac": "ZX Spectrum", "turbofm": "TurboFM", "saa": "SAM Coupé",
 }
 
 

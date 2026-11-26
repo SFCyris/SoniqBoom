@@ -36,6 +36,7 @@ from soniqboom.core.users import (
     SessionRefused,
     SignInsClosed,
     _SESSION_TTL_SEC,
+    bind_request_client,
     get_user_store,
     role_rank,
     validate_password,
@@ -70,16 +71,84 @@ _SESSION_COOKIE = "sb_session"
 # to surface as a "set still contained sockets after handler returned" log
 # message rather than be silently masked.
 _open_ws_by_user: dict[str, set] = {}
+# Per registered socket, what its account stood on when the socket was let
+# in: ``(role rank, password hash)`` — ``_close_ws_revoked`` closes a socket
+# whose account no longer stands there.  None when the account wasn't loaded
+# then: such a socket closes only when its account is gone or disabled.
+_ws_admitted: dict = {}
+_NOW = object()
 
 
-def register_open_ws(user_id: str, ws) -> None:
-    """Register an accepted WebSocket against ``user_id``.
+def ws_standing(user) -> tuple:
+    """``(role rank, password hash)`` of ``user`` (a ``User``).  A WebSocket
+    handler takes it from the account its session check looked up, before
+    ``accept()`` yields, and hands it to ``register_open_ws``; right after
+    registering, ``ws_revoked_since_admitted`` compares it with the account
+    as it is then."""
+    return (role_rank(user.role), user.password_hash)
 
-    Idempotent — registering the same socket twice is a no-op (set semantics).
+
+def register_open_ws(user_id: str, ws, standing=_NOW) -> None:
+    """Register an accepted WebSocket against ``user_id``, with the standing
+    its account had when the socket was let in (``ws_standing``; by default
+    the account's standing now, None when it isn't loaded).
+
+    Idempotent — registering the same socket twice is a no-op (set
+    semantics; the first registration's standing stays).
     """
     if not user_id:
         return
     _open_ws_by_user.setdefault(user_id, set()).add(ws)
+    if ws not in _ws_admitted:
+        if standing is _NOW:
+            try:
+                u = get_user_store().get(user_id)
+            except Exception:
+                u = None
+            standing = ws_standing(u) if u is not None else None
+        _ws_admitted[ws] = standing
+
+
+def _revoked_why(user, was) -> str | None:
+    """Why a socket let in at standing ``was`` must close now that its account
+    is ``user`` (None: gone), or None when it may stay."""
+    if user is None:
+        return "removed"
+    if not user.enabled:
+        return "disabled"
+    if was is None:
+        return None
+    if role_rank(user.role) < was[0]:
+        return "demoted"
+    if user.password_hash != was[1]:
+        return "password changed"
+    return None
+
+
+def ws_revoked_since_admitted(user_id: str, ws) -> str | None:
+    """Called right after ``register_open_ws``, with no ``await`` between:
+    why ``ws`` must be closed (4401) at once, or None.
+
+    The account changed after the session check, while the socket was being
+    accepted.  A reload whose close pass (``_close_ws_revoked``) ran during
+    that accept did not see the socket, because it was not registered yet.
+    A reload that runs after this check does see it.  A socket that must
+    close is dropped from the registry here, so a reload running during the
+    caller's close does not close it a second time.  Unknown sockets and
+    lookup errors give None."""
+    was = _ws_admitted.get(ws, _NOW)
+    if was is _NOW:
+        return None
+    try:
+        user = get_user_store().get(user_id)
+    except Exception:
+        return None
+    why = _revoked_why(user, was)
+    if why:
+        unregister_open_ws(user_id, ws)
+        log.info("Closing a WebSocket for user %s at once (%s while it opened)",
+                 user.username if user is not None else user_id, why)
+    return why
 
 
 def unregister_open_ws(user_id: str, ws) -> None:
@@ -88,6 +157,7 @@ def unregister_open_ws(user_id: str, ws) -> None:
     Safe to call when the user_id has no entry (handler tearing down after
     auth failure / unauth WS arrives in pre-bootstrap state).
     """
+    _ws_admitted.pop(ws, None)
     if not user_id:
         return
     bucket = _open_ws_by_user.get(user_id)
@@ -110,15 +180,68 @@ async def close_open_ws_for(user_id: str, code: int = 4401) -> int:
     if not bucket:
         return 0
     sockets = list(bucket)
-
-    async def _close(ws):
-        try:
-            await asyncio.wait_for(ws.close(code=code), timeout=1.0)
-        except Exception:
-            pass
-
-    await asyncio.gather(*(_close(ws) for ws in sockets), return_exceptions=True)
+    for ws in sockets:
+        _ws_admitted.pop(ws, None)
+    await asyncio.gather(*(_close_ws(ws, code) for ws in sockets), return_exceptions=True)
     return len(sockets)
+
+
+async def _close_ws(ws, code: int) -> bool:
+    """Close ``ws`` with ``code``, waiting at most 1 s.  False when the close
+    failed or did not finish in that time."""
+    try:
+        await asyncio.wait_for(ws.close(code=code), timeout=1.0)
+        return True
+    except Exception:
+        return False
+
+
+async def _close_ws_revoked(store) -> int:
+    """users.json was just read again from disk (``POST /auth/reload``):
+    close (4401) every registered WebSocket whose account no longer stands
+    where it stood when the socket registered (``_ws_admitted``) — the
+    account is gone, disabled, demoted, or has another password.  The admin's
+    PATCH / DELETE close a user's sockets for a demote, disable or delete
+    made in this process; a change ``soniqboom-setadm`` wrote reaches the
+    server from disk, and a library WebSocket's session is checked again
+    only when the server next pushes it an event (``api.library.
+    _verify_ws_session``) — on a quiet server such a socket stayed open, and
+    a demotion (the session stays valid) never closed it.
+
+    Checked against the accounts in memory now, not as a diff of this one
+    reload: a save that merged setadm's change in before its knock arrived
+    (``UserStore._merge_disk``), or an earlier knock that failed, is caught
+    too.  A socket opened before its own account changed its password and
+    kept its sign-in is closed as well; it reconnects on that session.  A
+    socket still being accepted while this runs is not registered yet; its
+    handler checks it right after registering (``ws_revoked_since_admitted``).
+
+    All the sockets close at once; each close waits at most 1 s (setadm waits
+    5 s for the answer).  Returns the number of sockets whose close did not
+    fail or time out."""
+    users = {u.id: u for u in store.list_users()}
+    doomed: list[tuple[str, object, str]] = []
+    for uid, bucket in list(_open_ws_by_user.items()):
+        user = users.get(uid)
+        for ws in list(bucket):
+            why = _revoked_why(user, _ws_admitted.get(ws))
+            if why:
+                doomed.append((uid, ws, why))
+    if not doomed:
+        return 0
+    for uid, ws, _ in doomed:
+        unregister_open_ws(uid, ws)
+    done = await asyncio.gather(*(_close_ws(ws, 4401) for _, ws, _ in doomed))
+    per_user: dict[tuple[str, str], list[int]] = {}
+    for (uid, _, why), ok in zip(doomed, done):
+        n = per_user.setdefault((uid, why), [0, 0])
+        n[0] += ok
+        n[1] += 1
+    for (uid, why), (closed, asked) in per_user.items():
+        name = users[uid].username if uid in users else uid
+        log.info("Closed %d of %d WebSocket(s) for user %s at a users.json "
+                 "reload (%s since the socket opened)", closed, asked, name, why)
+    return sum(done)
 
 
 def claim_unowned_user_data() -> bool:
@@ -431,7 +554,11 @@ async def auth_reload(request: Request):
     Everyone else gets 403: a reload takes the users.json flock and rolls the
     in-memory ``last_login_at`` values back to their last-persisted ones.  500
     when users.json could not be read, so the CLI never reports a change live
-    that the server failed to load.  The CLI's answer carries ``data_dir``."""
+    that the server failed to load.  The CLI's answer carries ``data_dir``.
+
+    After either reload, every open WebSocket whose account is gone,
+    disabled, demoted or has another password since the socket opened is
+    closed with 4401 (``_close_ws_revoked``)."""
     import secrets
     from soniqboom.core import startup_status
     store = get_user_store()
@@ -457,9 +584,13 @@ async def auth_reload(request: Request):
     else:
         # The re-check button: accounts loaded, none an enabled admin.
         await asyncio.to_thread(store.adopt_from_disk, False)
+        await _close_ws_revoked(store)
         claim_unowned_user_data()
         return _auth_status_doc(request)
-    if not await asyncio.to_thread(store.reload):
+    ok = await asyncio.to_thread(store.reload)
+    # (also when the read failed: a save may have merged a change in already)
+    await _close_ws_revoked(store)
+    if not ok:
         raise HTTPException(500, "users.json could not be read — see the server log.")
     claim_unowned_user_data()
     return _auth_status_doc(request, cli=True)
@@ -502,6 +633,44 @@ def _register_allowed(client: str) -> float:
     return 0.0
 
 
+# Password checks of the web sign-in (scrypt: ~70 ms and 32 MB each) run on
+# the loop's default executor, which every other ``asyncio.to_thread`` job
+# shares: an anonymous flood of sign-ins (random user names, so no lockout)
+# used to fill it — 200 of them made a no-op worker job wait 1.4 s.  At most
+# _SIGNIN_SLOTS run at once, and one client address holds at most
+# _SIGNIN_PER_CLIENT of them (running or waiting) — more answer 429 at once —
+# so one address can't queue the owner's sign-in behind its own.
+_SIGNIN_SLOTS = 4
+_SIGNIN_PER_CLIENT = 2
+_signin_gate: dict = {"loop": None, "sem": None}
+_signin_inflight: dict[str, int] = {}
+
+
+async def _gated_password_check(request: Request, fn, *args):
+    """``fn(*args)`` (a scrypt password check) in a worker thread, behind
+    the sign-in gate — 429 when this client already has
+    _SIGNIN_PER_CLIENT checks running or waiting."""
+    from soniqboom.core.users import request_client_key
+    loop = asyncio.get_running_loop()
+    if _signin_gate["loop"] is not loop:
+        _signin_gate.update(loop=loop, sem=asyncio.Semaphore(_SIGNIN_SLOTS))
+        _signin_inflight.clear()
+    client = request_client_key(request)
+    if _signin_inflight.get(client, 0) >= _SIGNIN_PER_CLIENT:
+        raise HTTPException(429, "Too many sign-in attempts at once — wait a moment.",
+                            headers={"Retry-After": "1"})
+    _signin_inflight[client] = _signin_inflight.get(client, 0) + 1
+    try:
+        async with _signin_gate["sem"]:
+            return await asyncio.to_thread(fn, *args)
+    finally:
+        n = _signin_inflight.get(client, 1) - 1
+        if n > 0:
+            _signin_inflight[client] = n
+        else:
+            _signin_inflight.pop(client, None)
+
+
 @router.post("/auth/login")
 async def login(body: LoginBody, request: Request, response: Response):
     """Sign in.  ``authenticate`` runs scrypt which blocks ~80ms — move it
@@ -509,8 +678,11 @@ async def login(body: LoginBody, request: Request, response: Response):
     other users' API calls) aren't stalled during password verify."""
     import asyncio
     store = get_user_store()
-    locked, remaining = store._is_locked((body.username or "").lower())
-    if locked:
+    # (the guesses count per client address: a stranger's wrong passwords
+    # lock out only the stranger — core/users.py _LOCKOUT_MAX_ATTEMPTS)
+    bind_request_client(request)
+    remaining = store.sign_in_wait(body.username or "")
+    if remaining > 0:
         # Don't tell an unauthenticated caller *who* is locked beyond what
         # they asked about — but for the actual user, a clear "try again
         # in N min" is preferable to a generic 401.
@@ -519,8 +691,10 @@ async def login(body: LoginBody, request: Request, response: Response):
             429,
             f"Too many failed attempts. Try again in about {mins} minute"
             + ("s" if mins != 1 else "") + ".",
+            headers={"Retry-After": str(int(remaining) + 1)},
         )
-    hit = await asyncio.to_thread(store.authenticate_with_hash, body.username, body.password)
+    hit = await _gated_password_check(request, store.authenticate_with_hash,
+                                      body.username, body.password)
     if not hit:
         raise HTTPException(401, "Wrong username or password.")
     user, verified = hit
@@ -548,7 +722,9 @@ async def register(body: RegisterBody, request: Request, response: Response):
         )
     if not _registration_open(store):
         raise HTTPException(403, "Registration is turned off. Ask an administrator for an account.")
-    wait = _register_allowed(request.client.host if request.client else "")
+    from soniqboom.core.users import request_client_key
+    # (per address — an IPv6 client by its /64: one host holds a whole /64)
+    wait = _register_allowed(request_client_key(request))
     if wait:
         mins = max(1, int(wait // 60) + 1)
         raise HTTPException(429, f"Too many new accounts — try again in about {mins} minute"
@@ -576,7 +752,9 @@ async def register(body: RegisterBody, request: Request, response: Response):
     # Signing up signs the new account in: recorded like a password sign-in
     # (last sign-in, Subsonic token seed) so the Users list doesn't show
     # "Never signed in" for an account with a live session.
-    user = await asyncio.to_thread(store.authenticate, body.username, body.password) or user
+    bind_request_client(request)
+    user = await _gated_password_check(request, store.authenticate,
+                                       body.username, body.password) or user
     token, expiry = _issue_session(store, user.id, user.password_hash)
     _set_session_cookie(response, request, token)
     log.info("user '%s' self-registered (role=readonly)", user.username)
@@ -621,6 +799,7 @@ async def logout(
 @router.post("/auth/change-password")
 async def change_password(
     body: ChangePasswordBody,
+    request: Request,
     user: User = Depends(require_user),
     sb_session: str | None = Cookie(default=None),
 ):
@@ -633,9 +812,10 @@ async def change_password(
     the other change stands."""
     import asyncio
     store = get_user_store()
+    bind_request_client(request)
     # scrypt off the event loop — same reason as /auth/login.
-    hit = await asyncio.to_thread(store.authenticate_with_hash, user.username,
-                                  body.current_password)
+    hit = await _gated_password_check(request, store.authenticate_with_hash, user.username,
+                                      body.current_password)
     if not hit or hit[0].id != user.id:
         raise HTTPException(401, "Current password is incorrect.")
     verified_hash = hit[1]

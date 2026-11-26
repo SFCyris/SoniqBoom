@@ -86,6 +86,16 @@ class _GmeInfo(ctypes.Structure):
                 ("loop_length", ctypes.c_int), ("play_length", ctypes.c_int)]
 
 
+# ``gme_set_fade_msecs`` (libgme 0.6.4+): a fade of any length — without it
+# libgme fades over its fixed 8 s.
+_have_fade_len = False
+if _lib is not None:
+    try:
+        _lib.gme_set_fade_msecs.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        _have_fade_len = True
+    except AttributeError:               # pragma: no cover - old lib
+        pass
+
 _have_info = False
 if _lib is not None:
     try:
@@ -170,7 +180,10 @@ def play_seconds(data: bytes, subsong: int = 0) -> float | None:
         if i.length > 0:
             ms = i.length
         elif i.loop_length > 0:
-            ms = max(0, i.intro_length) + 2 * i.loop_length
+            # (the loop count set — ``render_options.chip_loops``, twice by
+            # default, as libgme's own ``play_length``)
+            from soniqboom.core import render_options
+            ms = max(0, i.intro_length) + render_options.chip_loops() * i.loop_length
         else:
             return None
         secs = ms / 1000.0
@@ -423,30 +436,97 @@ def render_plan(data: bytes, subsong: int, default_s: float) -> tuple[float, flo
     return min(_MAX_STATED_S, secs + tune_fade(data, subsong)), secs
 
 
+def nsfe_fades(data: bytes) -> "list[float] | None":
+    """The NSFe ``fade`` chunk: each tune's fade-out in seconds, in the
+    order libgme numbers the tunes (through the ``plst`` playlist when there
+    is one), -1 for "not stated"; None without one (or for another format).
+    libgme reads the ``time`` chunk but not this one.  Pure."""
+    if data[:4] != b"NSFE":
+        return None
+    pos, fades, plst = 4, None, None
+    while pos + 8 <= len(data):
+        size = int.from_bytes(data[pos:pos + 4], "little")
+        cid = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fade":
+            fades = [int.from_bytes(body[i:i + 4], "little", signed=True)
+                     for i in range(0, len(body) - 3, 4)]
+        elif cid == b"plst":
+            plst = list(body)
+        elif cid == b"NEND":
+            break
+        pos += 8 + size
+    if fades is None:
+        return None
+    order = plst if plst else list(range(len(fades)))
+    out = []
+    for k in order[:_MAX_TUNES]:
+        ms = fades[k] if k < len(fades) else -1
+        out.append(round(ms / 1000.0, 3) if 0 <= ms <= _MAX_STATED_S * 1000 else -1.0)
+    return out
+
+
+def _vgm_head(data: bytes) -> bytes:
+    """The first 64 header bytes of VGM ``data`` (a VGZ inflated as far as
+    that), else b""."""
+    if data[:4] == b"Vgm ":
+        return data[:64]
+    if data[:2] == b"\x1f\x8b":
+        import zlib
+        try:
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data, 64)[:64]
+        except zlib.error:
+            return b""
+    return b""
+
+
+def vgm_loops(data: bytes) -> "bool | None":
+    """Does the VGM / VGZ ``data`` loop (a loop offset in its header)?  None
+    for another format.  Pure."""
+    head = _vgm_head(data)
+    if len(head) < 0x20 or head[:4] != b"Vgm ":
+        return None
+    return int.from_bytes(head[0x1C:0x20], "little") != 0
+
+
 def tune_fade(data: bytes, subsong: int) -> float:
     """Seconds of fade-out played after track ``subsong``'s stated length:
-    ``FADE_S``, or 0 for a SAP tune whose TIME isn't marked ``LOOP`` (it ends
-    there — what follows is silence, then the tune again).  Pure."""
+    the fade set (``render_options.chip_fade_s``, ``FADE_S`` by default);
+    the NSFe ``fade`` chunk's for its tune, when it states one; 0 for a tune
+    that ends there — a SAP tune whose TIME isn't marked ``LOOP`` (what
+    follows is silence, then the tune again) and a VGM without a loop (its
+    data ends: what follows is silence).  Pure."""
+    k = subsong if subsong and subsong > 0 else 0
     if data[:4] == b"SAP\r":
         loops = sap_header(data)["loops"]
-        k = subsong if subsong and subsong > 0 else 0
         if k < len(loops) and not loops[k]:
             return 0.0
-    return float(FADE_S)
+    elif data[:4] == b"NSFE":
+        fades = nsfe_fades(data)
+        if fades and k < len(fades) and fades[k] >= 0:
+            return float(fades[k])
+    elif vgm_loops(data) is False:
+        return 0.0
+    from soniqboom.core import render_options
+    return float(render_options.chip_fade_s())
 
 
 def tune_fades(data: bytes, count: int) -> "list[float] | None":
     """Each of the ``count`` tunes' fade (``tune_fade``) when they differ from
-    ``FADE_S`` for some tune — a SAP file whose tunes end — else None (the
-    fixed fade, known by the format).  Pure."""
-    if data[:4] != b"SAP\r":
-        return None
+    ``FADE_S`` for some tune — a SAP file whose tunes end, an NSFe that
+    states its fades, a VGM that ends, a fade set other than the default —
+    else None (the fixed fade, known by the format).  Pure."""
+    if not (data[:4] in (b"SAP\r", b"NSFE") or vgm_loops(data) is not None):
+        from soniqboom.core import render_options
+        if render_options.chip_fade_s() == FADE_S:
+            return None
     out = [tune_fade(data, k) for k in range(max(0, min(int(count or 0), _MAX_TUNES)))]
     return out if any(f != FADE_S for f in out) else None
 
 
 def render_wav(data: bytes, subsong: int = 0, duration_s: float = 180,
-               fade_at_s: float | None = None) -> bytes | None:
+               fade_at_s: float | None = None,
+               fade_len_s: float | None = None) -> bytes | None:
     """Render GME file *data* (raw NSF/SPC/… bytes) to a 44.1 kHz 16-bit
     stereo WAV and return the WAV bytes.
 
@@ -459,7 +539,8 @@ def render_wav(data: bytes, subsong: int = 0, duration_s: float = 180,
     ffmpeg path.  Never raises.
     """
     pcm = bytearray()
-    if not render_pcm(data, subsong, duration_s, pcm.extend, fade_at_s=fade_at_s):
+    if not render_pcm(data, subsong, duration_s, pcm.extend, fade_at_s=fade_at_s,
+                      fade_len_s=fade_len_s):
         return None
     # The canonical 44-byte PCM header (``render_pcm`` already gives
     # little-endian samples, so no ``wave`` module byte swapping).
@@ -469,8 +550,45 @@ def render_wav(data: bytes, subsong: int = 0, duration_s: float = 180,
             + b"data" + struct.pack("<I", n) + bytes(pcm))
 
 
+def reference_fade_len_s(duration_s: float, fade_at_s: "float | None") -> float:
+    """Seconds the reference render of a tune fades over (``stream._render_gme``):
+    what follows its stated length (``fade_at_s``, from ``render_plan`` — the
+    NSFe-stated or set fade), else the fade set over the end of the default
+    length (``render_options.chip_fade_s``).  0: no fade.  The voice mixer's
+    and meter's renders (core/gme_voices.py) take theirs from here too."""
+    if fade_at_s is not None:
+        return max(0.0, float(duration_s) - float(fade_at_s))
+    from soniqboom.core import render_options
+    return max(0.0, float(render_options.chip_fade_s()))
+
+
+def fade_window_ms(duration_s: float, fade_at_s: "float | None",
+                   fade_len_s: "float | None" = None) -> "tuple[int, int]":
+    """``(start, length)`` in ms of the fade ``render_pcm`` sets for a render of
+    ``duration_s`` with its fade at ``fade_at_s`` (None: over the last
+    ``fade_len_s``) lasting ``fade_len_s`` (None: libgme's ``FADE_S``).
+    Length 0: no fade (the render just stops)."""
+    dur = max(1.0, float(duration_s))
+    flen = FADE_S if fade_len_s is None else max(0.0, float(fade_len_s))
+    start = (int(fade_at_s * 1000) if fade_at_s is not None
+             else int(dur * 1000) - int(flen * 1000))
+    return max(1000, start), (int(flen * 1000) if flen > 0 else 0)
+
+
+def set_fade(emu, start_ms: int, len_ms: int) -> None:
+    """Set the fade ``fade_window_ms`` gives on libgme ``emu`` (none for
+    length 0; ``gme_set_fade_msecs`` for a length other than libgme's own)."""
+    if len_ms <= 0:
+        return
+    if _have_fade_len and int(len_ms) != FADE_S * 1000:
+        _lib.gme_set_fade_msecs(emu, int(start_ms), int(len_ms))
+    else:
+        _lib.gme_set_fade(emu, int(start_ms))
+
+
 def render_pcm(data: bytes, subsong: int = 0, duration_s: float = 180,
-               sink=None, *, fade_at_s: float | None = None) -> int:
+               sink=None, *, fade_at_s: float | None = None,
+               fade_len_s: float | None = None) -> int:
     """``render_wav``'s render, streamed: hand each block of 44.1 kHz 16-bit
     stereo little-endian PCM to ``sink(bytes)`` as libgme produces it (a
     caller can play the render while it runs).  ``sink`` returning False
@@ -496,11 +614,10 @@ def render_pcm(data: bytes, subsong: int = 0, duration_s: float = 180,
             log.debug("gme_start_track(%d) failed: %s", track, err)
             return 0
         dur = max(1.0, float(duration_s))
-        # Fade out the final ~8 s so capped/looping tunes end cleanly — from
-        # the stated length when there is one.
-        fade_ms = (int(fade_at_s * 1000) if fade_at_s is not None
-                   else int(dur * 1000) - FADE_S * 1000)
-        _lib.gme_set_fade(emu, max(1000, fade_ms))
+        # Fade out the final seconds (``fade_len_s``; ~8 s by default) so
+        # capped/looping tunes end cleanly — from the stated length when
+        # there is one.  No fade: the render just stops at its length.
+        set_fade(emu, *fade_window_ms(dur, fade_at_s, fade_len_s))
         total_frames = int(_SR * dur)
         n_shorts = 8192                  # stereo interleaved → n_shorts/2 frames
         frames = 0
@@ -522,6 +639,82 @@ def render_pcm(data: bytes, subsong: int = 0, duration_s: float = 180,
     except Exception:
         log.warning("libgme render failed", exc_info=True)
         return 0
+    finally:
+        try:
+            _lib.gme_delete(emu)
+        except Exception:
+            pass
+
+
+def track_count(data: bytes) -> "int | None":
+    """How many tracks libgme counts in GME ``data`` (``gme_track_count``):
+    the header's count, 256 slots for a HES or plain KSS file (they state
+    none), a KSSX file's last track + 1.  None when libgme can't open it.
+    Never raises; blocking."""
+    if _lib is None or not data:
+        return None
+    try:
+        fn = _lib.gme_track_count
+        fn.restype, fn.argtypes = ctypes.c_int, [ctypes.c_void_p]
+    except AttributeError:               # pragma: no cover - old lib
+        return None
+    emu = ctypes.c_void_p()
+    try:
+        if _lib.gme_open_data(data, len(data), ctypes.byref(emu), _SR) or not emu:
+            return None
+        return max(0, int(fn(emu)))
+    except Exception:
+        return None
+    finally:
+        try:
+            if emu:
+                _lib.gme_delete(emu)
+        except Exception:
+            pass
+
+
+def tune_sounds(data: bytes, subsong: int = 0, *, min_sound_s: float = 1.0,
+                silence_s: float = 3.0, max_seconds: float = 30.0) -> "bool | None":
+    """Does track ``subsong`` of GME ``data`` make sound for at least
+    ``min_sound_s`` — from its first audible 0.1 s block to its last, before
+    ``silence_s`` of silence (or the track's end) stops it — within its first
+    ``max_seconds``?  The test kssrender's ``-i`` makes of a KSS song (a song
+    falling silent for 3 s stops), so a HES / KSS slot holding a sound effect
+    is not a tune.  None when libgme can't open the data or start the track.
+    Never raises; blocking."""
+    from soniqboom.core.silence import _PCM16, _audible, _samples
+    if _lib is None or not data:
+        return None
+    emu = ctypes.c_void_p()
+    try:
+        err = _lib.gme_open_data(data, len(data), ctypes.byref(emu), _SR)
+    except Exception:
+        return None
+    if err or not emu:
+        return None
+    try:
+        if _lib.gme_start_track(emu, max(0, int(subsong))):
+            return None
+        block = _SR // 10                                 # 0.1 s of stereo frames
+        buf = (ctypes.c_short * (block * 2))()
+        t = 0.0
+        first = last = None
+        while t < max_seconds and not _lib.gme_track_ended(emu):
+            if _lib.gme_play(emu, block * 2, buf):
+                break
+            t += 0.1
+            if _audible(_samples(bytes(buf), _PCM16), 2, _PCM16):
+                first = t if first is None else first
+                last = t
+                if last - first + 0.1 >= min_sound_s:
+                    return True
+            elif ((last is not None and t - last >= silence_s)
+                  or (last is None and t >= max(silence_s, 5.0))):   # (a short intro silence)
+                return False
+        return first is not None and last - first + 0.1 >= min_sound_s
+    except Exception:
+        log.debug("libgme probe failed", exc_info=True)
+        return None
     finally:
         try:
             _lib.gme_delete(emu)

@@ -25,7 +25,8 @@ def test_collector_reads_every_pin_from_the_dockerfile():
                     "DEVILBOX_COMMIT", "PORTABLE_MDX_COMMIT", "KSS_DRIVERS_COMMIT",
                     "MGSDRV_H_SHA256", "GOATTRACKER_VERSION", "GOATTRACKER_SHA256",
                     "SUNVOX_LIB_VERSION", "SUNVOX_LIB_SHA256", "FURNACE_COMMIT",
-                    "LIBXMP_VERSION", "LIBXMP_SHA256"}
+                    "LIBXMP_VERSION", "LIBXMP_SHA256", "ADLMIDI_VERSION", "ADLMIDI_SHA256",
+                    "OPNMIDI_VERSION", "OPNMIDI_SHA256", "MUNT_VERSION", "MUNT_SHA256"}
     # (the SID chain's pins are read in a loop: ``arg "${key}_VERSION"``)
     assert 'for c in libresidfp:RESIDFP libsidplayfp:LIBSIDPLAYFP sidplayfp:SIDPLAYFP' in COLLECTOR
     used |= {f"{k}_{f}" for k in ("RESIDFP", "LIBSIDPLAYFP", "SIDPLAYFP") for f in ("VERSION", "SHA256")}
@@ -77,7 +78,10 @@ def test_dockerfile_uses_the_pins_it_declares():
                         ("GOATTRACKER_VERSION", "goattracker"), ("GOATTRACKER_SHA256", "goattracker"),
                         ("SUNVOX_LIB_VERSION", "sunvoxrender"), ("SUNVOX_LIB_SHA256", "sunvoxrender"),
                         ("FURNACE_COMMIT", "furnace"),
-                        ("LIBXMP_VERSION", "xmprender"), ("LIBXMP_SHA256", "xmprender")):
+                        ("LIBXMP_VERSION", "xmprender"), ("LIBXMP_SHA256", "xmprender"),
+                        ("ADLMIDI_VERSION", "midirender"), ("ADLMIDI_SHA256", "midirender"),
+                        ("OPNMIDI_VERSION", "midirender"), ("OPNMIDI_SHA256", "midirender"),
+                        ("MUNT_VERSION", "midirender"), ("MUNT_SHA256", "midirender")):
         assert f'{name}="${name}"' in DOCKERFILE, name
         default = re.search(r'%s="\$\{%s:-([\w.]+)\}"' % (name, name),
                             (native / build / "build.sh").read_text())
@@ -119,7 +123,7 @@ def test_downloads_are_hash_checked():
     for name in ("ZXTUNE_SHA256_X86_64", "ZXTUNE_SHA256_ARM64", "SC68_SHA256", "UADE_SHA256",
                  "LIBGME_SHA256", "RESIDFP_SHA256", "LIBSIDPLAYFP_SHA256", "SIDPLAYFP_SHA256",
                  "LIBOPENMPT_SHA256", "MGSDRV_H_SHA256", "GOATTRACKER_SHA256", "SUNVOX_LIB_SHA256",
-                 "LIBXMP_SHA256"):
+                 "LIBXMP_SHA256", "ADLMIDI_SHA256", "OPNMIDI_SHA256", "MUNT_SHA256"):
         assert re.search(rf"^ARG {name}=[0-9a-f]{{64}}$", DOCKERFILE, re.M), name
     for f in ("/tmp/zx.tar.gz", "/tmp/sc68.tar.gz", "/tmp/uade.tar.bz2", "/tmp/libgme.tar.gz",
               "/tmp/libopenmpt.tar.gz"):
@@ -140,7 +144,9 @@ def test_image_carries_third_party_licence_texts():
                  "libopenmpt/LICENSE.BSL-1.0.txt", "libopenmpt/TinyFFT-NOTICE",
                  "libkss/MGSDRV-NOTICE.txt", "goattracker/COPYING", "sunvox/LICENSE.txt",
                  "sunvox/lib_sunvox-LICENSE", "furnace/LICENSE", "libxmp/libxmp-LICENSE",
-                 "sawteethrender/NostalgicPlayer-LICENSE"):
+                 "sawteethrender/NostalgicPlayer-LICENSE", "libadlmidi/LICENSE",
+                 "libadlmidi/NOTICE", "libopnmidi/LICENSE", "libopnmidi/NOTICE",
+                 "munt/COPYING.LESSER.txt"):
         assert f"{doc}/{path}" in gate, path
     assert "COPY --from=builder /out/share/                /usr/local/share/" in DOCKERFILE
     ignored = {l.strip() for l in (ROOT / ".dockerignore").read_text().splitlines()
@@ -216,3 +222,25 @@ def test_the_source_bundle_and_builds_leave_out_unlicensed_parts():
     assert 'cp "$src/demos/' in furnace_build.split('if [ "${SELFTEST_DIR:-}" ]')[1]
     assert "COPY --from=builder /selftest" not in DOCKERFILE and "/selftest " not in \
         DOCKERFILE.split("FROM python:3.12-slim-trixie\n")[-1]
+
+
+def test_midi_synth_libraries_leave_out_banks_of_unclear_terms():
+    """libADLMIDI is built without its "grey zone" banks (game banks used
+    without their authors' permission) and the source bundle leaves them
+    out, with libOPNMIDI's banks other than its own MIT xg.wopn / gm.wopn;
+    midirender's source pins the release archives the Dockerfile pins, and
+    no MT-32 ROM is fetched anywhere."""
+    build = (ROOT / "soniqboom" / "native" / "midirender" / "build.sh").read_text()
+    assert "-DBUILD_NO_GREY_BANKS=ON" in build
+    # libOPNMIDI's MAME YM2608 core compiles a GPL-2.0-only resampler (it can't
+    # be combined with AGPL-3.0 code) and its MAME YM2612 file states no
+    # licence: neither is built (libOPNMIDI builds both by default).
+    assert "-DUSE_MAME_2608_EMULATOR=OFF" in build and "-DUSE_MAME_EMULATOR=OFF" in build
+    assert "-DUSE_MAME_EMULATOR=ON" not in build
+    assert 'fm_banks/xg.wopn' in build
+    assert "fm_banks fm_banks_new/greyzone src/inst_db.cpp banks.ini" in COLLECTOR
+    for bank in ("Nineko.wopn", "Tomsoft.wopn", "gems-fmlib-gmize.wopn", "gs-by-papiezak"):
+        assert f"fm_banks/{bank}" in COLLECTOR, bank
+    for text in (build, DOCKERFILE, COLLECTOR):
+        assert not re.search(r"(?i)https?://\S*(mt32|cm32l)\S*\.(rom|bin)", text)
+    assert '!= "$3"' in build or 'expected $3' in build      # (the archives' SHA-256 checked)

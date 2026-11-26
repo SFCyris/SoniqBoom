@@ -1173,6 +1173,11 @@ export function mountLibrary(root, ctx) {
       // with no value is no filter at all: it listed, played and shuffled the
       // whole library.)
       crumb = { label: display, field: 'untagged', value: groupField, url: '/api/tracks' };
+    } else if (groupField === 'artist' && item.composer) {
+      // An Artists row of a scene musician folds every spelling of his name
+      // (the server's composer identity): its tracks are the composer's —
+      // the rows the row counts.
+      crumb = { label: display, field: 'composer', value: String(item.composer) };
     } else {
       crumb = { label: display, field: groupField, value: String(value) };
     }

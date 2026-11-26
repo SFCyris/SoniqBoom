@@ -369,7 +369,8 @@ def stored_name(names, display: str, head_of=None) -> str | None:
     if display in pool:
         return display
     stem, dot, ext = display.rpartition(".")
-    if dot and stem in pool and _prefix_alternative(stem) == "." + ext.lower():
+    if dot and stem in pool and (_prefix_alternative(stem) == "." + ext.lower()
+                                 or _display_name(stem) == display):   # mod.Astra_1.mod
         return stem
     real = _build_map(list(pool), head_of).get(display)
     return real
@@ -566,11 +567,39 @@ def sniff_ext(head: bytes) -> str | None:
     return None
 
 
+def _zip_head(head: bytes) -> bool:
+    return head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+
+
+def _lha_head(head: bytes) -> bool:
+    return len(head) >= 7 and head[2:4] == b"-l" and head[6:7] == b"-"        # -lh5-
+
+
+def container_named(name: str) -> bool:
+    """Is member ``name`` (its stored name) named as an archive —
+    ``abk.mod.zip``, whose prefix token (``abk`` = AMOS) also names a module?
+    Only its bytes say which it is (``rejected_by_bytes``)."""
+    return _base_of(name).lower().endswith(ARCHIVE_EXTS)
+
+
+def _container_bytes(base: str, display: str, head: bytes) -> bool:
+    """Are a container-named member's first bytes ``head`` the archive its
+    name says — never a module?  LHA bytes that read as YM are a YM tune
+    (Atari YM files are LHA-packed: ``YM.song.lha``)."""
+    if _zip_head(head):
+        return True
+    reads_ym = (base.split(".", 1)[0].lower() == "ym"
+                or os.path.splitext(_base_of(display))[1].lower() == ".ym")
+    return _lha_head(head) and not reads_ym
+
+
 def rejected_by_bytes(real: str, display: str, head_of) -> bool:
     """Is member ``real``, listed as ``display``, one no reading of it plays,
-    by its readable first bytes?  A name whose format another one shares
-    (``_SUFFIX_VERIFY``: FamiTracker's ``.ftm``, DefleMask's ``.dmf``)
-    holding the other format; or
+    by its readable first bytes?  A member named as an archive
+    (``container_named``: ``abk.mod.zip``) that is one (``_container_bytes``)
+    — never a module, whatever prefix token its name starts with; a name
+    whose format another one shares (``_SUFFIX_VERIFY``: FamiTracker's
+    ``.ftm``, DefleMask's ``.dmf``) holding the other format; or
     any reading of a Face The Music module saved without its samples
     (``FTM.title`` read as ``.ftm`` — or as the uade format its suffix
     names, ``FTM.One``): libopenmpt loads no such module."""
@@ -580,11 +609,16 @@ def rejected_by_bytes(real: str, display: str, head_of) -> bool:
     ext = os.path.splitext(_base_of(display))[1].lower()
     check = _SUFFIX_VERIFY.get(ext)
     ftm_named = base.split(".", 1)[0].lower() == "ftm" or base.lower().endswith(".ftm")
-    if check is None and not ftm_named:
+    boxed = container_named(base)
+    if check is None and not ftm_named and not boxed:
         return False
     try:
         head = head_of(real) or b""
     except Exception:                                      # noqa: BLE001
+        return False
+    if boxed and _container_bytes(base, display, head):
+        return True
+    if check is None and not ftm_named:
         return False
     if len(head) < 4:
         return False
@@ -618,6 +652,114 @@ def sniffed_members(names, head_of, taken=()) -> dict[str, str]:
             continue
         out[disp] = real
     return out
+
+
+# ── Members named by a prefix only the archive map reads ────────────────────
+# ``mod.Astra_1``, ``MED.Tune``: an Amiga prefix uade leaves to another engine
+# (``uade_formats._PREFIX_OWNED_ELSEWHERE``) and a body that is no extension.
+# The local ZIP listings' music-name test takes no such name (``classify``
+# leaves those prefixes to ``_AMIGA_PREFIX_EXT``), so they list it under its
+# ``_display_name`` (``mod.Astra_1.mod``, as every other archive reader names
+# it) when its first bytes hold a module that plays under that name
+# (``_owned_prefix_plays``) — not a cover named ``It.Takes.Two.jpg`` or a
+# ``mod.json``.
+
+# ProTracker-family tags libopenmpt reads besides ``_PT_TAGS`` (``xxCN`` too).
+_MOD_TAGS_MORE = frozenset({b"PATT", b"FEST", b"CD61", b"FA05", b"FA07"})
+
+
+def _st15(head: bytes, size: int | None = None) -> bool:
+    """Do these first bytes (of a member of ``size`` bytes, when known) hold
+    a 15-sample Soundtracker module, which carries no signature?  Header
+    checks after libopenmpt's — names mostly printable, sample volumes up to
+    64 with some sample audible, up to 128 positions, a tempo up to 220,
+    patterns below 64 —, a NUL in the header (a text file has none) and room
+    for its patterns (a short file of another format fails it)."""
+    if len(head) < 600 or 0 not in head[:600]:
+        return False
+
+    def invalid(name: bytes) -> int:
+        return sum(1 for c in name if c and (c < 32 or c > 127))
+    bad = invalid(head[:20])
+    if bad > 5:
+        return False
+    total = loud = 0
+    for i in range(15):
+        smp = head[20 + 30 * i:50 + 30 * i]
+        bad += invalid(smp[:22])
+        if bad > 48 or smp[25] > 64:
+            return False
+        total += int.from_bytes(smp[22:24], "big")
+        loud |= smp[25]
+    top = max(head[472:600])
+    if size is not None and size < 600 + (top + 1) * 1024:
+        return False
+    return (total > 0 and loud > 0 and head[470] <= 128 and head[471] <= 220
+            and top < 64 and (head[470] or head[471] or top) > 0)
+
+
+def _tracker_module(head: bytes, size: int | None = None) -> bool:
+    """Do these first bytes hold a module of the formats below, which a
+    tracker extension plays (``stream._render_tracker`` reads by content,
+    whatever the extension)?  ProTracker and its clones, Soundtracker,
+    ChipTracker, Soundtracker 2.6 / IceTracker, DIGI Booster, PolyTracker,
+    ProTracker 3.6, OctaMED, an old MED module (zxtune), XM, S3M, IT,
+    Oktalyzer, DigiBooster Pro, MultiTracker and Scream Tracker 2 — or one
+    packed with PowerPacker or XPK-SQSH (libopenmpt unpacks both).  (Not
+    every format libopenmpt reads: the PC ones and SoundFX & co. aren't
+    stored under these prefixes.)"""
+    if head[:4] == b"PP20" or (head[:4] == b"XPKF" and head[8:12] == b"SQSH"):
+        return True
+    tag = head[1080:1084]
+    if ((_pt_tag(head) and tag != b"0CHN") or tag in _MOD_TAGS_MORE
+            or (tag[2:] == b"CN" and tag[:2].isdigit())):
+        return True
+    return (_st15(head, size) or head[952:956] == b"KRIS"                # ChipTracker
+            or head[1464:1468] in (b"MTN\0", b"IT10")                   # ST 2.6, IceTracker
+            or head[:20] == b"DIGI Booster module\0" or head[44:48] == b"PTMF"
+            or (head[:4] == b"FORM" and head[8:12] == b"MODL")          # ProTracker 3.6
+            or head[:4] in (b"MMD0", b"MMD1", b"MMD2", b"MMD3")
+            or (head[:3] == b"MED" and head[3:4] in (b"\x02", b"\x03", b"\x04"))
+            or head[:17] == b"Extended Module: " or head[44:48] == b"SCRM"
+            or head[:4] == b"IMPM" or head[:8] == b"OKTASONG" or head[:4] == b"DBM0"
+            or head[:3] == b"MTM"
+            or (len(head) > 30 and head[28] in (0x1A, 0x02) and head[29] == 2
+                and head[30] == 2))                                       # Scream Tracker 2
+
+
+def _owned_prefix_plays(pext: str, head: bytes, size: int | None = None) -> bool:
+    """Does a member listed with the extension ``pext`` (its prefix's
+    ``_AMIGA_PREFIX_EXT`` value) play, by its first bytes?  HivelyTracker
+    and C64 tunes by their signature; every other such extension is a
+    tracker one, which takes any tracker module (``_tracker_module``)."""
+    if pext == ".hvl":
+        return _SNIFF_EXTRA[".hvl"](head)
+    if pext == ".sid":
+        return head[:4] in (b"PSID", b"RSID")
+    return _tracker_module(head, size)
+
+
+def owned_prefix_name(real: str, head_of, size: int | None = None, taken=()) -> str | None:
+    """The name a local ZIP listing gives member ``real`` (``size`` bytes,
+    when known) whose name only an Amiga prefix uade leaves to another
+    engine reads: its ``_display_name`` (``mod.Astra_1`` → ``mod.Astra_1.mod``)
+    when its first bytes (``head_of``) hold a module that plays under it — or
+    can't be read (corrupt, encrypted, a dropped share: the name reading, as
+    every byte reader falls back to, so a track listed before stays listed).
+    None for any other name or bytes, and for a name in ``taken`` (another
+    member's: ``mod.X.mod`` beside ``mod.X``)."""
+    if head_of is None:
+        return None
+    if _base_of(real).partition(".")[0].lower() not in _uade_formats._PREFIX_OWNED_ELSEWHERE:
+        return None
+    disp = _display_name(real)
+    if disp is None or disp == real or disp in taken:
+        return None
+    try:
+        head = head_of(real) or b""
+    except Exception:                                      # noqa: BLE001
+        return disp
+    return disp if _owned_prefix_plays(disp[len(real):], head, size) else None
 
 
 def resolve_display(names, display: str, head_of=None) -> str | None:

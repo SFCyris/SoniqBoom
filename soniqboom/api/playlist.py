@@ -21,6 +21,7 @@ from soniqboom.core.data import (
     update_playlist,
 )
 from soniqboom.core import playlist_files
+from soniqboom.core.search_values import QUERY_MAX_LEN
 from soniqboom.core.store import get_store
 from soniqboom.api.users import current_user, listener_uid
 
@@ -32,13 +33,15 @@ router = APIRouter(prefix="/playlists", tags=["playlists"])
 class PlaylistCreate(BaseModel):
     name: str
     track_ids: list[str | dict] = []
-    query: str | None = None        # non-empty ⇒ smart (auto-updating) playlist
+    # non-empty ⇒ smart (auto-updating) playlist
+    query: str | None = Field(None, max_length=QUERY_MAX_LEN)
 
 
 class PlaylistUpdate(BaseModel):
     name: str | None = None
     track_ids: list[str | dict] | None = None
-    query: str | None = None        # smart playlists: update the saved search
+    # smart playlists: update the saved search
+    query: str | None = Field(None, max_length=QUERY_MAX_LEN)
     shared: bool | None = None      # offer it to every account (owner, not readonly)
 
 
@@ -363,7 +366,7 @@ def _mark_offline(tracks: list) -> list:
     if availability.mode(store) == "show":
         return tracks
     snap = availability.snapshot(store)
-    if not snap.dead:
+    if not snap:
         return tracks
     out = []
     for t in tracks:

@@ -46,7 +46,11 @@ const FACTORY = new Function('env', `
   const plays = env.plays, events = env.events;
   function playTrack(t, opts = {}) {                       // mirrors the real one's bookkeeping
     _playSeq++; _noteStart(); if (!opts.auto) _explicitPick = true;
-    trackId = t && t.id; plays.push(t && t.id);
+    trackId = t && t.id; _track = t || null; plays.push(t && t.id);
+    // (the real start moves a resumed entry's place into _resumeSeek until
+    // its metadata arrives — the station park reads it from there)
+    _resumeSeek = (_resumeAt && _resumeAt.entry === t) ? { seq: _playSeq, sec: _resumeAt.sec } : null;
+    _resumeAt = null;
   }
   function emit(name, data) { events.push([name, data]); }
   // (player.js: formats the server renders — here, anything but plain audio.)
@@ -61,6 +65,8 @@ const FACTORY = new Function('env', `
   function _crossfadeOnPlaying() {}
   function _crossfadeOnPause() {}
   let _seekOffset = 0, _isTranscoded = false, trackId = null, _extAudio = false, _stationMode = false;
+  let _track = null, replayGain = null;               // (suspendForExternalAudio: the radio takeover)
+  function _applyReplayGain() {}
   ${extractCore()}
   return {
     setQueue, playSource, next, prev, _advance, toggleShuffle, toggleRepeat,
@@ -93,6 +99,7 @@ const FACTORY = new Function('env', `
     _qsyncBody, _pushQueueSync, _offerServerQueue, _applyServerQueue, resumeQueueOffer,
     get queueSyncSupported() { return _qsyncSupported; },
     get resumeAt() { return _resumeAt; },
+    setResumeAt(entry, sec) { _resumeAt = { entry, sec }; },   // (as _applyServerQueue leaves it)
     get queueOffer() { return _qsyncOffer ? _qsyncOffer.who : null; },
     get cuedTrack() { return _cuedTrack(); }, get cuedSec() { return _cuedSec(); },
     qsyncClient: () => _qsyncClient(),
@@ -100,6 +107,8 @@ const FACTORY = new Function('env', `
     setAudioSrc: (v) => { audio.src = v; },
     setExtAudio: (v) => { _extAudio = !!v; },
     setTrackId: (v) => { trackId = v; },
+    suspendForExternalAudio,
+    get trackId() { return trackId; }, get currentTrack() { return _track; },
   };
 `);
 

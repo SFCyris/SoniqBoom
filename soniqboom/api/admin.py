@@ -2548,6 +2548,7 @@ _PROBE_RENDERER_SPECS = (
     ("mdxrender", "mdxrender_path"), ("gt2reloc", "gt2reloc_path"),
     ("sunvoxrender", "sunvoxrender_path"), ("furnace", "furnace_path"),
     ("xmprender", "xmprender_path"), ("sawteethrender", "sawteethrender_path"),
+    ("midirender", "midirender_path"),
 )
 
 
@@ -2605,6 +2606,7 @@ def _furnace_env(home: str) -> dict:
     before HOME)."""
     env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
     env["HOME"] = home
+    env["CFFIXED_USER_HOME"] = home     # (macOS: Application Support follows it, not HOME)
     return env
 
 
@@ -2782,6 +2784,20 @@ async def skip_short_coverage(_tok: str = Depends(_require_token)):
     from soniqboom.core.store import get_store
     tracks = list(get_store()._tracks.values())       # (a stable list for the thread)
     return await asyncio.to_thread(skip_rules.coverage, tracks)
+
+
+@router.get("/mt32")
+async def mt32_roms(path: "str | None" = None, _tok: str = Depends(_require_token)):
+    """The MT-32 ROM folder's state (``stream.mt32_rom_state``): the saved
+    folder's, or with ``path`` that of a folder typed but not saved yet —
+    ``{"state": "not_set" | "invalid" | "ok", "error"?, "machine"?,
+    "control"?, "pcm"?}``.  SoniqBoom ships no ROMs; libmt32emu identifies the
+    user's images by content."""
+    from soniqboom.api.stream import mt32_rom_state
+    folder = settings.mt32_rom_dir if path is None else str(path).strip()
+    if len(folder) > 4096:
+        raise HTTPException(422, "That path is too long.")
+    return await asyncio.to_thread(mt32_rom_state, folder)
 
 
 @router.get("/renderers")
@@ -2985,6 +3001,7 @@ async def check_renderers(_tok: str = Depends(_require_token)):
                      "path": which_renderer("furnace") or ""}),
         "xmprender": _check(settings.xmprender_path, "xmprender"),
         "sawteethrender": _check(settings.sawteethrender_path, "sawteethrender"),
+        "midirender": _check(settings.midirender_path, "midirender"),
         # Clean keys — they double as the frontend's element-id suffixes
         # (renderer-icon-<key>); the "bundled" note lives in the label.
         "ym2wav": _bundled("ym2wav", ("c++", "clang++", "g++"), "C++"),
@@ -3002,7 +3019,8 @@ async def check_renderers(_tok: str = Depends(_require_token)):
         k for k in ("sidplayfp", "fluidsynth", "openmpt123", "uade123",
                     "adplay", "psgplay", "sc68", "zxtune123", "kssrender",
                     "dsfrender", "milkyrender", "mlrender", "mdxrender",
-                    "gt2reloc", "sunvoxrender", "furnace", "xmprender", "sawteethrender")
+                    "gt2reloc", "sunvoxrender", "furnace", "xmprender", "sawteethrender",
+                    "midirender")
         if _status[k].get("installed") and _status[k].get("path")
     ]
     if _probe_keys:
@@ -3366,12 +3384,16 @@ def _purge_art_dir(*, keep_online: bool = False) -> tuple[int, list[str]]:
     ``unlink`` failures so one locked/permission-denied file doesn't abort the
     whole clear.  Shared by the clear-art endpoint and the ``use_folder_art``
     settings change (both need a full art re-evaluation on next request).
-    ``keep_online``: the online covers (``online/``, core/online_cover.py)
-    stay — they depend on no setting of the tracks' own covers; otherwise
-    they go too and what the server holds of them in memory is forgotten."""
+    ``keep_online``: the online covers (``online/``, core/online_cover.py),
+    the game box covers (``igdb/``, core/igdb_cover.py) and the CSDb answers
+    (``csdb/``, core/csdb.py) stay — they depend on no setting of the tracks'
+    own covers; otherwise they go too and what the server holds of them in
+    memory is forgotten."""
     from soniqboom.config import get_art_cache_dir
+    from soniqboom.core import csdb, gen_cover, igdb_cover
     art_dir = get_art_cache_dir()
     online_dir = os.path.join(str(art_dir), "online")
+    kept_dirs = {online_dir, os.path.join(str(art_dir), "igdb"), os.path.join(str(art_dir), "csdb")}
     count = 0
     errors: list[str] = []
 
@@ -3394,7 +3416,7 @@ def _purge_art_dir(*, keep_online: bool = False) -> tuple[int, list[str]]:
                                     f"{entry.name}: {exc.strerror or 'error'}"
                                 )
                         elif entry.is_dir(follow_symlinks=False):
-                            if keep_online and entry.path == online_dir:
+                            if keep_online and entry.path in kept_dirs:
                                 continue
                             _scan_and_unlink(entry.path)
                     except OSError:
@@ -3404,9 +3426,13 @@ def _purge_art_dir(*, keep_online: bool = False) -> tuple[int, list[str]]:
 
     if not keep_online:
         online_cover.forget_all()               # (queued lookups too: they would store into the gap)
+        igdb_cover.forget_all()
     _scan_and_unlink(str(art_dir))
+    gen_cover.forget_all()
     if not keep_online:
         online_cover.forget_all()               # (an answer noted while the files went)
+        igdb_cover.forget_all()
+        csdb.forget_all()
     # What each folder holds (core/folder_art_index) lives in the same folder
     # and was just removed; forget it in memory too, so "this folder has no
     # image" is found out again under the new rule.
@@ -3805,6 +3831,32 @@ def _unplayable_mode() -> str:
     return availability.unplay_mode()
 
 
+# Render options (2.3.0, core/render_options.py): renderers.* keys, validated.
+_RENDER_OPTION_KEYS = ("amiga_resampler", "stereo_width", "tracker_loops", "tracker_fade",
+                       "chip_loops", "chip_fade", "sid_fade")
+
+
+def _normalize_render_option(key: str, val):
+    """A render option's value as ``core/render_options`` reads it."""
+    from soniqboom.core import render_options as ro
+    if key == "amiga_resampler":
+        return ro.normalize_amiga(val)
+    if key == "stereo_width":
+        return ro.normalize_width(val)
+    if key.endswith("_loops"):
+        return ro.normalize_loops(val)
+    return ro.normalize_fade(val, allow_default=key != "sid_fade")
+
+
+def _render_options_settings() -> dict:
+    from soniqboom.core import render_options as ro
+    return {"amiga_resampler": ro.amiga_resampler(),
+            "stereo_width": ro.stereo_width(),
+            "tracker_loops": ro.loops("tracker"), "tracker_fade": ro.fade("tracker"),
+            "chip_loops": ro.loops("chip"), "chip_fade": ro.fade("chip"),
+            "sid_fade": ro.fade("sid")}
+
+
 @router.get("/settings")
 async def get_settings(_tok: str = Depends(_require_token)):
     """Return current application settings (safe subset)."""
@@ -3835,6 +3887,10 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "furnace_path": settings.furnace_path,
             "xmprender_path": settings.xmprender_path,
             "sawteethrender_path": settings.sawteethrender_path,
+            "midirender_path": settings.midirender_path,
+            "midi_synth": settings.midi_synth,
+            "game_midi_synth": settings.game_midi_synth,
+            "mt32_rom_dir": settings.mt32_rom_dir,
             "uade123_path": settings.uade123_path,
             "gme_path": settings.gme_path,
             "adplay_path": settings.adplay_path,
@@ -3843,6 +3899,9 @@ async def get_settings(_tok: str = Depends(_require_token)):
             "sid_filter": settings.sid_filter,
             "sid_filter_curve": settings.sid_filter_curve,
             "sid_digiboost": settings.sid_digiboost,
+            # Amiga resampler, stereo width, loops / endings (2.3.0 —
+            # core/render_options.py: validated values)
+            **_render_options_settings(),
             "hvsc_docs_path": settings.hvsc_docs_path,
             "hvsc_autodetect": settings.hvsc_autodetect,
             "hvsc_source": settings.hvsc_source,
@@ -3876,6 +3935,12 @@ async def get_settings(_tok: str = Depends(_require_token)):
         # Look up a cover online for tracks that have none of their own
         # (core/online_cover.py).
         "online_cover_lookup": await online_cover.setting_value(),
+        # Retro tracks without a cover get one drawn in their platform's
+        # style (core/gen_cover.py) — on by default.
+        "generated_covers": await _gen_cover_setting(),
+        # Track Info of a SID asks CSDb for the releases that use the tune
+        # (core/csdb.py) — on by default.
+        "csdb_lookup": await _csdb_setting(),
         # Sidebar folder-tree filter.  When True, ``/api/fstree/children``
         # drops subdirectories whose subtree contains zero indexed audio
         # tracks (e.g. photo dumps, build dirs, video-only folders
@@ -4016,6 +4081,115 @@ async def test_discogs(body: dict | None = None, _tok: str = Depends(_require_to
     return await nowplaying_art.discogs_identity(token)
 
 
+async def _gen_cover_setting() -> bool:
+    from soniqboom.core import gen_cover
+    return gen_cover.enabled_now()
+
+
+async def _csdb_setting() -> bool:
+    from soniqboom.core import csdb
+    return await csdb.setting_value()
+
+
+# ── IGDB (game box covers) with the user's own Twitch application ───────────
+# The client id is kept in SoniqBoom.conf as ``igdb_client_id``, the secret
+# encrypted as ``igdb_client_secret_enc`` (``core.credentials``; read at start
+# by ``config._igdb_secret_from_conf``); ``core/igdb_cover`` reads both from
+# ``settings``.  The secret is never sent back.
+
+def _igdb_env_override() -> bool:
+    """Do SONIQBOOM_IGDB_CLIENT_ID / _SECRET (the environment, or
+    ~/.soniqboom.env) set the credentials — which then win over the conf?"""
+    keys = {"SONIQBOOM_IGDB_CLIENT_ID", "SONIQBOOM_IGDB_CLIENT_SECRET"}
+    if any(k.upper() in keys for k in os.environ):
+        return True
+    try:
+        for line in (Path.home() / ".soniqboom.env").read_text(encoding="utf-8").splitlines():
+            name = line.strip().removeprefix("export ").split("=", 1)[0].strip()
+            if name.upper() in keys and "=" in line:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _igdb_state() -> dict:
+    from soniqboom.core import netpolicy
+    cid = (settings.igdb_client_id or "").strip()
+    secret = (settings.igdb_client_secret or "").strip()
+    return {"set": bool(cid and secret), "client_id": cid,
+            "from_env": _igdb_env_override(), "offline": netpolicy.offline()}
+
+
+@router.get("/igdb")
+async def get_igdb(_tok: str = Depends(_require_token)):
+    """Whether IGDB credentials are set (the client id; never the secret)."""
+    return _igdb_state()
+
+
+@router.put("/igdb")
+async def put_igdb(body: dict, _tok: str = Depends(_require_token)):
+    """Save (``{"client_id": "…", "client_secret": "…"}``) or remove (both
+    empty) the Twitch application IGDB is asked with; the secret is kept
+    encrypted.  Applies at once; the games no box cover was found for are
+    asked again.  Credentials set by the environment can't be changed here
+    (409)."""
+    from soniqboom.config import ConfUnreadable, update_local_conf
+    from soniqboom.core import igdb_cover
+    from soniqboom.core.credentials import encrypt
+    if not isinstance(body, dict) or not isinstance(body.get("client_id"), str) \
+            or not isinstance(body.get("client_secret"), str):
+        raise HTTPException(400, 'Send {"client_id": "…", "client_secret": "…"} — both empty remove them.')
+    cid, secret = body["client_id"].strip(), body["client_secret"].strip()
+    if _igdb_env_override():
+        raise HTTPException(409, "SONIQBOOM_IGDB_CLIENT_ID / _SECRET set the IGDB credentials — change them there.")
+    if (cid or secret) and not igdb_cover.credentials_ok(cid, secret):
+        raise HTTPException(400, "That isn't a Twitch client id and secret "
+                                 "(8–64 letters and digits each).")
+    enc = encrypt(secret) if secret else ""
+
+    def _apply(conf: dict) -> dict:
+        conf.pop("igdb_client_secret", None)
+        if cid:
+            conf["igdb_client_id"] = cid
+        else:
+            conf.pop("igdb_client_id", None)
+        if enc:
+            conf["igdb_client_secret_enc"] = enc
+        else:
+            conf.pop("igdb_client_secret_enc", None)
+        settings.igdb_client_id = cid
+        settings.igdb_client_secret = secret
+        return conf
+    try:
+        await asyncio.to_thread(update_local_conf, _apply)
+    except ConfUnreadable as exc:
+        raise HTTPException(409, f"SoniqBoom.conf couldn't be read, so nothing was saved: {exc}")
+    igdb_cover.credentials_changed()
+    if cid and secret:
+        await asyncio.to_thread(igdb_cover.forget_misses)
+    from soniqboom.api.library import _broadcast
+    await _broadcast({"event": "art_refresh"})
+    return _igdb_state()
+
+
+@router.post("/igdb/test")
+async def test_igdb(body: dict | None = None, _tok: str = Depends(_require_token)):
+    """Ask Twitch for a token with the typed pair (``{"client_id", "client_secret"}``),
+    else the saved one."""
+    from soniqboom.core import igdb_cover
+    b = body if isinstance(body, dict) else {}
+    cid = (b.get("client_id") or "").strip() if isinstance(b.get("client_id"), str) else ""
+    secret = (b.get("client_secret") or "").strip() if isinstance(b.get("client_secret"), str) else ""
+    if not (cid and secret):
+        cid, secret = igdb_cover.credentials()
+    if not (cid and secret):
+        return {"ok": False, "error": "No IGDB client id and secret are set."}
+    if not igdb_cover.credentials_ok(cid, secret):
+        return {"ok": False, "error": "That isn't a Twitch client id and secret."}
+    return await igdb_cover.test_credentials(cid, secret)
+
+
 @router.put("/settings")
 async def update_settings(body: dict, _tok: str = Depends(_require_token)):
     """Update application settings (persisted to SoniqBoom.conf)."""
@@ -4026,6 +4200,14 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
     if "renderers" in body:
         if "renderers" not in conf:
             conf["renderers"] = {}
+        # (the MIDI synth choices: refused before anything is changed)
+        _r = body["renderers"] if isinstance(body["renderers"], dict) else {}
+        if "midi_synth" in _r and str(_r["midi_synth"]).lower() not in (
+                "soundfont", "opl3", "opn2", "mt32"):
+            raise HTTPException(422, "midi_synth must be soundfont, opl3, opn2 or mt32.")
+        if "game_midi_synth" in _r and str(_r["game_midi_synth"]).lower() not in (
+                "opl3", "opn2", "mt32"):
+            raise HTTPException(422, "game_midi_synth must be opl3, opn2 or mt32.")
         for k in ("sidplayfp_path", "fluidsynth_path", "openmpt123_path",
                    "soundfont_path", "soundfonts_dir", "sid_default_duration",
                    "hvsc_docs_path", "hvsc_autodetect", "hvsc_source",
@@ -4035,12 +4217,20 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                    "uade123_path", "gme_path", "adplay_path", "kssrender_path",
                    "dsfrender_path", "milkyrender_path", "mlrender_path",
                    "mdxrender_path", "gt2reloc_path", "sunvoxrender_path",
-                   "furnace_path", "xmprender_path", "sawteethrender_path"):
+                   "furnace_path", "xmprender_path", "sawteethrender_path",
+                   *_RENDER_OPTION_KEYS,
+                   "midirender_path", "midi_synth", "game_midi_synth", "mt32_rom_dir"):
             if k in body["renderers"]:
                 val = body["renderers"][k]
-                if k in ("hvsc_autodetect", "sid_model_force", "sid_filter",
+                if k in _RENDER_OPTION_KEYS:
+                    val = _normalize_render_option(k, val)
+                elif k in ("hvsc_autodetect", "sid_model_force", "sid_filter",
                          "sid_digiboost"):
                     val = _flag(val)           # coerce — keep the schema honest
+                elif k in ("midi_synth", "game_midi_synth"):
+                    val = str(val).lower()         # (checked above)
+                elif k == "mt32_rom_dir":
+                    val = str(val or "").strip()
                 elif k == "hvsc_source":
                     val = "online" if str(val).lower() == "online" else "local"
                 elif k == "sid_model":
@@ -4222,6 +4412,8 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
         or "dedup_folders" in body
         or "use_folder_art" in body
         or "online_cover_lookup" in body
+        or "generated_covers" in body
+        or "csdb_lookup" in body
         or "folder_art_names" in body
         or "hide_empty_folders" in body
     ):
@@ -4274,6 +4466,25 @@ async def update_settings(body: dict, _tok: str = Depends(_require_token)):
                     pass
                 from soniqboom.api.library import _broadcast
                 await _broadcast({"event": "art_refresh"})
+        if "generated_covers" in body:
+            from soniqboom.core import gen_cover
+            new_val = _flag(body["generated_covers"])
+            old_val = gen_cover.enabled_now()
+            await set_config(gen_cover.SETTING, new_val)
+            # Read per cover request; on an actual change every client asks
+            # for its on-screen covers again (the format emoji comes back, or
+            # goes).
+            if new_val != old_val:
+                try:
+                    from soniqboom.core import cast_session
+                    cast_session.forget_artwork()
+                except Exception:               # noqa: BLE001 — cast is optional
+                    pass
+                from soniqboom.api.library import _broadcast
+                await _broadcast({"event": "art_refresh"})
+        if "csdb_lookup" in body:
+            from soniqboom.core import csdb
+            await set_config(csdb.SETTING, _flag(body["csdb_lookup"]))
         if "folder_art_names" in body:
             # Stored verbatim as a CSV; the lookup side
             # (``_parse_folder_art_names`` in api/art.py) trims / lowercases

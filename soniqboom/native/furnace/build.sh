@@ -73,4 +73,5 @@ fi
 # (Furnace writes a config folder under HOME — ~/.config/furnace, on macOS
 # ~/Library/Application Support/Furnace — even for --version: a temp HOME)
 mkdir -p "$work/home"
-env -u XDG_CONFIG_HOME HOME="$work/home" "$dest/furnace-headless" --version 2>/dev/null | grep -a "^Furnace version" || true
+env -u XDG_CONFIG_HOME HOME="$work/home" CFFIXED_USER_HOME="$work/home" \
+  "$dest/furnace-headless" --version 2>/dev/null | grep -a "^Furnace version" || true

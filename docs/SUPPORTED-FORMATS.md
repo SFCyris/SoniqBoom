@@ -21,10 +21,11 @@ from Homebrew or the Linux distribution.
 | Player | Version (Docker image) | Plays | Docker image |
 |---|---|---|---|
 | Browser (no conversion) | — | MP3, FLAC, WAV, Ogg Vorbis, Opus; AAC (and ALAC in Safari) after a codec check | — |
-| ffmpeg | Debian package (or the bundled static build) | Every other ordinary audio format, surround streams, DSD | Included |
+| ffmpeg | Debian package (or the bundled static build) | Every other ordinary audio format, surround streams, DSD; measures loudness (EBU R128) for volume leveling | Included |
 | sidplayfp (libsidplayfp with reSIDfp) | sidplayfp 3.1.0, libsidplayfp 3.1.0, libresidfp 1.2.2 | C64 SID tunes, C64 Sidplayer songs, GoatTracker songs (after `gt2reloc`) | Included |
 | `gt2reloc` (GoatTracker's packer) | GoatTracker 2.77 | Converts GoatTracker songs to SID tunes | Included |
-| FluidSynth | Debian package, with the FluidR3 General MIDI SoundFont | MIDI | Included |
+| FluidSynth | Debian package, with the FluidR3 General MIDI SoundFont | Standard MIDI files (the default synth) | Included |
+| `midirender` (libADLMIDI, libOPNMIDI, libmt32emu) | midirender 1.0, libADLMIDI 1.6.2.1, libOPNMIDI 1.6.2, libmt32emu 2.8.6 (munt 2.8.4) | Game MIDI formats (XMI, DMX MUS, HMI / HMP, GMF, KLM); any MIDI song on OPL3 FM, OPN2 FM or a Roland MT-32 (with your own ROMs) | Included (no MT-32 ROMs) |
 | libopenmpt / `openmpt123` | 0.8.9 | Tracker modules | Included |
 | `xmprender` (libxmp) | xmprender 1.0, libxmp 4.7.4 | The modules only libxmp reads, and packed modules SoniqBoom converts | Included |
 | UADE (`uade123`) | 3.05 | AHX and the Amiga custom-player formats | Not in a `SLIM=1` build (heavy source build) |
@@ -33,11 +34,11 @@ from Homebrew or the Linux distribution.
 | `milkyrender` (MilkyPlay) | MilkyTracker `e3ceb05` | Early DSIK modules (`DSM\x10`) | Included |
 | libgme (Game Music Emu) | 0.6.5 | Console chiptunes | Included |
 | `kssrender` (libkss + MGSDRV) | kssrender 1.2, libkss `2ed9588` | MSX / Sega Master System KSS, MSX MGSDRV songs | Included |
-| ZXTune (`zxtune123`) | r5112 | PSF family, S98, Farbrausch V2, MED 2–4, VGM with chips libgme lacks (left out by `install.sh --slim`) | Included |
+| ZXTune (`zxtune123`) | r5112 | ZX Spectrum (SAM Coupé, Amstrad CPC) tracker modules, PSF family, S98, Farbrausch V2, MED 2–4, VGM with chips libgme lacks (left out by `install.sh --slim`) | Included |
 | `dsfrender` (Highly Theoretical + psflib) | Highly Theoretical `2998a4b`, psflib `95509e0` | Dreamcast / Naomi DSF rips | Included |
 | `mdxrender` (portable_mdx) | portable_mdx `dc50b06` | Sharp X68000 MDX (+ PDX) | Included |
 | `sunvoxrender` (SunVox Library) | 2.1.4d | SunVox projects | Included |
-| Furnace (`furnace-headless`) | 0.6.8.3 | FamiTracker and DefleMask modules | Included |
+| Furnace (`furnace-headless`) | 0.6.8.3 | Furnace, FamiTracker and DefleMask modules | Included |
 | `sawteethrender` (NostalgicPlayer's Sawteeth player, ported to C) | sawteethrender 1.1, NostalgicPlayer `c6eb0c5` | Sawteeth songs | Included |
 | psgplay | `6f1c39f` | Atari ST SNDH | Included |
 | `ym2wav` (ST-Sound) | bundled with SoniqBoom | Atari ST YM register dumps | Included |
@@ -46,6 +47,14 @@ from Homebrew or the Linux distribution.
 
 gear → **Renderers → Renderer Status** shows which of these an install has and
 the version each reports.
+
+A file that holds several tunes lists each as a tune of its own — SID, SNDH,
+SC68, the UADE formats that report subsongs, AHX and HivelyTracker songs,
+tracker modules with several subsongs (each libopenmpt subsong a tune),
+GoatTracker songs (their subtunes), FamiTracker modules (their tracks) and
+NSF, NSFe, GBS, AY, SAP, HES and KSS rips; for HES and KSS files the tunes are
+found by playing their song slots, the first time one is played or opened
+(see *Files with several tunes* in [FORMATS.md](FORMATS.md)).
 
 ## Ordinary audio
 
@@ -78,9 +87,35 @@ the version each reports.
 
 ## MIDI
 
+Standard MIDI files play on the synth chosen in Settings → Renderers → MIDI
+synths — the SoundFont (FluidSynth, the default), OPL3 FM, OPN2 FM or a Roland
+MT-32. The game formats play on OPL3 FM with the instrument bank of their
+sound library (the default), on OPN2 FM or on the MT-32. The MT-32 plays only
+with the control and PCM ROMs you provide (*MT-32 ROMs* below).
+
 | Format | Suffixes | Player |
 |---|---|---|
-| Standard MIDI file | `.mid`, `.midi` | FluidSynth |
+| Standard MIDI file | `.mid`, `.midi`, `.kar` (karaoke) | FluidSynth; `midirender` on OPL3 / OPN2 / MT-32 |
+| RIFF MIDI | `.rmi` | FluidSynth; `midirender` on OPL3 / OPN2 / MT-32 |
+| Miles Sound System XMIDI (AIL games) | `.xmi` (its first song) | `midirender`: OPL3 with AIL's instruments, OPN2 or MT-32 |
+| DMX MUS (Doom and other games on its sound library) | `.mus` (`MUS` header) | `midirender`: OPL3 with the DMXOPL3 instruments (a free remake of Doom's; the original bank isn't included), OPN2 or MT-32 |
+| HMI SOS (Descent and others) | `.hmi`, `.hmp` | `midirender`: OPL3 with HMI's instruments, OPN2 or MT-32 |
+| Creative GMF | `.gmf` | `midirender`: OPL3, OPN2 or MT-32 |
+| KLM (Wacky Wheels) | `.klm` | `midirender`: OPL3 |
+
+OPL3 plays through the Nuked OPL3 emulator, OPN2 through Nuked OPN2 (a
+YM3438), the MT-32 through munt's libmt32emu.
+
+### MT-32 ROMs
+
+SoniqBoom includes no MT-32 ROM, and never downloads or copies one. To play
+MIDI on the MT-32, put your own control ROM and PCM ROM images (an MT-32 or a
+CM-32L / CM-32LN set, full or in two halves, under any file names) in a folder
+on the server and enter that folder in Settings → Renderers → MIDI synths;
+**Check ROM folder** says which ROMs libmt32emu recognised. Until a usable
+folder is set, the settings say *MT-32 ROMs not set* and a song on the MT-32
+doesn't play (its play says why). With several machines' ROMs in the folder,
+an MT-32 is preferred (control ROM 1.07, 1.06, 1.05, 1.04, then the 2.x revisions), then the CM-32L.
 
 ## Tracker modules (libopenmpt)
 
@@ -377,6 +412,33 @@ TFMX player refuses plays with the TFMX ST player.
 | MSX MGSDRV | `.mgs` | `kssrender` |
 | FamiTracker | `.ftm` | Furnace |
 | DefleMask | `.dmf` | Furnace |
+| Furnace | `.fur` (its first song) | Furnace |
+
+## ZX Spectrum trackers
+
+ZX Spectrum tracker modules, and a few of the SAM Coupé and Amstrad CPC. A file
+is listed when ZXTune reads it as the module its suffix names (for `.asc`,
+`.chi`, `.dst`, `.pdt`, `.psg`, `.str`, `.stp`, `.sqt` and `.psm`, also only
+when the module starts the file). Without ZXTune (`install.sh --slim`) the
+files with the other suffixes are listed and their play says ZXTune is missing.
+
+| Format | Suffixes | Player |
+|---|---|---|
+| Pro Tracker 3.x (and TurboSound pairs) | `.pt3` | ZXTune |
+| Pro Tracker 2.x / 1.x | `.pt2`, `.pt1` | ZXTune |
+| Sound Tracker (compiled, 1.x, 3.x) | `.stc`, `.st1`, `.st3` | ZXTune |
+| Sound Tracker Pro (compiled) | `.stp` | ZXTune |
+| ASC Sound Master 1.x / 0.x | `.asc`, `.as0` | ZXTune |
+| SQ-Tracker (compiled) | `.sqt` | ZXTune |
+| Pro Sound Creator | `.psc` | ZXTune |
+| Pro Sound Maker | `.psm` | ZXTune |
+| Global Tracker | `.gtr` | ZXTune |
+| Fast Tracker (ZX) | `.ftc` | ZXTune |
+| VTX and PSG AY register dumps | `.vtx`, `.psg` | ZXTune |
+| Amstrad CPC AYC dumps | `.ayc` | ZXTune |
+| Chip Tracker, Sample Tracker, Digital Studio, SQ Digital Tracker, Digital Music Maker, Extreme Tracker, ProDigi Tracker (sample players) | `.chi`, `.str`, `.dst`, `.sqd`, `.dmm`, `.et1`, `.pdt` | ZXTune |
+| TFM Music Maker, TurboFM dumps (two YM2203) | `.tf0`, `.tfe`, `.tfc`, `.tfd` | ZXTune |
+| SAM Coupé E-Tracker (SAA1099) | `.cop` | ZXTune |
 
 ## PSF family (console rips)
 
@@ -420,6 +482,43 @@ TFMX player refuses plays with the TFMX ST player.
 | Ken Silverman's music | `.ksm` (+ `insts.dat`) | AdPlug |
 | AMUSIC AdLib Tracker | `.amd` | AdPlug |
 
+AdPlug's other formats are listed when `adplay` reads the file as one (for
+`.m`, `.raw`, `.rac`, `.msc`, `.sdb`, `.agd`, `.bmf`, `.mad`, `.got`, `.cff`,
+`.dmo` and `.lds`, as the format of that suffix) — which of them it reads
+depends on the installed AdPlug's version (AdPlug 2.4 reads them all):
+
+| Format | Suffixes | Player |
+|---|---|---|
+| Apogee IMF (Wolfenstein 3D) | `.wlf`, `.adlib` | AdPlug |
+| AdLib Tracker 2 (tiny modules) | `.a2t` | AdPlug |
+| AdLib MIDI / IMPlay songs | `.mus`, `.mdy` (+ the `.snd` / `.tim` bank beside them in a local folder; inside an archive or on a network share they play with AdPlug's default instruments), `.ims` (+ its `.bnk`, likewise) | AdPlug |
+| AdLib MIDIPlay | `.mdi` | AdPlug |
+| XMS-Tracker | `.xms` | AdPlug |
+| Digital-FM | `.dfm` | AdPlug |
+| HSC packed | `.hsp` | AdPlug |
+| Mlat AdLib Tracker | `.mad` | AdPlug |
+| MKJamz | `.mkj` | AdPlug |
+| BoomTracker | `.cff` | AdPlug |
+| TwinTeam | `.dmo` | AdPlug |
+| MPU-401 Trakker | `.mtk` | AdPlug |
+| Master Tracker | `.mtr` | AdPlug |
+| Raw AdLib Capture (RdosPlay) | `.raw`, `.rac` | AdPlug |
+| Surprise! AdLib Tracker | `.sat`, `.sa2` | AdPlug |
+| BMF, Flash, Hybrid, Hypnosis, PSI, rat (XAD) | `.xad`, `.bmf` | AdPlug |
+| LOUDNESS Sound System | `.lds` | AdPlug |
+| PALLADIX | `.plx` | AdPlug |
+| Ultima 6 | `.m` | AdPlug |
+| eXtra Simple Music | `.xsm` | AdPlug |
+| Beni Tracker | `.pis` | AdPlug |
+| AdLib MSCplay | `.msc` | AdPlug |
+| Softstar RIX (packed) | `.mkf` | AdPlug |
+| JBM AdLib Music | `.jbm` | AdPlug |
+| God of Thunder | `.got` | AdPlug |
+| Note Sequencer (sopepos) | `.sop` | AdPlug |
+| Herbulot AdLib System (HERAD) | `.hsq`, `.sqx`, `.sdb`, `.agd`, `.ha2` | AdPlug |
+| SNGPlay, Faust Music Creator, AdLib Tracker 1.0 | `.sng` | AdPlug |
+| DeFy AdLib Tracker | `.dtm` | AdPlug |
+
 ## Shared suffixes
 
 | Suffix | Formats, told apart by content |
@@ -429,15 +528,18 @@ TFMX player refuses plays with the TFMX ST player.
 | `.dsf` | Sony DSD Stream File: ffmpeg · Dreamcast rip: `dsfrender` |
 | `.imf` | Imago Orpheus: libopenmpt · id Software IMF: AdPlug |
 | `.ftm` | FamiTracker: Furnace · Face The Music: libopenmpt |
-| `.sng` | GoatTracker: `gt2reloc` → sidplayfp · ZoundMonitor / Richard Joseph: UADE |
-| `.mus` | C64 Sidplayer: sidplayfp · Amiga UFO: UADE |
+| `.sng` | GoatTracker: `gt2reloc` → sidplayfp · ZoundMonitor / Richard Joseph: UADE · SNGPlay / Faust Music Creator / AdLib Tracker (a file UADE refuses): AdPlug |
+| `.mus` | C64 Sidplayer: sidplayfp · DMX MUS (`MUS` header): `midirender` · Amiga UFO: UADE · AdLib MUS (a file UADE refuses): AdPlug |
+| `.ims` | Images Music System: UADE · AdLib IMPlay (a file UADE refuses): AdPlug |
+| `.stp`, `.sqt` | StarTrekker packer, Quartet PSG: UADE · ZX Spectrum Sound Tracker Pro, SQ-Tracker (a file UADE refuses): ZXTune |
+| `.str` | ZX Spectrum Sample Tracker: ZXTune · the second SID of a Stereo Sidplayer song (played with its `.mus`): not listed |
 | `.st` | Sawteeth: `sawteethrender` · an Amiga module under a UADE prefix name (`jam.title.st`): UADE; any other `.st` is not listed |
 | `.ksm` | Ken Silverman's AdLib music: AdPlug · Kefrens Sound Machine: UADE |
 | `.fred` | Fred Editor modules: UADE · songs saved in the Fred Editor's own format (`Fred Editor ` header): not listed |
 | `.dsm` | early DSIK (`DSM\x10`): `milkyrender` · RIFF DSIK: libopenmpt |
 | `.ptm` | ProTracker IFF and PolyTracker: both libopenmpt |
 | `.dmf` | DefleMask: Furnace · X-Tracker, DSMI Compact and Software Visions: libopenmpt |
-| `.dtm`, `.psm`, `.xmf` | Digital Tracker, Epic MegaGames MASI, Astroidea XMF: libopenmpt · DeFy AdLib Tracker, ZX Spectrum Pro Sound Maker, Extensible Music Format: not played |
+| `.dtm`, `.psm`, `.xmf` | Digital Tracker, Epic MegaGames MASI, Astroidea XMF: libopenmpt · DeFy AdLib Tracker: AdPlug · ZX Spectrum Pro Sound Maker: ZXTune · Extensible Music Format: not played |
 | `.med` | OctaMED (MMD0–MMD3): libopenmpt · MED 2–4: ZXTune |
 
 ## Archives and disk images
@@ -457,4 +559,4 @@ These hold tunes; the tunes inside play through the players above.
 | Build | Left out | Formats that don't play |
 |---|---|---|
 | Docker `--build-arg SLIM=1` | UADE, sc68 | AHX, the Amiga custom players, `.sc68` |
-| `install.sh --slim` | ZXTune | PSF family (except Dreamcast rips `dsfrender` plays), S98, Farbrausch V2, MED 2–4, VGM using chips libgme lacks |
+| `install.sh --slim` | ZXTune | PSF family (except Dreamcast rips `dsfrender` plays), S98, Farbrausch V2, the ZX Spectrum trackers, MED 2–4, VGM using chips libgme lacks |

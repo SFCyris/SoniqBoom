@@ -39,6 +39,7 @@ window.SoniqBoom = window.SoniqBoom || {};
 window.SoniqBoom.player = Player;
 import { Library }    from './library.js';
 import { forgetCover, forgetAllCovers } from './cover_status.js';
+import { watchPlays } from './art_intent.js';
 import { LibSync, snapshotPlan, watchBootLoads } from './lib_sync.js';
 import { Search }     from './search.js';
 import { FolderTree } from './foldertree.js';
@@ -67,18 +68,22 @@ let _trackInfoP = null;
 const loadTrackInfo = () => (_trackInfoP ||= import('./trackinfo.js').then(m => m.TrackInfo));
 let _vizP = null;
 const loadVisualizer = () => (_vizP ||= import('./visualizer.js').then(m => m.Visualizer));
-import { artPlaceholderEmoji, isUadeAmigaTrack,
+import { artPlaceholderEmoji,
          Toast, trapFocus, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
 // The per-voice VU meter's data (sidecar parse / fetch, eligibility, levels,
 // label thinning, re-ask ladders) — shared with the phone's Now Playing.
 import { parseVUMR, createVumrFetcher, vuEligible, vuKeyOf, vuLabelStep,
          vumrLevelsAt, fftColumnLevels, vuFallbackText, FFT_FALLBACK_BARS,
+         serverPassTrack, vuVoiceLabel,
          SID_VU_RETRY_MS, AMIGA_VU_RETRY_MS, AMIGA_VU_SETTLE_S,
          AMIGA_VU_SETTLE_POLL_MS, AMIGA_VU_SETTLE_MAX_WAITS } from './vu/vumr.js';
 // The shared Modern / Retro hi-fi look: the waveform's colours follow it, and
 // the Retro player bar adds twin needle meters to the VU meter.
-import { getUiStyle, onUiStyleChange } from './ui_style.js';
+import { getUiStyle, setUiStyle, onUiStyleChange } from './ui_style.js';
+import { styleSwitchText } from './ui_style_switch.js';
+import { welcomeLead } from './welcome_lead.js';
 import { createVuNeedles } from './player/vu_needles.js';
+import { bindWaveSeek } from './player/wave_seek.js';
 // Expose Toast globally so the classic-script cast picker (cast_picker.js,
 // not an ES module) can call ``Toast.info(…)``.  Without this all
 // ``if (window.Toast) Toast.x(…)`` guards in cast_picker fall through —
@@ -348,6 +353,7 @@ const playerArt      = document.getElementById('player-art');
 // ── Waveform canvas ──────────────────────────────────────────────────────────
 const waveformCanvas = document.getElementById('waveform-canvas');
 const waveformCtx    = waveformCanvas ? waveformCanvas.getContext('2d') : null;
+const waveformHit    = document.getElementById('waveform-hit');
 let _waveformData    = null;   // Float array [0..1], 200 values
 // AbortController for the in-flight waveform fetch.  Aborted on track
 // change (a fresh _fetchWaveform supersedes it) and on folder navigation
@@ -409,6 +415,12 @@ function _resizeWaveformCanvas() {
   waveformCanvas.style.top    = topOffset + 'px';
   waveformCanvas.style.width  = sbRect.width + 'px';
   waveformCanvas.style.height = WAVE_H + 'px';
+  if (waveformHit) {                // (the seek target over it — js/player/wave_seek.js)
+    waveformHit.style.left   = waveformCanvas.style.left;
+    waveformHit.style.top    = waveformCanvas.style.top;
+    waveformHit.style.width  = waveformCanvas.style.width;
+    waveformHit.style.height = waveformCanvas.style.height;
+  }
   waveformCanvas.width  = sbRect.width * dpr;
   waveformCanvas.height = WAVE_H * dpr;
   waveformCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -880,8 +892,11 @@ function _initVU(channelCount, opts) {
         label.classList.add('vu-col-dot');
         label.textContent = '·';
       } else {
-        label.textContent = preset === 'roomy' ? `CH:${n}` : `${n}`;
+        // A voice's name where it fits (a chip's "SQ1" / "DSP3" / "FM2"),
+        // else its number; the full name is the tooltip.
+        label.textContent = vuVoiceLabel(useVUMR ? _vumr : null, i, preset);
       }
+      if (useVUMR && _vumr && _vumr.names && _vumr.names[i]) col.title = _vumr.names[i];
       col.appendChild(label);
 
       // Pan circles only meaningful with real VUMR data and only
@@ -1396,7 +1411,9 @@ let _sidClientDone = '';
 let _sidPollActive = '';
 
 function _scheduleSidVURetry(track, key, attempt = 0, settleWaits = 0) {
-  const amiga = isUadeAmigaTrack(track);
+  // (Amiga and chip tunes: the server's pass starts on the first ask, once
+  // the track has played a few seconds — vu/vumr.js serverPassTrack.)
+  const amiga = serverPassTrack(track);
   const ladder = amiga ? _AMIGA_VU_RETRY_MS : _SID_VU_RETRY_MS;
   if (attempt === 0 && settleWaits === 0) _sidPollActive = key;
   // ``final``: polling ended without meters for the track still playing — the
@@ -1685,13 +1702,13 @@ async function _handleVU(track) {
   // ``/api/tracks/<id>/vu`` runs a lazy backfill against the source
   // file on cache miss (see _try_backfill_vu_sidecar in api/tracks.py),
   // so a 200 here means real per-channel data on the very first play.
-  // Chip formats (SID, NSF, SPC, …): no Python binding exists yet for
-  // libsidplay/libgme, so the server returns 204 and we render the
-  // honest fallback below.
-  // Amiga: ask the cache only (``start: false``) — a cached sidecar still
-  // paints at once, but a miss leaves starting the per-voice pass to the
-  // re-ask ladder below, once the track has really played.
-  const fetched0 = await _fetchVUMR(track.id, track.subsong, { start: !isUadeAmigaTrack(track) });
+  // SID: the browser (WASM) or the server renders the sidecar; until it
+  // lands the server returns 204 and we render the honest fallback below.
+  // Amiga, libgme chiptunes and AdLib (serverPassTrack): ask the cache only
+  // (``start: false``) — a cached sidecar still paints at once, but a miss
+  // leaves starting the per-voice pass to the re-ask ladder below, once the
+  // track has really played.
+  const fetched0 = await _fetchVUMR(track.id, track.subsong, { start: !serverPassTrack(track) });
   // "None is coming" paints the spectrum like a miss, but arms no re-ask ladder.
   const vuUnavailable = !!(fetched0 && fetched0.unavailable);
   const fetched = vuUnavailable ? null : fetched0;
@@ -1713,7 +1730,7 @@ async function _handleVU(track) {
     // "loading…" while a per-voice sidecar may still arrive: SID always polls
     // (and may render it in-browser), Amiga unless the server said none is
     // coming.  The ladder turns it into "not available" when it gives up.
-    const willPoll = primary === 'SID' || (isUadeAmigaTrack(track) && !vuUnavailable);
+    const willPoll = primary === 'SID' || (serverPassTrack(track) && !vuUnavailable);
     _addFallbackLabel(fmtLabel, willPoll, vuUnavailable ? fetched0.reason : '');
     // SID gets a real 3-voice sidecar.  PRIMARY path: render it in-browser
     // (WASM) and upload — fast + offloads the server.  FALLBACK: poll the
@@ -1728,7 +1745,7 @@ async function _handleVU(track) {
     // Amiga modules: the per-voice sidecar is built in the background right
     // after the first render (it no longer delays the audio) — poll for it the
     // same way so the meter switches from the spectrum to real voices mid-play.
-    if (primary !== 'SID' && isUadeAmigaTrack(track) && _sidPollActive !== key && !vuUnavailable) {
+    if (primary !== 'SID' && serverPassTrack(track) && _sidPollActive !== key && !vuUnavailable) {
       _scheduleSidVURetry(track, key);
     }
     if (primary === 'SID' && _sidPollActive !== key) {
@@ -1846,6 +1863,24 @@ function _commitSeek() {
 }
 seekBar.addEventListener('change', _commitSeek);
 seekBar.addEventListener('pointerup', _commitSeek);
+
+// The waveform's whole rectangle seeks by x (player/wave_seek.js; app.css makes
+// it the pointer target while it shows): a press shows the place, a drag
+// scrubs, the release seeks.  The playback position doesn't move the display
+// meanwhile (_applyTimeUpdate).
+function _paintScrub(pct) {
+  seekBar.value = pct;
+  seekBar.style.setProperty('--pct', pct + '%');
+  const dur = _tuLatest && _tuLatest.duration;
+  if (isFinite(dur) && dur > 0) { timeCur.textContent = Player.fmt((pct / 100) * dur); _tuLast.curStr = ''; }
+  if (_waveformData) _drawWaveform(pct);
+}
+const _waveSeek = waveformHit ? bindWaveSeek(waveformHit, {
+  paint: _paintScrub,
+  // (the seek bar takes the focus, as a press on it would: ←/→ go on from there)
+  commit: (pct) => { _lastSeekPct = pct; _tuLast.pct = -1; Player.seek(pct); try { seekBar.focus({ preventScroll: true }); } catch (_) {} },
+  cancel: () => { _tuLast.pct = -1; _tuLast.curStr = ''; if (_tuLatest) _applyTimeUpdate(); },
+}) : { active: () => false };
 
 // Also paint right after the toggle: a page still running modules from before
 // an upgrade (an older player.js that never emits 'shufflechange') keeps a
@@ -2088,19 +2123,24 @@ let _tuLatest = null;
 function _applyTimeUpdate() {
   _tuPending = false;
   if (!_tuLatest) return;
-  const { current, duration, pct } = _tuLatest;
+  if (_waveSeek.active()) return;          // (a scrub on the waveform shows its own place)
+  const { current, duration, pct, endless } = _tuLatest;
   const curStr = Player.fmt(current);
   // No length yet (a render still growing, a tune nobody has timed): a dash,
-  // not a "0:00" that reads as an empty track.
+  // not a "0:00" that reads as an empty track.  A tune playing endlessly
+  // (Repeat-One / "Play looping tunes endlessly"): ∞.
   const durKnown = isFinite(duration) && duration > 0;
-  const durStr = durKnown ? Player.fmt(duration) : '–:––';
+  const durStr = endless ? '\u221e' : (durKnown ? Player.fmt(duration) : '–:––');
   const pctRounded = Math.round(pct * 10) / 10;  // 0.1% granularity — plenty
 
   if (curStr !== _tuLast.curStr) { timeCur.textContent = curStr; _tuLast.curStr = curStr; }
   if (durStr !== _tuLast.durStr) {
-    if (durKnown) timeDur.textContent = durStr;
+    if (endless) {
+      timeDur.innerHTML = `<span aria-hidden="true">${durStr}</span><span class="sr-only">Plays endlessly</span>`;
+      timeDur.title = 'Plays endlessly, through its own loop';
+    } else if (durKnown) timeDur.textContent = durStr;
     else timeDur.innerHTML = `<span aria-hidden="true">${durStr}</span><span class="sr-only">Length unknown</span>`;
-    timeDur.title = durKnown ? '' : 'Length unknown';
+    if (!endless) timeDur.title = durKnown ? '' : 'Length unknown';
     _tuLast.durStr = durStr;
   }
   if (pctRounded !== _tuLast.pct) {
@@ -2361,7 +2401,9 @@ function _paintBarArt(track, bust = false) {
     // background-image URL the browser stores at cache key
     // ``/api/art/X?size=sm`` is the visible-grey JPEG.  If the IMG
     // path errors (204 — no art) we strip the glow classes; if it 200s we paint them.
-    const glowSrc = withT(staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg`);
+    // (``fallback=placeholder``: not the plain URL, whose grey placeholder a
+    // browser kept for a year before retro tracks had a drawn cover)
+    const glowSrc = withT(staticArtUrl(track.cover_art) || `/api/art/${track.id}/sm.jpg?fallback=placeholder`);
     const reqGen = ++_artRenderGen;
     const _renderEmojiFallback = () => {
       playerArt.innerHTML = `<span class="art-placeholder">${artPlaceholderEmoji(track)}</span>`;
@@ -2530,9 +2572,10 @@ function toggleNowPlayingArt() {
 if (npArt) npArt.addEventListener('click', closeNowPlayingArt);
 npArtBtn?.addEventListener('click', toggleNowPlayingArt);
 
-// The player bar's icon row scrolls sideways when it doesn't fit (601–1024 px
-// and phone width, player-styles.css): a plain wheel scrolls it, a focused
-// button comes fully into view, and .more-l / .more-r fade the side with more.
+// The player bar's icon row scrolls sideways when it doesn't fit (601–1024 px,
+// phone width, and wider when it would reach the transport — player-styles.css): a
+// plain wheel scrolls it, a focused button comes fully into view, and
+// .more-l / .more-r fade the side with more.
 {
   const row = document.querySelector('#player-bar .player-extra-controls');
   if (row) {
@@ -2552,6 +2595,57 @@ npArtBtn?.addEventListener('click', toggleNowPlayingArt);
     row.addEventListener('scroll', paint, { passive: true });
     new ResizeObserver(paint).observe(row);
     paint();
+    // The transport (◄◄ ▶ ►► ◎) must stay clear of the icon row (>1024 px; at
+    // 601–1024 px the row already keeps to its column).  The row may reach past
+    // its column into the free space beside the transport; once its keys would
+    // come within 4 px of it, .keys-capped holds the row 12 px short (--keys-room)
+    // and it scrolls (player-styles.css) — Cast's device pill, or Retro's wider
+    // keys at ≈1101 px, used to put it over ◎ or over ►►.  In radio mode the station names beside
+    // ◄◄ / ►► give way first: one width for both (▶ stays put), up to 120 px,
+    // what is free beside the transport — its column, and a flank or the keys
+    // where they share its line — less 12 px; under 40 px, none (app.css).
+    // Measured from the column's right edge and the keys' own span (first shown
+    // key to last), never from the capped row's box, so capping it never changes
+    // the answer; the keys themselves are observed too (Cast's pill comes and goes).
+    const ctrls = document.querySelector('#player-bar .player-controls');
+    const col = row.parentElement;
+    const bar = document.getElementById('player-bar');
+    const art = document.querySelector('#player-bar .player-art-info');
+    const prevT = document.getElementById('radio-prev-target');
+    const wide = window.matchMedia('(min-width: 1025px)');
+    const keysWidth = () => {
+      const shown = [...row.children].filter((k) => k.getClientRects().length);
+      if (!shown.length) return 0;
+      return shown[shown.length - 1].getBoundingClientRect().right - shown[0].getBoundingClientRect().left;
+    };
+    const fitRadio = (keysLeft) => {
+      if (!bar.classList.contains('radio-mode')) { bar.style.removeProperty('--radio-target-w'); return; }
+      const p = ctrls.getBoundingClientRect(), c = ctrls.parentElement.getBoundingClientRect();
+      if (!c.width || !prevT) return;
+      const level = (r) => r.width > 0 && r.top < p.bottom && r.bottom > p.top;   // on the transport's line
+      let left = c.left, right = c.right;
+      const a = art && art.getBoundingClientRect();
+      if (a && level(a)) left = Math.max(left, a.right);
+      const k = col.getBoundingClientRect();
+      if (level(k)) right = Math.min(right, k.left, keysLeft);
+      const cx = p.left + p.width / 2;                     // (the names widen it evenly about here)
+      const half = Math.min(right - cx, cx - left) - 12;
+      const w = Math.floor(half - (p.width - 2 * prevT.getBoundingClientRect().width) / 2);
+      bar.style.setProperty('--radio-target-w', `${w >= 40 ? Math.min(120, w) : 0}px`);
+    };
+    const fit = () => {
+      if (!ctrls || !col || !bar || !ctrls.getBoundingClientRect().width) return;
+      const colRight = col.getBoundingClientRect().right;
+      // (wide: where the keys would reach uncapped; narrower, the row keeps to its column)
+      const keysLeft = wide.matches ? colRight - keysWidth() : row.getBoundingClientRect().left;
+      fitRadio(keysLeft);
+      const p = ctrls.getBoundingClientRect();
+      row.style.setProperty('--keys-room', `${Math.max(0, Math.floor(colRight + 4 - p.right - 12))}px`);
+      row.classList.toggle('keys-capped', wide.matches && keysLeft < p.right + 4);
+    };
+    const fitObs = new ResizeObserver(fit);
+    for (const el of [col, ctrls, ctrls && ctrls.parentElement, row, bar, ...row.children]) if (el) fitObs.observe(el);
+    fit();
   }
 }
 // Another view chosen (one of #content's views shown / hidden — not a badge): it closes.
@@ -2575,7 +2669,7 @@ function _showNowPlayingArt(track) {
   if (!track) return;
   // The large size: a stored cover_art URL names the thumbnail (sm) unless asked.
   const src = staticArtUrl(_artUrlAtSize(track.cover_art, 'lg'))
-    || (track.id ? `/api/art/${track.id}/lg.jpg` : '');
+    || (track.id ? `/api/art/${track.id}/lg.jpg?fallback=placeholder` : '');   // (see glowSrc)
   // Reset to placeholder state, fade in real art when it decodes, drop
   // the src on error so the browser's broken-image glyph never paints.
   // (Previously a 404 left the broken-image icon on the dialog
@@ -2603,6 +2697,8 @@ function _showNowPlayingArt(track) {
 Player.on('trackchange', (track) => {
   if (!npArt.hidden) _showNowPlayingArt(track);
 });
+// A played retro track's game box cover is looked up (art_intent.js).
+watchPlays(Player);
 
 // Retro hi-fi shows the art as a turntable (css/visualizer-styles.css): the
 // record turns while it plays and the Now-playing visualizations are on.
@@ -2671,6 +2767,7 @@ let _prevVolume = parseFloat(localStorage.getItem('sb_prev_volume')) || 0.8;
 // ── Sidebar navigation ────────────────────────────────────────────────────────
 const views = {
   all:           () => Library.showAll(),
+  folders:       () => { _cancelAncillaryFetches(); return Library.showFolders(); },
   artists:       () => Library.showArtists(),
   album_artists: () => Library.showAlbumArtists(),
   albums:        () => Library.showAlbums(),
@@ -2691,8 +2788,14 @@ const smartViews = {
 };
 
 /** Deactivate all sidebar nav items across all sections (``keepTree``: not
- *  the folder tree's — a folder pick has just marked its row). */
+ *  the folder tree's — a folder pick has just marked its row).  Every sidebar
+ *  pick comes through here — a click, Enter/Space on a Library / Smart entry
+ *  or a folder row — and so do the 1–6 / Alt+1–6 / H / D keys, so it also
+ *  tells the Stations view to go ('sb:library-pick', heard at once, before the
+ *  new view sets up the pane; on its own the view hid only on a click).  A
+ *  view opened from elsewhere (a search, a player-bar link) doesn't pass here. */
 function _deactivateAllNav(keepTree = false) {
+  document.dispatchEvent(new CustomEvent('sb:library-pick'));
   document.querySelectorAll('#nav-library li, #nav-smart li').forEach(x => x.classList.remove('active'));
   if (!keepTree) document.querySelectorAll('.tree-node.active').forEach(n => n.classList.remove('active'));
 }
@@ -2914,14 +3017,22 @@ document.addEventListener('visibilitychange', () => {
 // onSelect overwrites the previous listener (FolderTree allows one),
 // so the share-tracking + folder-open freshness trigger has to live in
 // the SAME callback that drives Library.showFolder.
-FolderTree.onSelect(async (path) => {
+// The sidebar Folders heading's key opens the Folders view (as its Library
+// entry does: highlight, aria-current and the remembered view follow).
+document.getElementById('btn-folders-open')?.addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.querySelector('#nav-library li[data-view="folders"]')?.click();
+});
+
+// What opening a folder does first, from the tree or the Folders view
+// (library.js fires 'sb:folder-open' for each level it opens).
+function _onFolderOpen(path) {
   // Free browser connection slots before the (potentially blocking) folder
   // listing fetch: abort the waveform + VUMR fetches and stop the
   // transcode-status poll/watchdog.  User-initiated navigation takes
   // priority over background metadata refreshes.  Never touches the
   // playing audio stream.
   _cancelAncillaryFetches();
-  _deactivateAllNav(true);
   const share = _resolveRemoteShareFromPath(path);
   if (share && /^(ftp|smb|https?|webdavs?):\/\//i.test(share)) {
     // Track the last-viewed remote share so the visibility-change
@@ -2932,6 +3043,12 @@ FolderTree.onSelect(async (path) => {
     // arrive, the remote_new_tracks toast lands a few seconds later.
     _maybeFireFreshnessCheck(share, 'folder_open');
   }
+}
+document.addEventListener('sb:folder-open', (e) => { if (e.detail && e.detail.path) _onFolderOpen(e.detail.path); });
+
+FolderTree.onSelect(async (path) => {
+  _onFolderOpen(path);
+  _deactivateAllNav(true);
   await Library.showFolder(path);
 });
 
@@ -3014,16 +3131,42 @@ if (scanBadge) {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && sidebar.classList.contains('is-open')) _setOpen(false);
   });
-  // Auto-close when the user picks something inside the drawer — otherwise
-  // the content they wanted to see is hidden behind the just-opened drawer.
+  // Close the drawer once the user picks something in it — otherwise the view
+  // they opened stays hidden behind it.  A pick opens a view: a Library, Smart
+  // or Stations entry ([data-view] / [data-sview]), a folder row, a playlist,
+  // the Folders heading's "open in the main pane" key, or a link.  Not picks:
+  // a folder's ▶ (it only expands), an offline drive's row (it only says so),
+  // the Folders ▼ (.btn-section-toggle folds the drawer's own contents), the
+  // Playlists + (it asks for a name first), the filter box and the splitters.
+  // Heard in the capture phase, since several of these handlers stop the
+  // event (the ▶, the open key, the rows' Enter/Space); closed after it, so
+  // the pick's own handler runs first.  (An offline root's test is reveal()'s.)
+  const _PICK = '[data-view], [data-sview], .tree-node, .sidebar-playlist-item, #btn-folders-open, a[href]';
+  const _isPick = (t) => {
+    if (!(t instanceof Element) || t.closest('.tree-chevron')) return false;
+    const pick = t.closest(_PICK);
+    if (!pick || !sidebar.contains(pick)) return false;
+    const row = pick.classList.contains('tree-node') ? pick.parentElement : null;
+    return !(row && row.classList.contains('tree-unavailable') && !row.classList.contains('tree-catalogue'));
+  };
+  const _closeAfterPick = (byKey) => setTimeout(() => {
+    // The closed drawer goes inert, which drops the focus a keyboard pick
+    // left in it: hand it to the content (the skip link's target) instead.
+    // (Above 900 px the sidebar never goes inert: focus stays where it is.)
+    const refocus = byKey && _narrowMQ.matches && sidebar.contains(document.activeElement);
+    _setOpen(false);
+    if (refocus) document.getElementById('content')?.focus({ preventScroll: true });
+  }, 0);
   sidebar.addEventListener('click', (e) => {
-    if (!sidebar.classList.contains('is-open')) return;
-    const t = e.target;
-    if (t instanceof HTMLElement &&
-        (t.closest('a, button') || t.closest('[data-route], [data-scan-dir]'))) {
-      _setOpen(false);
-    }
-  });
+    // (detail 0 on a trusted click: Enter on a <button> or link)
+    if (sidebar.classList.contains('is-open') && _isPick(e.target)) _closeAfterPick(e.isTrusted && e.detail === 0);
+  }, true);
+  sidebar.addEventListener('keydown', (e) => {
+    if ((e.key !== 'Enter' && e.key !== ' ') || !sidebar.classList.contains('is-open')) return;
+    // (Enter on a <button> or link makes a click of its own, heard above)
+    if (e.target instanceof Element && e.target.matches('button, a[href]')) return;
+    if (_isPick(e.target)) _closeAfterPick(true);
+  }, true);
 })();
 
 // ── Admin button ──────────────────────────────────────────────────────────────
@@ -3950,10 +4093,40 @@ const _welcomeOverlay = document.getElementById('welcome-overlay');
 let _welcomeRelease   = null;   // trapFocus release callback
 let _welcomePrevFocus = null;   // element to restore focus to on close
 
+// The guide's lead key fits the library (welcome_lead.js): "Add your music"
+// for an empty one, "Start listening" (then "Add more music") once it has
+// music.  Painted at once from the sidebar's All Tracks count when it is
+// known, then from /api/library/counts (the sidebar's request, shared).
+function _paintWelcomeLead(tracks) {
+  const add = document.getElementById('welcome-add-music');
+  const dismiss = document.getElementById('welcome-dismiss');
+  if (!add || !dismiss || !add.parentNode) return;
+  const focused = document.activeElement;
+  const w = welcomeLead(tracks);
+  add.textContent = w.add;
+  dismiss.textContent = w.dismiss;
+  const first = w.lead === 'dismiss' ? dismiss : add;
+  const second = first === add ? dismiss : add;
+  first.className = 'btn-primary';
+  second.className = 'btn-secondary';
+  if (first.nextElementSibling !== second || first.parentNode.firstElementChild !== first) {
+    first.parentNode.insertBefore(first, first.parentNode.firstElementChild);
+    first.after(second);
+    if ((focused === add || focused === dismiss) && document.activeElement !== focused) focused.focus();
+  }
+}
 function _openWelcome() {
   // Idempotent — never stack a second instance (the splash IIFE and the header
   // "?" button can both ask).
   if (!_welcomeOverlay || !_welcomeOverlay.classList.contains('hidden')) return;
+  const known = parseInt((document.querySelector('#nav-library li[data-view="all"] .nav-count')?.textContent || '').replace(/\D/g, ''), 10);
+  if (Number.isFinite(known)) _paintWelcomeLead(known);
+  try {
+    const c = Library.refreshCounts && Library.refreshCounts({ reuse: true });
+    if (c && typeof c.then === 'function') {
+      c.then((r) => { if (r) _paintWelcomeLead(r.tracks ?? r.visible); }).catch(() => {});
+    }
+  } catch (_) { /* the guide as written */ }
   _welcomePrevFocus = document.activeElement;
   // Hide the app from AT and the tab order while the modal is up — matches the
   // auth/cast-picker pattern.  The overlay is a sibling of #app, so inert on
@@ -4013,6 +4186,25 @@ if (_welcomeOverlay) {
 }
 // Header "?" re-opens the guide any time — a persistent discoverability entry.
 document.getElementById('btn-welcome')?.addEventListener('click', _openWelcome);
+
+// ── The Retro hi-fi / Modern switch at the top ──────────────────────────────
+// One press switches the shared style (ui_style.js) — the same choice as
+// Settings › Appearance › Style, which follows it (admin.js), as it follows the
+// Settings one.  The icon shows the style in use (app.css), the name and the
+// tooltip say what a press switches to (ui_style_switch.js).  At ≤600 px it
+// folds into the ⋯ menu.
+{
+  const btn = document.getElementById('btn-ui-style');
+  const itemLabel = document.getElementById('hdr-more-style-label');
+  const paint = (style) => {
+    const t = styleSwitchText(style);
+    if (btn) { btn.setAttribute('aria-label', t.label); btn.title = t.title; btn.dataset.state = style; }
+    if (itemLabel) itemLabel.textContent = t.item;
+  };
+  btn?.addEventListener('click', () => setUiStyle(getUiStyle() === 'retro' ? 'modern' : 'retro'));
+  onUiStyleChange(paint);
+  paint(getUiStyle());
+}
 
 // ── ⋯ menus of folded keys (narrow window) ──────────────────────────────────
 // Keys that don't fit fold into a ⋯ menu (app.css): the header's user chip, "?",

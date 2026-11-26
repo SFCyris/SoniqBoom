@@ -144,7 +144,9 @@ test('a station paused while it tuned in, and one resumed, ask what it plays too
 });
 
 test('the Now Playing screen and the mini-player show the station through the same two lines', () => {
-  assert.match(SRC, /get lines\(\)\s+\{ return _stationLines\(_station, _station \? _now : null\); \}/);
+  assert.match(SRC, /get lines\(\) \{\n\s*const l = _stationLines\(_station, _station \? _now : null\);/);
+  // (while the stream recovers, the second line says so — stream_recovery.js)
+  assert.match(SRC, /if \(s === 'reconnecting'\) l\.sub = 'Reconnecting\\u2026';/);
   const np = read('views/nowplaying.js');
   assert.match(np, /const lines = MobileRadio\.lines;\n\s*titleEl\.textContent\s+= lines\.title;\n\s*artistEl\.textContent = lines\.sub;/);
   const app = read('app.js');

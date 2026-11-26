@@ -338,11 +338,55 @@ def test_public_track_hands_back_a_canonical_row_untouched_and_never_mutates(lib
     assert tracks_api.public_track(None) is None and tracks_api.public_track({}) is None
 
 
+def test_browse_rows_equal_the_model_dump(lib):
+    """The folder browse cache's rows (``fstree._shape_row`` — the startup
+    warmup shapes every track through it) equal what the old per-row
+    ``TrackMeta(**d).model_dump()`` + ``_scanned`` made: value and type,
+    field by field — rows missing fields (the defaults merged under them),
+    None values, lists, the nested ``loudness`` map, stray keys, coerced
+    values, rejected rows — and the stored row is never written."""
+    odd = [_minimal("minimal2", lib.dir, lib.root),
+           {**_minimal("minimal3", lib.dir, lib.root), "genre": None},   # model rejects
+           {k: v for k, v in _row("someless", lib.dir, lib.root,
+                                  loudness={"1": [-14.5, 0.9], "2": [-9.0, 1.0]},
+                                  tune_slots=[1, 3], game_aliases=["X"]).items()
+            if k not in ("genre", "album", "year", "health", "format_score")},
+           {k: v for k, v in _row("lessstray", lib.dir, lib.root, extra=1).items()
+            if k not in ("genre", "bpm")},
+           {k: v for k, v in _row("lessint", lib.dir, lib.root, duration=180).items()
+            if k != "instruments"},
+           _row("loud", lib.dir, lib.root, loudness={"1": [-14, 1]})]    # model: → floats
+    for row in _clean_rows(lib.dir, lib.root) + _poison_rows(lib.dir, lib.root) + odd:
+        try:
+            want = TrackMeta(**{k: v for k, v in row.items() if k in FIELDS}).model_dump()
+            want["_scanned"] = True
+        except Exception:
+            want = None
+        before = copy.deepcopy(row)
+        got = fstree._shape_row(row)
+        name = row.get("id", "noid")
+        assert row == before and "_scanned" not in row, name
+        if want is None:
+            assert got is None, name
+            continue
+        assert got is not row and got.keys() == want.keys(), name
+        for k in want:
+            assert _same_value(got[k], want[k]), (name, k, got[k], want[k])
+    # a default list is a fresh object for each row (one row's edit is not
+    # every row's)
+    a = fstree._shape_row(_minimal("m1", lib.dir, lib.root) | {"genre": []})
+    b, c = (fstree._shape_row({k: v for k, v in _minimal(t, lib.dir, lib.root).items()
+                               if k != "genre"}) for t in ("m2", "m3"))
+    assert b["genre"] == c["genre"] == [] and b["genre"] is not c["genre"]
+    assert a["genre"] is not b["genre"]
+
+
 def test_every_trackmeta_field_has_a_fast_path_type():
     """A field whose annotation ``_meta_types`` can't read would send EVERY row
     through the model (correct, ~5x slower) — fail loudly instead."""
     assert not [n for n, (kept, _f, _e) in tracks_api._META_SPEC.items() if not kept]
-    assert set(tracks_api._STR_LISTS) | set(tracks_api._FLOAT_LISTS) == {
+    assert (set(tracks_api._STR_LISTS) | set(tracks_api._FLOAT_LISTS) | set(tracks_api._INT_LISTS)
+            | set(tracks_api._FLOAT_LIST_MAPS)) == {
         n for n, f in TrackMeta.model_fields.items() if "list" in repr(f.annotation)}
 
 

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import fcntl
 import functools
+import contextvars
 import hashlib
 import json
 import logging
@@ -122,13 +123,118 @@ _SCRYPT_P      = 1
 _SCRYPT_KEY    = 64
 _SCRYPT_MAXMEM = 128 * 1024 * 1024   # 128 MB — fits N=2**15, r=8, p=1
 
-# Login lockout — bounds brute-force at K guesses per window per username.
-# A determined botnet distributing across many usernames can still try,
-# but the scrypt cost (~80 ms each) + this lockout makes per-account
-# break-in impractical (15 guesses in 15 min = effective rate ≤ 1/min).
+# Login lockout — counted per (account, scope, CLIENT): 15 wrong guesses from
+# one client address within 15 min lock that client out of that account's
+# scope for 15 min.  Another client — the account's owner, their Subsonic
+# apps — is not locked by a stranger's guesses (until 2.3.0 the count was per
+# account: 15 guesses from anyone locked everyone out).  The client is
+# ``request.client.host``, which uvicorn rewrites from ``X-Forwarded-For``
+# only for a proxy it trusts (``FORWARDED_ALLOW_IPS``, default loopback);
+# IPv6 clients are grouped by their /64 (``client_key``).
 _LOCKOUT_MAX_ATTEMPTS = 15
 _LOCKOUT_WINDOW_SEC   = 15 * 60      # rolling 15 min window
 _LOCKOUT_COOLDOWN_SEC = 15 * 60      # lock duration after threshold hit
+# Account-wide slow-down against guesses spread over many clients: once an
+# account has _ACCOUNT_SLOW_AFTER failed guesses (all clients, all scopes) in
+# the window, a client that never signed in to it successfully
+# (``_known_good``: in the last _KNOWN_GOOD_TTL_SEC, this process) is locked
+# after _ACCOUNT_SLOW_MAX_ATTEMPTS guesses instead of 15.  Each client keeps
+# its OWN budget — nothing is shared, so a stranger's guesses never use up
+# the owner's tries from a new address (a shared check every N seconds was
+# taken by an attacker polling faster: the owner got none).
+_ACCOUNT_SLOW_AFTER = 30
+_ACCOUNT_SLOW_MAX_ATTEMPTS = 3
+_KNOWN_GOOD_TTL_SEC = 30 * 86400
+_KNOWN_GOOD_PER_ACCOUNT = 64
+# Memory bounds of the failed-guess tables (each record holds at most
+# _LOCKOUT_MAX_ATTEMPTS / _ACCOUNT_SLOW_AFTER timestamps): expired records are
+# pruned and the least recently counted go beyond the caps.  Names that are no
+# account have tables of their own, so a flood of made-up names (one md5 each
+# in token mode) can't push a real account's lock out.  A name longer than any
+# valid user name (64) is kept as its hash, not as sent (a form POST may carry
+# megabytes).
+_LOCKOUT_MAX_ENTRIES = 50_000        # real accounts (a record still locked: kept)
+_LOCKOUT_X_MAX_ENTRIES = 20_000      # names that are no account (plain LRU)
+_ACCOUNT_X_MAX_ENTRIES = 5_000
+_KNOWN_GOOD_REFRESH_SEC = 3600.0
+
+
+_CLIENT_KEYS: dict[str, str] = {}      # host → client_key (memo, bounded)
+
+
+def client_key(host: str | None) -> str:
+    """The lockout's key for a client address: the address as text (an
+    IPv4-mapped IPv6 address as its IPv4), a global IPv6 address by its /64
+    (one host on the internet holds a whole /64 to rotate through; a LAN's
+    link-local / unique-local addresses stay one host each), ``"?"`` when
+    unknown.  Memoised: every Subsonic request with credentials asks."""
+    hit = _CLIENT_KEYS.get(host) if host else None
+    if hit is not None:
+        return hit
+    h = (host or "").strip()
+    if not h:
+        return "?"
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(h.split("%", 1)[0])
+    except ValueError:
+        key = h[:64]
+    else:
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            key = str(ip.ipv4_mapped)
+        elif ip.version == 6 and ip.is_global:
+            key = str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        else:
+            key = str(ip)          # (a LAN's link-local / ULA address: each host its own)
+    if len(host) <= 64:
+        if len(_CLIENT_KEYS) >= 4096:
+            _CLIENT_KEYS.clear()
+        _CLIENT_KEYS[host] = key
+    return key
+
+
+def request_client_key(request) -> str:
+    """``client_key`` of a request's peer (``request.client.host``); ``"?"``
+    for an object without one (tests, a Unix socket)."""
+    c = getattr(request, "client", None)
+    return client_key(getattr(c, "host", None) if c is not None else None)
+
+
+# The client of the request being authenticated: set at each sign-in entry
+# point (``bind_request_client`` — the web sign-in, Subsonic ``/rest`` auth,
+# ``/api/stream`` auth) and read by the store's lockout methods when no
+# ``client`` is passed.  ``asyncio.to_thread`` copies it into the worker that
+# runs the scrypt check.  Unset (a direct call: the CLI, tests) = the client
+# "?" when counting.
+_REQUEST_CLIENT: "contextvars.ContextVar[str | None]" = contextvars.ContextVar(
+    "soniqboom_auth_client", default=None)
+
+
+def bind_request_client(request) -> str:
+    """Make ``request``'s client (``request_client_key``) the one this
+    request's sign-in checks count against; returns it."""
+    c = request_client_key(request)
+    _REQUEST_CLIENT.set(c)
+    return c
+
+
+def _client_of(client: str | None) -> str:
+    if client is not None:
+        return client
+    return _REQUEST_CLIENT.get() or "?"
+
+
+def _account_key(username: str | None) -> str:
+    low = (username or "").lower()
+    if len(low) <= 64:
+        return low
+    return "#" + hashlib.sha256(low.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _split_lock_key(key: str) -> tuple[str, str]:
+    """``_lock_key``'s ``"name\\0scope"`` → (account key, scope)."""
+    name, _, scope = (key or "").partition("\0")
+    return _account_key(name), scope
 
 # ── Scrobble-token at-rest encryption ───────────────────────────────────────
 
@@ -493,10 +599,22 @@ class UserStore:
         # Sessions: sha256(token) → {user_id, expiry, pw (``_pw_binding``),
         # persisted (the expiry last written to sessions.json)}.
         self._sessions: dict[str, dict] = {}
-        # Lockout state: username_lower → {fails: [(ts, ...)], locked_until}.
+        # Lockout state: (account key, scope, client key) → {fails: deque of
+        # timestamps, locked_until}; least recently counted first (pruned and
+        # capped — ``_count_attempt``).  ``_acct_fails``: account key →
+        # {fails} — the account-wide slow-down; ``_known_good``: account key →
+        # {client key: last successful sign-in}.
         # In-memory only; a restart clears all counters which is acceptable
         # (an attacker who can restart the server has bigger leverage).
-        self._lockout: dict[str, dict] = {}
+        import collections as _collections
+        self._lockout: "_collections.OrderedDict[tuple[str, str, str], dict]" = \
+            _collections.OrderedDict()
+        self._acct_fails: "_collections.OrderedDict[str, dict]" = _collections.OrderedDict()
+        # (the same two for names that are no account — ``_tables``)
+        self._lockout_x: "_collections.OrderedDict[tuple[str, str, str], dict]" = \
+            _collections.OrderedDict()
+        self._acct_fails_x: "_collections.OrderedDict[str, dict]" = _collections.OrderedDict()
+        self._known_good: "dict[str, _collections.OrderedDict[str, float]]" = {}
         # Guards ``_lockout``: a guess is counted (``_reserve_attempt``)
         # before its scrypt check, so parallel guesses can't all pass a check
         # made before any of them failed.
@@ -664,7 +782,9 @@ class UserStore:
             # every sign-in failed then — start over (Subsonic apps that kept
             # polling would otherwise stay locked out for the cooldown).
             with self._lockout_lock:
-                self._lockout.clear()
+                for t in (self._lockout, self._acct_fails, self._lockout_x,
+                          self._acct_fails_x):
+                    t.clear()
         self._ss_raw = m["ss_raw"]
         self._users = m["users"]
         self._by_username = m["by_username"]
@@ -1448,6 +1568,9 @@ class UserStore:
                 elif sp and known is None:
                     self._ss_custom[user_id] = True
                 self._pw_verified.pop(user_id, None)
+                # (the addresses that signed in with the old password are no
+                # longer vouched for by the lockout's slow-down)
+                self.forget_known_clients(user.username)
                 # Force re-login everywhere when password rotates (but on the
                 # device that changed it).
                 self._purge_sessions_for(user_id, keep=keep_h if keep_rec is not None else None)
@@ -1571,64 +1694,243 @@ class UserStore:
         return any(k["id"] == key_id for k in self._api_keys.get(user_id) or ())
 
     # ── Authentication ───────────────────────────────────────────────────
+    #
+    # Failed guesses are counted per (account, scope, client) — see
+    # _LOCKOUT_MAX_ATTEMPTS — plus account-wide for the slow-down
+    # (_ACCOUNT_SLOW_AFTER).  ``client`` is ``client_key(...)`` of the
+    # request's peer; None = the request's bound client
+    # (``bind_request_client``), else "?" (a direct call: the CLI, tests).
+    # Names that are no account are counted in their own tables, so a flood
+    # of made-up names can only push out other made-up names — never a real
+    # account's lock.  Every table is touched under ``_lockout_lock``.
 
-    def _is_locked(self, username_lower: str) -> tuple[bool, float]:
-        """Return (locked, seconds_remaining)."""
-        rec = self._lockout.get(username_lower)
-        if not rec:
-            return (False, 0.0)
-        locked_until = rec.get("locked_until", 0.0)
-        if locked_until > time.time():
-            return (True, locked_until - time.time())
-        return (False, 0.0)
+    def _tables(self, akey: str) -> tuple:
+        """``(per-client table, account-wide table, cap of the first)`` for
+        ``akey``: a real account's, or the made-up names' (LRU-capped)."""
+        if akey in self._by_username:
+            return self._lockout, self._acct_fails, _LOCKOUT_MAX_ENTRIES
+        return self._lockout_x, self._acct_fails_x, _LOCKOUT_X_MAX_ENTRIES
 
-    def _note_failed_login(self, username_lower: str) -> None:
-        with self._lockout_lock:
-            self._count_attempt(username_lower, time.time())
+    @staticmethod
+    def _lock_left(rec: dict | None, now: float) -> float:
+        """Seconds left of a per-client record's lock (0 = not locked)."""
+        if rec is None:
+            return 0.0
+        left = rec["locked_until"] - now
+        return left if left > 0 else 0.0
 
-    def _count_attempt(self, username_lower: str, now: float) -> None:
-        """One guess against ``username_lower`` (``_lockout_lock`` held)."""
-        rec = self._lockout.setdefault(username_lower, {"fails": [], "locked_until": 0.0})
-        # Drop fails outside the rolling window.
-        rec["fails"] = [t for t in rec["fails"] if now - t < _LOCKOUT_WINDOW_SEC]
-        rec["fails"].append(now)
-        if len(rec["fails"]) >= _LOCKOUT_MAX_ATTEMPTS and rec["locked_until"] <= now:
+    def _rec(self, akey: str, scope: str, client: str) -> "dict | None":
+        return self._tables(akey)[0].get((akey, scope, client))
+
+    def _is_known_good(self, akey: str, client: str, now: float) -> bool:
+        ts = self._known_good.get(akey, {}).get(client)
+        return ts is not None and now - ts < _KNOWN_GOOD_TTL_SEC
+
+    def _slowed(self, akey: str, client: str, now: float) -> bool:
+        """The account-wide slow-down holds ``client`` to
+        _ACCOUNT_SLOW_MAX_ATTEMPTS: the account had _ACCOUNT_SLOW_AFTER failed
+        guesses (all clients, all scopes) in the window, and ``client`` never
+        signed in to it (``_known_good``)."""
+        a = self._tables(akey)[1].get(akey)
+        if (a is None or len(a["fails"]) < _ACCOUNT_SLOW_AFTER
+                or now - a["fails"][0] >= _LOCKOUT_WINDOW_SEC):
+            return False
+        return not self._is_known_good(akey, client, now)
+
+    @staticmethod
+    def _expired(rec: dict, now: float) -> bool:
+        return rec["locked_until"] <= now and now - rec["fails"][-1] >= _LOCKOUT_WINDOW_SEC
+
+    def _prune_table(self, table, cap: int, now: float, *, keep_locked: bool,
+                     keep=None) -> None:
+        """Expired records go from the front (least recently counted =
+        soonest expired: a record expires a window after its last guess);
+        then, over ``cap``, the least recently counted down to 90 % of it (one
+        pass, so the cost is amortised) — with ``keep_locked``, records still
+        locked only when nothing else is left to go."""
+        while table and self._expired(next(iter(table.values())), now):
+            table.popitem(last=False)
+        if len(table) <= cap:
+            return
+        target = cap - cap // 10
+        if keep_locked:
+            for k in [k for k, r in table.items() if r["locked_until"] <= now and k != keep][
+                    :len(table) - target]:
+                del table[k]
+        # (down to the target in every case — locked records too when there
+        # are no others — so the next cap // 10 records cost no scan; never
+        # ``keep``, the record just counted: it is the most recent, last)
+        while len(table) > target and next(iter(table)) != keep:
+            table.popitem(last=False)
+
+    def _prune_acct(self, table, cap: "int | None", now: float) -> None:
+        while table and now - next(iter(table.values()))["fails"][-1] >= _LOCKOUT_WINDOW_SEC:
+            table.popitem(last=False)
+        while cap is not None and len(table) > cap:
+            table.popitem(last=False)
+
+    def _count_attempt(self, akey: str, scope: str, client: str, now: float) -> None:
+        """One guess by ``client`` against ``akey``'s ``scope``
+        (``_lockout_lock`` held): locks the client once it made
+        _LOCKOUT_MAX_ATTEMPTS guesses in the window — or, held back by the
+        account-wide slow-down (``_slowed``), _ACCOUNT_SLOW_MAX_ATTEMPTS."""
+        import collections
+        table, _acct, cap = self._tables(akey)
+        k = (akey, scope, client)
+        rec = table.get(k)
+        if rec is None:
+            rec = table[k] = {
+                "fails": collections.deque(maxlen=_LOCKOUT_MAX_ATTEMPTS), "locked_until": 0.0}
+        else:
+            table.move_to_end(k)
+        fails = rec["fails"]
+        fails.append(now)
+        limit = (_ACCOUNT_SLOW_MAX_ATTEMPTS if self._slowed(akey, client, now)
+                 else _LOCKOUT_MAX_ATTEMPTS)
+        n = sum(1 for t in fails if now - t < _LOCKOUT_WINDOW_SEC)
+        if n >= limit and rec["locked_until"] <= now:
             rec["locked_until"] = now + _LOCKOUT_COOLDOWN_SEC
             log.warning(
-                "Account '%s' locked for %ds after %d failed login attempts",
-                username_lower.split("\0", 1)[0], _LOCKOUT_COOLDOWN_SEC, len(rec["fails"]),
+                "Sign-in of '%s'%s from %s locked for %ds after %d failed attempts",
+                akey[:64], f" ({scope})" if scope else "", client, _LOCKOUT_COOLDOWN_SEC, n,
             )
+        # (both tables keep their locked records the longest: a made-up
+        # name's lock outlasting a junk flood like a real account's does, so
+        # the flood doesn't tell which names are accounts)
+        self._prune_table(table, cap, now, keep_locked=True, keep=k)
 
-    def _reserve_attempt(self, username_lower: str, also_locked: str | None = None) -> bool:
+    def _count_account_fail(self, akey: str, now: float) -> None:
+        """One failed guess against ``akey`` from any client — the
+        slow-down's count (``_lockout_lock`` held)."""
+        import collections
+        _t, acct, _cap = self._tables(akey)
+        real = acct is self._acct_fails
+        a = acct.get(akey)
+        if a is None:
+            a = acct[akey] = {"fails": collections.deque(maxlen=_ACCOUNT_SLOW_AFTER)}
+        else:
+            acct.move_to_end(akey)
+        a["fails"].append(now)
+        if (real and len(a["fails"]) == _ACCOUNT_SLOW_AFTER
+                and now - a["fails"][0] < _LOCKOUT_WINDOW_SEC and not a.get("warned")):
+            a["warned"] = True
+            log.warning("Account '%s': %d failed sign-ins within %d min — addresses that "
+                        "never signed in to it now get %d tries each", akey[:64],
+                        _ACCOUNT_SLOW_AFTER, _LOCKOUT_WINDOW_SEC // 60,
+                        _ACCOUNT_SLOW_MAX_ATTEMPTS)
+        self._prune_acct(acct, None if real else _ACCOUNT_X_MAX_ENTRIES, now)
+
+    def _account_failed(self, username: str) -> None:
+        with self._lockout_lock:
+            self._count_account_fail(_account_key(username), time.time())
+
+    def _reserve_attempt(self, key: str, client: str | None = None,
+                         also_locked: str | None = None) -> bool:
         """Count a guess BEFORE it is checked — under one lock with the
         lockout check, so a parallel burst gets exactly the guesses a serial
-        one would: False (refused, not counted) while ``username_lower`` (or
-        ``also_locked``) is locked.  A guess that then succeeds clears the
-        count (``_clear_failed_logins``); one that fails stays counted."""
+        one would: False (refused, not counted) while ``client`` is locked
+        out of ``key`` (a ``_lock_key``; or of ``also_locked``).  A guess
+        that then succeeds clears the client's count
+        (``_clear_failed_logins``); one that fails stays counted, and also
+        counts account-wide (``_account_failed``)."""
+        c = _client_of(client)
+        akey, scope = _split_lock_key(key)
         with self._lockout_lock:
             now = time.time()
-            for key in (username_lower, also_locked):
-                if key is not None:
-                    rec = self._lockout.get(key)
-                    if rec and rec.get("locked_until", 0.0) > now:
+            for k in (key, also_locked):
+                if k is not None:
+                    ak, sc = _split_lock_key(k)
+                    if self._lock_left(self._rec(ak, sc, c), now) > 0:
                         return False
-            self._count_attempt(username_lower, now)
+            self._count_attempt(akey, scope, c, now)
             return True
 
-    def _clear_failed_logins(self, username_lower: str) -> None:
+    def _clear_failed_logins(self, key: str, client: str | None = None) -> None:
+        """Forget ``client``'s failed guesses against ``key`` (a
+        ``_lock_key``) — every client's when ``client`` is None."""
+        akey, scope = _split_lock_key(key)
         with self._lockout_lock:
-            self._lockout.pop(username_lower, None)
+            table = self._tables(akey)[0]
+            if client is not None:
+                table.pop((akey, scope, client), None)
+                return
+            for k in [k for k in table if k[0] == akey and k[1] == scope]:
+                del table[k]
 
-    def is_locked(self, username: str, scope: str = "") -> bool:
-        """Whether ``username`` is locked out (``scope`` "" = the main login
-        password; "token" = Subsonic token-mode guesses and "p" = Subsonic
-        ``p=`` password guesses, each counted separately so a client stuck on
-        a stale token / retired app password can't lock the web login)."""
-        return self._is_locked(self._lock_key(username, scope))[0]
+    def sign_in_wait(self, username: str, client: str | None = None,
+                     scope: str = "") -> float:
+        """Seconds until ``client`` may try a password for ``username``
+        again (0.0: now), without counting anything."""
+        c = _client_of(client)
+        akey = _account_key(username)
+        with self._lockout_lock:
+            return self._lock_left(self._rec(akey, scope, c), time.time())
 
-    def note_failed_attempt(self, username: str, scope: str = "") -> None:
-        """Count one failed guess against ``username`` in ``scope``."""
-        self._note_failed_login(self._lock_key(username, scope))
+    def is_locked(self, username: str, scope: str = "", client: str | None = None) -> bool:
+        """Whether ``client`` is locked out of ``username``'s ``scope`` ("" =
+        the main login password; "token" = Subsonic token-mode guesses and
+        "p" = Subsonic ``p=`` password guesses, each counted separately so a
+        client stuck on a stale token / retired app password can't lock the
+        web login).  ``client`` None: the request's client
+        (``bind_request_client``); outside a request, whether ANY client is
+        locked out of that scope (a diagnostic)."""
+        if client is None:
+            client = _REQUEST_CLIENT.get()
+        if client is None:
+            akey = _account_key(username)
+            now = time.time()
+            with self._lockout_lock:
+                return any(k[0] == akey and k[1] == scope and rec["locked_until"] > now
+                           for k, rec in self._tables(akey)[0].items())
+        return self.sign_in_wait(username, client, scope) > 0
+
+    def token_check_allowed(self, username: str, client: str | None = None) -> bool:
+        """May ``client`` have a Subsonic token (``t`` + ``s``) for
+        ``username`` checked now?  False while it is locked out of the
+        "token" scope.  A wrong token is then counted with
+        ``note_failed_attempt(..., "token", client)``; a right one with
+        ``note_signed_in``."""
+        return not self.is_locked(username, "token", _client_of(client))
+
+    def note_failed_attempt(self, username: str, scope: str = "",
+                            client: str | None = None) -> None:
+        """Count one failed guess by ``client`` against ``username`` in
+        ``scope`` (and account-wide)."""
+        akey = _account_key(username)
+        with self._lockout_lock:
+            now = time.time()
+            self._count_account_fail(akey, now)
+            self._count_attempt(akey, scope, _client_of(client), now)
+
+    def note_signed_in(self, username: str, client: str | None = None) -> None:
+        """``client`` just proved it holds a credential of ``username``: the
+        account-wide slow-down no longer holds it to the smaller budget (for
+        _KNOWN_GOOD_TTL_SEC; at most _KNOWN_GOOD_PER_ACCOUNT addresses an
+        account, the least recently seen go first).  O(1); a client seen in
+        the last hour is not re-stamped (the Subsonic fast paths call this
+        per request)."""
+        import collections
+        akey, c = _account_key(username), _client_of(client)
+        now = time.time()
+        ts = self._known_good.get(akey, {}).get(c)
+        if ts is not None and now - ts < _KNOWN_GOOD_REFRESH_SEC:
+            return
+        if akey not in self._by_username:
+            return
+        with self._lockout_lock:
+            mine = self._known_good.get(akey)
+            if mine is None:
+                mine = self._known_good[akey] = collections.OrderedDict()
+            mine[c] = now
+            mine.move_to_end(c)
+            while len(mine) > _KNOWN_GOOD_PER_ACCOUNT:
+                mine.popitem(last=False)
+
+    def forget_known_clients(self, username: str) -> None:
+        """A password change: the addresses that signed in before are not
+        vouched for any more."""
+        with self._lockout_lock:
+            self._known_good.pop(_account_key(username), None)
 
     @staticmethod
     def _lock_key(username: str, scope: str) -> str:
@@ -1644,19 +1946,22 @@ class UserStore:
             UserStore._DUMMY_HASH_CACHE = hash_password("__dummy__")
         return UserStore._DUMMY_HASH_CACHE
 
-    def authenticate(self, username: str, password: str) -> User | None:
-        """Verify ``(username, password)``.  Bounded by per-username
-        lockout so brute-force is impractical even with the scrypt cost.
-        Returns None on bad creds OR lockout."""
-        hit = self.authenticate_with_hash(username, password)
+    def authenticate(self, username: str, password: str,
+                     client: str | None = None) -> User | None:
+        """Verify ``(username, password)``.  Bounded by the lockout (per
+        client, plus the account-wide slow-down) so brute-force is
+        impractical even with the scrypt cost.  ``client``: the caller's
+        ``client_key`` (None = "?").  Returns None on bad creds OR lockout."""
+        hit = self.authenticate_with_hash(username, password, client)
         return hit[0] if hit else None
 
-    def authenticate_with_hash(self, username: str, password: str) -> tuple[User, str] | None:
+    def authenticate_with_hash(self, username: str, password: str,
+                               client: str | None = None) -> tuple[User, str] | None:
         """``authenticate``, also answering the password hash the password was
         verified against — what a sign-in session is bound to
         (``issue_session``), so a password reset racing the sign-in ends it."""
         u_lower = (username or "").lower()
-        if not self._reserve_attempt(u_lower):
+        if not self._reserve_attempt(u_lower, client):
             # Burn the same scrypt time as a real check so locked accounts
             # don't have an obvious timing fingerprint.
             verify_password(password, UserStore._dummy_hash())
@@ -1664,34 +1969,42 @@ class UserStore:
         user = self.get_by_username(username)
         if not user or not user.enabled:
             verify_password(password, UserStore._dummy_hash())
+            self._account_failed(u_lower)
             return None
         verified = user.password_hash
         if not verify_password(password, verified):
+            self._account_failed(u_lower)
             return None
-        # Successful auth — clear the counter and bump last_login.
-        self._clear_failed_logins(u_lower)
+        # Successful auth — clear this client's counter and bump last_login.
+        self._clear_failed_logins(u_lower, _client_of(client))
+        self.note_signed_in(u_lower, client)
         return self._login_ok(user, password, verified), verified
 
-    def authenticate_subsonic_password(self, username: str, password: str) -> User | None:
+    def authenticate_subsonic_password(self, username: str, password: str,
+                                       client: str | None = None) -> User | None:
         """``authenticate`` for a Subsonic ``p=`` password (plain / enc:)
         that missed the O(1) checks — the login password, verified with
         scrypt.  Failures count in their OWN lockout scope ("p"), never the
         main one: a device that keeps sending a retired app password (or an
         old login password) can't lock the owner out of the web UI.  Refused
-        while either scope is locked (a locked web login stays locked here
-        too).  Success does the same bookkeeping as ``authenticate``."""
+        while either scope is locked for ``client`` (a locked web login stays
+        locked here too).  Success does the same bookkeeping as
+        ``authenticate``."""
         p_key = self._lock_key(username, "p")
-        if not self._reserve_attempt(p_key, also_locked=(username or "").lower()):
+        if not self._reserve_attempt(p_key, client, also_locked=(username or "").lower()):
             verify_password(password, UserStore._dummy_hash())
             return None
         user = self.get_by_username(username)
         if not user or not user.enabled:
             verify_password(password, UserStore._dummy_hash())
+            self._account_failed(username)
             return None
         verified = user.password_hash
         if not verify_password(password, verified):
+            self._account_failed(username)
             return None
-        self._clear_failed_logins(p_key)
+        self._clear_failed_logins(p_key, _client_of(client))
+        self.note_signed_in(username, client)
         return self._login_ok(user, password, verified)
 
     def _login_ok(self, user: User, password: str, verified: str | None = None) -> User:
@@ -1740,15 +2053,17 @@ class UserStore:
         import hmac as _hmac
         return _hmac.new(self._pw_key, (password or "").encode("utf-8"), "sha256").digest()
 
-    def check_cached_password(self, username: str, password: str) -> User | None:
+    def check_cached_password(self, username: str, password: str,
+                              client: str | None = None) -> User | None:
         """O(1) check of a login password this process already verified with
         scrypt (``authenticate``) — the user, or None (then run
-        ``authenticate``).  Never succeeds for a disabled account, one locked
-        out in the main or the Subsonic ``p=`` scope, or after a password
-        change (the entry is bound to the password hash)."""
+        ``authenticate``).  Never succeeds for a disabled account, one whose
+        main or Subsonic ``p=`` scope holds ``client`` back (``is_locked``;
+        None: any client locked out), or after a password change (the entry
+        is bound to the password hash)."""
         user = self.get_by_username(username)
-        if (user is None or not user.enabled or self.is_locked(username)
-                or self.is_locked(username, "p")):
+        if (user is None or not user.enabled or self.is_locked(username, "", client)
+                or self.is_locked(username, "p", client)):
             return None
         hit = self._pw_verified.get(user.id)
         if hit is None or hit[0] != user.password_hash:

@@ -448,6 +448,26 @@
   }
   #player-bar .player-extra-controls::-webkit-scrollbar { display: none; }
 }
+/* Wider, the icons fit (or spill into the free space beside the transport) —
+   until they would reach it (within 4 px): a Cast session's device pill, or
+   Retro's wider keys at ≈1101 px, put them over ◄◄ ▶ ►► or ◎.  Then
+   (.keys-capped, app.js) the row may reach left only as far as --keys-room
+   (app.js: to 12 px short of the transport, radio mode's station names
+   included), never less than its column, and scrolls sideways beyond that.
+   Only then: a scroller clips what is drawn past its padding (Retro's key
+   shadows reach 5 px). */
+@media (min-width: 1025px) {
+  #player-bar .player-extra-controls.keys-capped {
+    width: max-content;
+    max-width: max(100%, var(--keys-room, 100%));
+    justify-content: flex-start;      /* (a scroller can't reach what overflows its start) */
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 4px;                     /* room for the focus rings the scroller clips */
+    margin: -4px;
+  }
+  #player-bar .player-extra-controls.keys-capped::-webkit-scrollbar { display: none; }
+}
 /* The side with more buttons fades out (app.js sets .more-l / .more-r) */
 #player-bar .player-extra-controls.more-r { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
 #player-bar .player-extra-controls.more-l { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 28px), transparent); }

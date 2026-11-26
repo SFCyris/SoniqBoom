@@ -48,25 +48,28 @@ function _ensureOverlay() {
       </div>
       <h2 id="auth-title" class="auth-title">Sign in</h2>
       <form id="auth-form" class="auth-form" autocomplete="on">
-        <label class="auth-field">
-          <span>Username</span>
+        <label class="auth-field" for="auth-username">
+          <span id="auth-username-label">Username</span>
           <input id="auth-username" type="text" autocomplete="username"
+                 aria-labelledby="auth-username-label"
                  autocapitalize="off" autocorrect="off" spellcheck="false"
                  inputmode="text"
                  required minlength="2" maxlength="64"
                  pattern="[A-Za-z0-9._\\-]+">
         </label>
-        <label class="auth-field auth-field-password">
-          <span>Password <em id="auth-pw-rule" hidden></em></span>
+        <label class="auth-field auth-field-password" for="auth-password">
+          <span><span id="auth-password-label">Password</span> <em id="auth-pw-rule" hidden></em></span>
           <input id="auth-password" type="password"
+                 aria-labelledby="auth-password-label" aria-describedby="auth-pw-rule"
                  autocomplete="current-password"
                  required>
           <button type="button" id="auth-pw-toggle" class="auth-pw-toggle"
                   aria-label="Show password" title="Show password">👁</button>
         </label>
-        <label class="auth-field auth-field-display" hidden>
-          <span>Display name <em>(optional)</em></span>
+        <label class="auth-field auth-field-display" for="auth-display-name" hidden>
+          <span id="auth-display-name-label">Display name <em>(optional)</em></span>
           <input id="auth-display-name" type="text" maxlength="64"
+                 aria-labelledby="auth-display-name-label"
                  autocomplete="nickname">
         </label>
         <button id="auth-submit" type="submit" class="auth-submit">Sign in</button>
@@ -120,6 +123,8 @@ function _applyMode() {
   const hint = passwordHint(!!STATE.authStatus?.strong_passwords);
   rule.hidden = _mode === 'login' || !hint;
   rule.textContent = hint ? `(${hint})` : '';
+  // (the rule describes the password field only while it is shown)
+  if (rule.hidden) pwd.removeAttribute('aria-describedby'); else pwd.setAttribute('aria-describedby', 'auth-pw-rule');
   if (_mode === 'login') {
     title.textContent  = 'Sign in';
     submit.textContent = 'Sign in';

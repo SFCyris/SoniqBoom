@@ -127,6 +127,7 @@ _CONF_DEFAULTS: dict[str, Any] = {
     "scan_zips": True,
     "scan_remote_zips": True,   # also crack open .zip on remote (FTP/SMB) sources
     "startup_reconcile_scan": True,   # incremental rescan of local folders shortly after startup
+    "loudness_scan": True,      # measure the loudness of local files without ReplayGain while idle
     "expose_local_files": True,
     "display_startup_logo": True,
     # Internet-radio now-playing cover lookup (library → Discogs → MusicBrainz).
@@ -614,6 +615,14 @@ def _conf_int(section: str, key: str, default: int) -> int:
         return default
 
 
+def _conf_float(section: str, key: str, default: float) -> float:
+    """``_conf_int`` for a float value."""
+    try:
+        return float(_local_conf.get(section, {}).get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # ── Pydantic settings ─────────────────────────────────────────────────────────
 
 class Settings(BaseSettings):
@@ -690,6 +699,23 @@ class Settings(BaseSettings):
     # sawteethrender (NostalgicPlayer's Sawteeth player, ported to C) — Sawteeth
     # songs, built from source by install.sh (soniqboom/native/sawteethrender).
     sawteethrender_path: str = _local_conf.get("renderers", {}).get("sawteethrender_path", "")
+    # midirender (libADLMIDI / libOPNMIDI / libmt32emu) — MIDI-family songs
+    # on an OPL3 or OPN2 FM synth or an MT-32, and the game MIDI formats (XMI,
+    # DMX MUS, HMI / HMP …); built from source by install.sh
+    # (soniqboom/native/midirender).
+    midirender_path:    str = _local_conf.get("renderers", {}).get("midirender_path", "")
+    # The synth Standard MIDI files (.mid / .kar / .rmi) play on: "soundfont"
+    # (FluidSynth with the chosen SoundFont — the default), "opl3", "opn2" or
+    # "mt32"; and the one the game MIDI formats play on: "opl3" (the default,
+    # with the format's own FM bank), "opn2" or "mt32".
+    midi_synth:         str = (lambda v: v if v in ("soundfont", "opl3", "opn2", "mt32")
+                               else "soundfont")(
+        str(_local_conf.get("renderers", {}).get("midi_synth", "soundfont")).lower())
+    game_midi_synth:    str = (lambda v: v if v in ("opl3", "opn2", "mt32") else "opl3")(
+        str(_local_conf.get("renderers", {}).get("game_midi_synth", "opl3")).lower())
+    # The folder holding the user's own MT-32 / CM-32L control and PCM ROM
+    # images (SoniqBoom ships none); empty = not set (MT-32 can't play).
+    mt32_rom_dir:       str = _local_conf.get("renderers", {}).get("mt32_rom_dir", "")
     soundfont_path:     str = _local_conf.get("renderers", {}).get("soundfont_path", "")
     soundfonts_dir:     str = _local_conf.get("renderers", {}).get("soundfonts_dir", "")
     sid_default_duration: int = _local_conf.get("renderers", {}).get("sid_default_duration", 180)
@@ -717,6 +743,22 @@ class Settings(BaseSettings):
     sid_filter:         bool  = bool(_local_conf.get("renderers", {}).get("sid_filter", True))
     sid_filter_curve:   float = float(_local_conf.get("renderers", {}).get("sid_filter_curve", -1.0))
     sid_digiboost:      bool  = bool(_local_conf.get("renderers", {}).get("sid_digiboost", False))
+    # Amiga modules, stereo width and loops / endings (2.3.0) — read through
+    # ``core/render_options`` (which validates them):
+    #   amiga_resampler: libopenmpt's Amiga (Paula) resampler for Amiga
+    #                    modules: "auto" (default) | "a500" | "a1200" | "off"
+    #   stereo_width:    retro tunes' stereo width at playback, percent
+    #                    (100 = as rendered; the render stays the reference)
+    #   tracker_loops / chip_loops: loop count, 0 = the engine's default
+    #   tracker_fade / chip_fade:   fade seconds, -1 = the engine's default
+    #   sid_fade:        fade over the end of a SID's length, 0 = none
+    amiga_resampler:    str   = str(_local_conf.get("renderers", {}).get("amiga_resampler", "auto"))
+    stereo_width:       int   = _conf_int("renderers", "stereo_width", 100)
+    tracker_loops:      int   = _conf_int("renderers", "tracker_loops", 0)
+    tracker_fade:       float = _conf_float("renderers", "tracker_fade", -1.0)
+    chip_loops:         int   = _conf_int("renderers", "chip_loops", 0)
+    chip_fade:          float = _conf_float("renderers", "chip_fade", -1.0)
+    sid_fade:           float = _conf_float("renderers", "sid_fade", 0.0)
     # HVSC integration — point at the High Voltage SID Collection's
     # ``DOCUMENTS/`` folder (containing Songlengths.md5 + STIL.txt) to
     # get per-tune accurate durations and STIL commentary.  Empty = off.
@@ -741,6 +783,10 @@ class Settings(BaseSettings):
     conversion_cache_max_bytes: int = int(
         _local_conf.get("conversion_cache_max_bytes", 4 * 1024 ** 3)
     )
+    # Finished renders are compressed losslessly in the background (WavPack
+    # through ffmpeg; ``core/conversion_cache`` packed entries).  False keeps
+    # new renders as plain WAV (packs already made are still read).
+    conversion_cache_pack: bool = bool(_local_conf.get("conversion_cache_pack", True))
 
     # ZIP-extract cache (stable disk path for ZIP-contained tracks so a
     # browser's 5–20 Range requests per playback don't re-extract the
@@ -769,6 +815,9 @@ class Settings(BaseSettings):
     # files added / changed / removed while the server was stopped are picked
     # up (the folder watcher only sees changes while it runs).
     startup_reconcile_scan: bool = bool(_local_conf.get("startup_reconcile_scan", True))
+    # While no render runs, measure the loudness (EBU R128) of local files
+    # without ReplayGain tags, for volume leveling (``core/loudness``).
+    loudness_scan: bool = bool(_local_conf.get("loudness_scan", True))
 
     # UI — startup logo animation
     display_startup_logo: bool = _local_conf.get("display_startup_logo", True)
@@ -781,6 +830,13 @@ class Settings(BaseSettings):
     # ``discogs_token_enc`` (``_discogs_token_from_conf``).
     radio_art_lookup: bool = bool(_local_conf.get("radio_art_lookup", True))
     discogs_token: str = _local_conf.get("discogs_token", "")
+
+    # Game box covers from IGDB (``core/igdb_cover``) with the user's own
+    # Twitch application: its client id and secret (both empty = off).  The
+    # web page saves the secret encrypted, as ``igdb_client_secret_enc``
+    # (``_igdb_secret_from_conf``).
+    igdb_client_id: str = _local_conf.get("igdb_client_id", "")
+    igdb_client_secret: str = _local_conf.get("igdb_client_secret", "")
 
     # Offline mode (``SONIQBOOM_OFFLINE=1`` / conf ``offline: true``): the
     # server makes no request to a host on the internet — ``core.netpolicy``.
@@ -834,6 +890,23 @@ def _discogs_token_from_conf() -> None:
 
 
 _discogs_token_from_conf()
+
+
+def _igdb_secret_from_conf() -> None:
+    """The IGDB (Twitch) client secret the web page saved — encrypted, as
+    ``igdb_client_secret_enc`` — when neither the environment nor a plain
+    ``igdb_client_secret`` in the conf sets one."""
+    if settings.igdb_client_secret or not _local_conf.get("igdb_client_secret_enc"):
+        return
+    try:
+        from soniqboom.core.credentials import decrypt
+        settings.igdb_client_secret = decrypt(str(_local_conf["igdb_client_secret_enc"])) or ""
+    except Exception:                                   # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("the saved IGDB client secret couldn't be read")
+
+
+_igdb_secret_from_conf()
 
 
 def get_soundfonts_dir() -> Path:

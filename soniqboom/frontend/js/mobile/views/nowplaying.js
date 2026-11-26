@@ -13,6 +13,7 @@ import { subsongVirtualTrack, TUNE_CHIP_FORMAT_NAMES } from '../../tunes.js';
 import { fmtDur, freshArt, reaskArt } from './_common.js';
 import { healthBadge } from '../../health.js';
 import { mountNpVisuals } from './np_visuals.js';
+import { attachSeekGesture } from '../seek_gesture.js';
 
 export function mountNowPlaying(root, ctx) {
   // A portable cassette player's face (Retro hi-fi, the phone's only look —
@@ -68,6 +69,7 @@ export function mountNowPlaying(root, ctx) {
         <div class="m-np-scrubber-wrap">
           <div class="m-npw" id="m-npw" aria-hidden="true" hidden><canvas></canvas><canvas></canvas></div>
           <input class="m-np-scrubber" id="m-np-scrubber" type="range" min="0" max="100" value="0" step="0.1" aria-label="Position">
+          <div class="m-np-seek" id="m-np-seek" aria-hidden="true"></div>
           <div class="m-np-times">
             <span id="m-np-cur">0:00</span>
             <span id="m-np-dur">0:00</span>
@@ -98,6 +100,7 @@ export function mountNowPlaying(root, ctx) {
   const titleEl  = root.querySelector('#m-np-title');
   const artistEl = root.querySelector('#m-np-artist');
   const scrub    = root.querySelector('#m-np-scrubber');
+  const seekEl   = root.querySelector('#m-np-seek');
   const curEl    = root.querySelector('#m-np-cur');
   const durEl    = root.querySelector('#m-np-dur');
   const playBtn  = root.querySelector('#m-np-play');
@@ -110,6 +113,7 @@ export function mountNowPlaying(root, ctx) {
   const tuneList = root.querySelector('#m-np-tune-list');
 
   let _scrubbing = false;
+  const _onAir = () => MobileRadio.status === 'live' || MobileRadio.status === 'paused';
   let _showingStation = false;      // the times say "● LIVE" (renderStation)
 
   // The scrubber's position also fills the played part of its track (--np-pct)
@@ -127,7 +131,7 @@ export function mountNowPlaying(root, ctx) {
   // it), LIVE for a station; empty with nothing loaded.
   function paintSource(t) {
     let txt = '';
-    if (MobileRadio.active) txt = 'LIVE';
+    if (MobileRadio.active) txt = _onAir() ? 'LIVE' : '';
     else if (t) {
       // a long player name ("Sonic Arranger") gives way to the file's type
       const f = String(t.format || '').split('/')[0].trim().toUpperCase();
@@ -145,15 +149,20 @@ export function mountNowPlaying(root, ctx) {
   // What the transport does: the play key's glyph; for the CSS the play lamp
   // and the reels (data-state), the VFD's PLAY / PAUSE / STOP, the radio source.
   // ``playing`` = the Player's statechange value (read from the source otherwise).
+  // A station that comes up or recovers keeps the pause key (a tap stops the
+  // attempt) but no reels turn: TUNING / BUFFER / RECONNECT on the VFD.
+  const RADIO_ANN = { tuning: 'TUNING', buffering: 'BUFFER', reconnecting: 'RECONNECT' };
   function paintState(playing) {
     const radio = MobileRadio.active;
     if (radio) playing = MobileRadio.playing;
     else if (typeof playing !== 'boolean') playing = Player.playing;
     const loaded = radio || !!Player.currentTrack || !!Player.cuedTrack;
-    const state = playing ? 'playing' : (loaded ? 'paused' : 'stop');
+    const waitWord = (radio && playing && RADIO_ANN[MobileRadio.status]) || '';
+    const state = playing && !waitWord ? 'playing' : (loaded ? 'paused' : 'stop');
     playBtn.textContent = playing ? PAUSE_GLYPH : PLAY_GLYPH;
     np.dataset.state = state;
-    annState.textContent = state === 'playing' ? `${PLAY_GLYPH} PLAY` : state === 'paused' ? '❚❚ PAUSE' : '■ STOP';
+    annState.textContent = waitWord ? `\u25CC ${waitWord}`
+      : state === 'playing' ? `${PLAY_GLYPH} PLAY` : state === 'paused' ? '❚❚ PAUSE' : '■ STOP';
     if (radio) np.dataset.src = 'radio'; else delete np.dataset.src;
   }
 
@@ -169,9 +178,10 @@ export function mountNowPlaying(root, ctx) {
     artistEl.textContent = lines.sub;
     art.__artSrc = null;
     paintStationArt(art, { logo: (st && st.favicon) || '', cover: (now && now.cover) || '' });
-    // Live stream — no seekable position.
+    // Live stream — no seekable position.  "● LIVE" only while it is on the
+    // air (or paused there): tuning in / recovering shows no live signal.
     setScrub(0); scrub.disabled = true;
-    curEl.textContent = '● LIVE'; durEl.textContent = '';
+    curEl.textContent = _onAir() ? '● LIVE' : '--:--'; durEl.textContent = '';
     _showingStation = true;
     paintSource(null);
   }
@@ -394,14 +404,19 @@ export function mountNowPlaying(root, ctx) {
     paintState(playing);
   });
 
+  // The last position playback told (a gesture that ends without a seek, or
+  // a seek that can't happen yet, shows it again).
+  let _last = { current: 0, duration: 0, pct: 0 };
   Player.on('timeupdate', ({ current, duration, pct }) => {
     if (MobileRadio.active) return;
+    _last = { current, duration, pct };
     if (!_scrubbing) {
       setScrub(pct);
       curEl.textContent = fmtDur(current);
     }
     durEl.textContent = fmtDur(duration);
   });
+  Player.on('trackchange', () => { _last = { current: 0, duration: 0, pct: 0 }; });
 
   // Radio drives the view + play button while a station is the active source.
   MobileRadio.on('change', () => { renderTrack(Player.currentTrack); renderTunes(Player.currentTrack); });
@@ -411,18 +426,44 @@ export function mountNowPlaying(root, ctx) {
   // The station said another song, or the song's cover was found.
   MobileRadio.on('meta', () => { if (MobileRadio.active) renderStation(MobileRadio.station); });
 
-  // Scrubber: pointerdown locks, input previews, change commits
-  scrub.addEventListener('pointerdown', () => { _scrubbing = true; });
-  scrub.addEventListener('input', () => {
-    // Preview the time without committing
-    const pct = parseFloat(scrub.value);
-    setScrub(pct);                          // the fill / tape follow the finger
-    curEl.textContent = fmtDur((pct / 100) * (Player.currentTrack?.duration || 0));
-  });
-  scrub.addEventListener('change', () => {
-    Player.seek(parseFloat(scrub.value));
+  // Seeking.  A finger or a mouse anywhere on the slot (the groove and the
+  // waveform in it, #m-np-seek over the input): a tap seeks to that spot, a
+  // drag previews and seeks where it is lifted; a cancelled gesture seeks
+  // nowhere (seek_gesture.js).  The range input under it is the keyboard's
+  // and the screen reader's: input previews, change commits.
+  const _lenNow = () => _last.duration || Number(Player.currentTrack?.duration) || 0;
+  function previewAt(pct) {
+    setScrub(pct);                          // the fill / tape / waveform follow the finger
+    curEl.textContent = fmtDur((pct / 100) * _lenNow()) || '0:00';
+  }
+  // Back to what playback says (the clock follows it again).
+  function showPlayback() {
+    if (MobileRadio.active) return;
+    if (!Player.currentTrack) {                  // a cued track: its place (or nothing)
+      const c = Player.cuedTrack, dur = Number(c && c.duration) || 0, sec = c ? (Player.cuedSec || 0) : 0;
+      setScrub(dur > 0 ? (sec / dur) * 100 : 0);
+      curEl.textContent = fmtDur(sec) || '0:00';
+      return;
+    }
+    setScrub(_last.pct);
+    curEl.textContent = fmtDur(_last.current) || '0:00';
+  }
+  function seekTo(pct) {
     _scrubbing = false;
+    // Nothing to seek in yet (no length known, or only a cued track): the
+    // clock shows playback again instead of a place nothing went to.
+    if (!Player.currentTrack || !(_last.duration > 0)) { showPlayback(); return; }
+    previewAt(pct);
+    Player.seek(pct);
+  }
+  attachSeekGesture(seekEl, {
+    enabled: () => !scrub.disabled && !MobileRadio.active,
+    preview: (pct) => { _scrubbing = true; previewAt(pct); },
+    commit: seekTo,
+    cancel: () => { _scrubbing = false; showPlayback(); },
   });
+  scrub.addEventListener('input', () => { previewAt(parseFloat(scrub.value)); });
+  scrub.addEventListener('change', () => { seekTo(parseFloat(scrub.value)); });
 
   playBtn.addEventListener('click', async () => {
     if (MobileRadio.active) { MobileRadio.toggle(); return; }

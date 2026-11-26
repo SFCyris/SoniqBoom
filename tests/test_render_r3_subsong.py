@@ -469,7 +469,10 @@ async def test_client_sid_audio_upload_for_a_subsong_needs_the_tune(monkeypatch)
     assert e.value.status_code == 404                  # past the gate: no such track
 
 
-# ── a tune for two SID chips renders mono, as the stream promises ────────────
+# ── the mono SID render: every render not asked for stereo ──────────────────
+# (Since 2.3.0 a tune whose stored chip count is 2 or 3 is asked for stereo —
+# ``stream.sid_stereo``, tests/test_stereo_loops.py; asked for mono, a 2SID
+# tune still renders mono, as the stream promises.)
 
 def _two_sid_psid(path):
     import struct

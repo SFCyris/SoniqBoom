@@ -8,12 +8,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Forward all args (e.g. --port 9090) to run.sh
-ARGS=("$@")
+# Forward all args (e.g. --port 9090) to shutdown.sh and run.sh — as "$@":
+# macOS's bash 3.2 calls an empty "${ARRAY[@]}" an unbound variable under
+# ``set -u``, which made a bare ``bash restart.sh`` exit before doing anything.
 
 # ── Stop (if running) ───────────────────────────────────────────────────────
 # Forward args (e.g. --port) so shutdown targets the same port's listener.
-"$SCRIPT_DIR/shutdown.sh" "${ARGS[@]}" 2>/dev/null || true
+"$SCRIPT_DIR/shutdown.sh" "$@" 2>/dev/null || true
 
 # ``shutdown.sh`` already blocks until the port is genuinely free (it drains any
 # lingering SoniqBoom listener), so no fixed sleep is needed here — that sleep
@@ -22,4 +23,4 @@ ARGS=("$@")
 sleep 0.3
 
 # ── Start ────────────────────────────────────────────────────────────────────
-exec "$SCRIPT_DIR/run.sh" "${ARGS[@]}"
+exec "$SCRIPT_DIR/run.sh" "$@"

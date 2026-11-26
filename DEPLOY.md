@@ -169,8 +169,9 @@ Several players are compiled from source during the build — libopenmpt
 (Dreamcast DSF, Highly Theoretical), `milkyrender` (early DSIK `.dsm` modules, MilkyPlay),
 `mlrender` (Musicline Editor, musicline_playback), `mdxrender` (X68000 MDX, portable_mdx),
 `gt2reloc` (GoatTracker), `sunvoxrender` (SunVox, the SunVox Library), `furnace-headless`
-(FamiTracker and DefleMask, Furnace), `xmprender` (libxmp modules, libxmp), `sawteethrender`
-(Sawteeth, NostalgicPlayer's player ported to C), the Amiga
+(Furnace, FamiTracker and DefleMask, Furnace), `xmprender` (libxmp modules, libxmp), `sawteethrender`
+(Sawteeth, NostalgicPlayer's player ported to C), `midirender` (game MIDI and the OPL3 / OPN2 /
+MT-32 MIDI synths, libADLMIDI, libOPNMIDI and munt's libmt32emu), the Amiga
 `uade123`, the Atari-ST `sc68` and the bundled HivelyTracker and ST-Sound engines
 (`hvl2wav`, `ym2wav`) — and
 compiling them for a *different* CPU than your own (cross-building) can fail.
@@ -648,15 +649,18 @@ in for 15 minutes, even with the right password; `docker compose restart` ends t
   (Musicline Editor tunes uade renders as silence, built from musicline_playback),
   `mdxrender` (Sharp X68000 MDX songs, built from portable_mdx), `gt2reloc` (GoatTracker
   songs, built from GoatTracker 2.77), `sunvoxrender` (SunVox projects, built from the
-  SunVox Library 2.1.4d), `furnace-headless` (FamiTracker and DefleMask modules, built from Furnace
+  SunVox Library 2.1.4d), `furnace-headless` (Furnace, FamiTracker and DefleMask modules, built from Furnace
   0.6.8.3), `xmprender` (the modules only libxmp plays and the packed Amiga modules
   SoniqBoom converts, built from libxmp 4.7.4), `sawteethrender` (Sawteeth songs, compiled
-  from SoniqBoom's own source) and
+  from SoniqBoom's own source), `midirender` (game MIDI — XMI, DMX MUS, HMI — and MIDI on
+  OPL3 / OPN2 FM or an MT-32, built from libADLMIDI 1.6.2.1, libOPNMIDI 1.6.2 and munt 2.8.4;
+  no MT-32 ROMs are included — an administrator enters the folder holding their own under
+  gear → **Renderers → MIDI synths**) and
   `uade123` (Amiga AHX and the ~175 Amiga "exotica" players) compiled
   from source; the prebuilt zxtune123; and the bundled ST-Sound (`.ym`) and
   HivelyTracker (`.hvl`) engines.
   The image build stops if any of them is missing, if adplay, kssrender, dsfrender,
-  milkyrender, mlrender, mdxrender, xmprender or sawteethrender renders its short test tune as silence, or if gt2reloc
+  milkyrender, mlrender, mdxrender, xmprender, sawteethrender or midirender (on OPL3 and OPN2) renders its short test tune as silence, or if gt2reloc
   with sidplayfp, sunvoxrender or furnace-headless renders an example song of its own
   source as silence (unless built with
   `--build-arg ALLOW_MISSING_RENDERERS=1`). gear → **Renderers → Renderer Status** shows

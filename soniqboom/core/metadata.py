@@ -12,6 +12,7 @@ import base64
 import contextlib
 import contextvars
 import hashlib
+import io
 import json
 import logging
 import math
@@ -22,6 +23,7 @@ import subprocess
 import tempfile
 import time
 import unicodedata
+import zlib
 from pathlib import Path
 from typing import Callable
 
@@ -142,6 +144,11 @@ SUPPORTED_EXTENSIONS = {
     # A DefleMask module (.dmf, Furnace) — by content too: the suffix is also
     # X-Tracker's / DSMI's / Software Visions' (libopenmpt).
     ".dmf",
+    # A Furnace module (.fur, Furnace).
+    ".fur",
+    # (ZX Spectrum trackers, the AdLib formats AdPlug reads by its verdict and
+    # the game MIDI formats: added below with their tables — ``ZX_FORMATS``,
+    # ``_ADLIB_VERIFY_EXTS``, ``GAME_MIDI_EXTS``.)
 }
 
 FORMAT_NAMES = {
@@ -228,7 +235,9 @@ _DSD_EXTS = {".dsf", ".dff", ".wsd"}
 # RealSID tune (``RSID`` header) is often saved as ``.rsid``.
 SID_EXTS = frozenset({".sid", ".psid", ".rsid"})
 _SID_EXTS = SID_EXTS
-_MIDI_EXTS = {".mid", ".midi"}
+# (Standard MIDI files: also a karaoke ``.kar`` and a RIFF MIDI ``.rmi`` —
+# ``MIDI_VARIANT_FORMATS``)
+_MIDI_EXTS = {".mid", ".midi", ".kar", ".rmi"}
 _TRACKER_EXTS = {
     ".mod", ".s3m", ".xm", ".it", ".mtm", ".med", ".oct",
     ".669", ".dbm", ".ahx", ".hvl", ".ult", ".stm", ".far",
@@ -325,6 +334,101 @@ _ADLIB_EXTS = {
     ".hsc", ".rix", ".a2m", ".adl", ".bam", ".ksm", ".amd",
 }
 _ADLIB_DEFAULT_DURATION = 180   # seconds; the rendered WAV carries the real length
+# The rest of AdPlug's formats (its player list, AdPlug 2.4): listed only when
+# adplay reads the file (``adlib_header``'s "type"; none without adplay) — and,
+# for a suffix other files use too, when the type is one of that suffix's
+# players (``_ADLIB_TYPES``).
+_ADLIB_VERIFY_NAMES = {
+    ".wlf": "AdLib IMF", ".adlib": "AdLib IMF", ".a2t": "AdLib Tracker 2",
+    ".xms": "XMS-Tracker", ".dfm": "Digital-FM", ".hsp": "HSC AdLib",
+    ".mad": "Mlat AdLib Tracker", ".mdy": "AdLib MUS", ".mdi": "AdLib MIDIPlay",
+    ".mkj": "MKJamz", ".cff": "BoomTracker", ".dmo": "TwinTeam",
+    ".mtk": "MPU-401 Trakker", ".mtr": "Master Tracker", ".rac": "Raw AdLib",
+    ".raw": "Raw AdLib", ".sat": "Surprise! AdLib Tracker", ".sa2": "Surprise! AdLib Tracker",
+    ".xad": "XAD AdLib", ".bmf": "BMF AdLib Tracker", ".lds": "LOUDNESS",
+    ".plx": "PALLADIX", ".m": "Ultima 6 Music", ".xsm": "eXtra Simple Music",
+    ".pis": "Beni Tracker", ".msc": "AdLib MSC", ".mkf": "RIX OPL", ".jbm": "JBM AdLib",
+    ".got": "God of Thunder", ".sop": "Note Sequencer", ".hsq": "HERAD", ".sqx": "HERAD",
+    ".sdb": "HERAD", ".agd": "HERAD", ".ha2": "HERAD",
+}
+_ADLIB_VERIFY_EXTS = frozenset(_ADLIB_VERIFY_NAMES)
+_ADLIB_EXTS |= _ADLIB_VERIFY_EXTS
+SUPPORTED_EXTENSIONS |= _ADLIB_VERIFY_EXTS
+FORMAT_NAMES.update(_ADLIB_VERIFY_NAMES)
+# AdLib formats whose suffix another engine owns (uade: AMOS / UFO ``.mus``,
+# Images Music System ``.ims``, ZoundMonitor / Richard Joseph ``.sng``;
+# GoatTracker ``.sng``, C64 Sidplayer ``.mus``; libopenmpt: Digital Tracker
+# ``.dtm``; DMX MUS ``.mus`` — ``GAME_MIDI_FORMATS``): that engine decides
+# first, AdPlug when it refuses the file — the record's format then names
+# it, and the stream router sends it to adplay by that name.
+ADLIB_SHARED_FORMATS = {".mus": "AdLib MUS", ".ims": "AdLib IMS", ".sng": "AdLib SNG",
+                        ".dtm": "DeFy AdLib Tracker"}
+ADLIB_SHARED_FORMAT_NAMES = frozenset(ADLIB_SHARED_FORMATS.values())
+SUPPORTED_EXTENSIONS |= set(ADLIB_SHARED_FORMATS)
+# adplay's type (its "Type :" line) a file with one of these suffixes must
+# have to be listed: suffixes other files use too.
+_ADLIB_TYPES = {
+    ".m": ("Ultima 6 Music",), ".raw": ("Raw AdLib Capture",), ".rac": ("Raw AdLib Capture",),
+    ".msc": ("AdLib MSCplay",), ".sdb": ("HERAD System SDB",), ".agd": ("HERAD System AGD",),
+    ".bmf": ("xad: BMF",), ".mad": ("Mlat Adlib Tracker",), ".got": ("God of Thunder",),
+    ".cff": ("BoomTracker",), ".dmo": ("TwinTeam",), ".lds": ("LOUDNESS",),
+    ".mus": ("AdLib Visual Composer: MIDI Format",), ".mdy": ("AdLib Visual Composer: MIDI Format",),
+    ".ims": ("AdLib Visual Composer: IMPlay",),
+    ".sng": ("SNG File Format", "Faust Music Creator", "Adlib Tracker 1"),
+    ".dtm": ("DeFy Adlib Tracker",),
+}
+
+# ── ZX Spectrum trackers (zxtune123) ─────────────────────────────────────────
+# Suffix → (the format name the scan stores, the zxtune plugin ids — its
+# "Type" — a module under that suffix has).  zxtune123 tells the format by
+# content; the scan lists a file only when its verdict names one of the
+# suffix's types (``zx_verdict``).
+ZX_FORMATS = {
+    ".pt3": ("Pro Tracker 3", ("PT3", "TS")), ".pt2": ("Pro Tracker 2", ("PT2",)),
+    ".pt1": ("Pro Tracker 1", ("PT1",)), ".stc": ("Sound Tracker", ("STC",)),
+    ".st1": ("Sound Tracker", ("ST1",)), ".st3": ("Sound Tracker 3", ("ST3",)),
+    ".stp": ("Sound Tracker Pro", ("STP",)), ".asc": ("ASC Sound Master", ("ASC", "AS0")),
+    ".as0": ("ASC Sound Master", ("AS0",)), ".sqt": ("SQ-Tracker", ("SQT",)),
+    ".psc": ("Pro Sound Creator", ("PSC",)), ".psm": ("Pro Sound Maker", ("PSM",)),
+    ".gtr": ("Global Tracker", ("GTR",)), ".ftc": ("Fast Tracker (ZX)", ("FTC",)),
+    ".vtx": ("VTX (AY)", ("VTX",)), ".psg": ("PSG (AY)", ("PSG",)),
+    ".ayc": ("AYC (Amstrad CPC)", ("AYC",)), ".chi": ("Chip Tracker (ZX)", ("CHI",)),
+    ".str": ("Sample Tracker", ("STR",)), ".dst": ("Digital Studio", ("DST",)),
+    ".sqd": ("SQ Digital Tracker", ("SQD",)), ".dmm": ("Digital Music Maker", ("DMM",)),
+    ".et1": ("Extreme Tracker", ("ET1",)), ".pdt": ("ProDigi Tracker", ("PDT",)),
+    ".tf0": ("TFM Music Maker", ("TF0",)), ".tfe": ("TFM Music Maker", ("TFE",)),
+    ".tfc": ("TurboFM", ("TFC",)), ".tfd": ("TurboFM", ("TFD",)),
+    ".cop": ("E-Tracker (SAM Coupé)", ("COP",)),
+}
+ZX_EXTS = frozenset(ZX_FORMATS)
+ZX_FORMAT_NAMES = frozenset(n for n, _types in ZX_FORMATS.values())
+# Another engine's suffix too: uade (``.stp`` StarTrekker packer, ``.sqt``
+# Quartet PSG — where uade is installed), libopenmpt (``.psm`` MASI), a
+# Stereo Sidplayer song's second SID (``.str``) — that one decides first.
+ZX_SHARED_EXTS = frozenset({".stp", ".sqt", ".psm", ".str"})
+# Suffixes files of other kinds have (text, help indexes …): a module there
+# must start the file (zxtune finds none at an offset — no "Container").
+_ZX_STRICT = frozenset({".asc", ".chi", ".dst", ".pdt", ".psg", ".str", ".stp", ".sqt",
+                        ".psm"})
+SUPPORTED_EXTENSIONS |= ZX_EXTS
+FORMAT_NAMES.update({e: n for e, (n, _t) in ZX_FORMATS.items() if e not in ZX_SHARED_EXTS})
+
+# ── Game MIDI formats (midirender: libADLMIDI's sequencer) ───────────────────
+# Standard MIDI variants the MIDI synth setting plays (``midi_synth``: the
+# SoundFont, OPL3, OPN2 or MT-32) — a RIFF MIDI file and a karaoke ``.kar``
+# hold a Standard MIDI file — and the game formats only midirender reads
+# (``game_midi_synth``: OPL3, OPN2 or MT-32).  A DMX MUS (Doom) has uade's
+# and C64 Sidplayer's ``.mus``: told apart by its "MUS\x1a" header.
+MIDI_VARIANT_FORMATS = {".rmi": "RIFF MIDI", ".kar": "MIDI"}
+GAME_MIDI_FORMATS = {".xmi": "XMIDI", ".hmi": "HMI MIDI", ".hmp": "HMP MIDI",
+                     ".gmf": "GMF MIDI", ".klm": "KLM"}
+DMX_MUS_FORMAT = "DMX MUS"
+GAME_MIDI_EXTS = frozenset(GAME_MIDI_FORMATS)
+GAME_MIDI_FORMAT_NAMES = frozenset({*GAME_MIDI_FORMATS.values(), DMX_MUS_FORMAT})
+_GAME_MIDI_MAGIC = {".xmi": (b"FORM",), ".hmi": (b"HMI-MIDISONG",), ".hmp": (b"HMIMIDIP",),
+                    ".gmf": (b"GMF\x01",), ".rmi": (b"RIFF",)}
+SUPPORTED_EXTENSIONS |= GAME_MIDI_EXTS | set(MIDI_VARIANT_FORMATS)
+FORMAT_NAMES.update({**GAME_MIDI_FORMATS, **MIDI_VARIANT_FORMATS, ".fur": "Furnace"})
 
 # ── UADE — exotic Amiga formats (TFMX, Future Composer, SidMon, ...) ─────────
 # uade's own eagleplayer.conf is the source of truth for which name tokens it
@@ -2157,6 +2261,29 @@ def _vorbis(path: Path, track_id: str, audio, fmt: str) -> dict:
 _SID_MAX_BYTES = 1024 * 1024
 
 
+def _psid_sid_address_ok(b: int) -> bool:
+    """Is ``b`` a valid PSID v3/v4 second / third SID address byte ($Dxx0's
+    middle part): even, in $42–$7F or $E0–$FE (the PSID spec)."""
+    return b % 2 == 0 and (0x42 <= b <= 0x7F or 0xE0 <= b <= 0xFE)
+
+
+def psid_chip_count(header: bytes) -> int:
+    """SID chips a PSID / RSID tune plays (1..3), from its header: a valid
+    ``secondSIDAddress`` (offset 0x7A, v3+) adds the second chip, a valid
+    ``thirdSIDAddress`` (0x7B, v4+, another address) the third — the
+    addresses sidplayfp maps the chips at, so this is what it plays.  (The
+    flags' model bits for the extra chips mean nothing without an address.)
+    Pure."""
+    if len(header) < 0x7C or header[:4] not in (b"PSID", b"RSID"):
+        return 1
+    version = struct.unpack(">H", header[4:6])[0]
+    if version < 3 or not _psid_sid_address_ok(header[0x7A]):
+        return 1
+    if version >= 4 and _psid_sid_address_ok(header[0x7B]) and header[0x7B] != header[0x7A]:
+        return 3
+    return 2
+
+
 def _extract_sid(path: Path, track_id: str) -> dict:
     """Parse PSID/RSID binary header to extract SID metadata."""
     from soniqboom.config import settings
@@ -2200,15 +2327,10 @@ def _extract_sid(path: Path, track_id: str) -> dict:
         flags = struct.unpack(">H", header[0x76:0x78])[0]
         sid_bits = (flags >> 4) & 0x03
         sid_model = {0: None, 1: "6581", 2: "8580", 3: "6581/8580"}.get(sid_bits)
-        # Second SID flag bits 6-7
-        second_sid = (flags >> 6) & 0x03
-        if second_sid:
-            channels = 2
-        # Third SID flag bits 8-9 (PSID v3+/v4)
-        if version >= 3 and len(header) >= 124:
-            third_sid = (flags >> 8) & 0x03
-            if third_sid:
-                channels = 3
+        # The second / third SID chips: their addresses (PSID v3 / v4) — what
+        # sidplayfp plays, and what makes a stereo render (2.3.0; before, the
+        # extra chips' model bits counted, address or not).
+        channels = psid_chip_count(header)
 
     # Try to extract a 4-digit year from the copyright string
     year: int | None = None
@@ -2296,7 +2418,8 @@ def _extract_midi(path: Path, track_id: str) -> dict:
         }
 
     try:
-        mid = mido.MidiFile(str(path))
+        smf = riff_midi_data(_read_head(path, _RMI_MAX)) if path.suffix.lower() == ".rmi" else None
+        mid = mido.MidiFile(file=io.BytesIO(smf)) if smf else mido.MidiFile(str(path))
     except Exception as exc:
         log.warning("Failed to parse MIDI file %s: %s", path, exc)
         return {
@@ -2332,7 +2455,7 @@ def _extract_midi(path: Path, track_id: str) -> dict:
     return {
         "id": track_id,
         "path": str(path),
-        "format": "MIDI",
+        "format": MIDI_VARIANT_FORMATS.get(path.suffix.lower(), "MIDI"),
         "title": title or path.stem,
         "duration": duration,
         "genre": ["MIDI"],
@@ -2340,6 +2463,74 @@ def _extract_midi(path: Path, track_id: str) -> dict:
         "instruments": instruments if instruments else None,
         "patterns": len(mid.tracks),  # stored as midi_tracks via patterns field
     }
+
+
+_RMI_MAX = 16 * 1024 * 1024
+_MIDIRENDER_INFO_TIMEOUT_S = 20
+
+
+def riff_midi_data(raw: bytes) -> "bytes | None":
+    """The Standard MIDI file a RIFF MIDI file (``RIFF`` … ``RMID``) holds —
+    its ``data`` chunk; None when ``raw`` isn't one.  Pure."""
+    if len(raw) < 20 or raw[:4] != b"RIFF" or raw[8:12] != b"RMID":
+        return None
+    pos = 12
+    while pos + 8 <= len(raw):
+        cid, size = raw[pos:pos + 4], struct.unpack_from("<I", raw, pos + 4)[0]
+        if cid == b"data":
+            body = raw[pos + 8:pos + 8 + size]
+            return body if body[:4] == b"MThd" else None
+        pos += 8 + size + (size & 1)
+    return None
+
+
+def find_midirender() -> "str | None":
+    """midirender (soniqboom/native/midirender): ``renderers.midirender_path``
+    or on PATH."""
+    return _find_atari_binary("midirender_path", "midirender")
+
+
+def midirender_info(path: "Path | str", binary: "str | None" = None,
+                    timeout: float = _MIDIRENDER_INFO_TIMEOUT_S) -> "dict[str, str]":
+    """``midirender -i`` of the MIDI-family song ``path``: ``seconds`` (its
+    length), ``loop_start`` / ``loop_end``, ``songs``, ``title``,
+    ``copyright``; empty without midirender, for a file its sequencer can't
+    load, or after ``timeout``.  Blocking (a short subprocess)."""
+    binary = binary or find_midirender()
+    return _run_info([binary, "-i", str(path)], timeout) if binary else {}
+
+
+def is_dmx_mus(head: bytes) -> bool:
+    """Does ``head`` start a DMX MUS song (Doom and the games on its sound
+    library): "MUS" + 0x1A, a score inside the file?  Its ``.mus`` is uade's
+    UFO and the C64 Sidplayer's suffix too.  Pure."""
+    if len(head) < 16 or head[:4] != b"MUS\x1a":
+        return False
+    score_len, score_start = struct.unpack_from("<HH", head, 4)
+    return score_len > 0 and score_start >= 16
+
+
+def _extract_game_midi(path: Path, track_id: str, fmt: str,
+                       info: "dict[str, str] | None" = None) -> dict:
+    """A game MIDI song (XMI, DMX MUS, HMI / HMP, GMF, KLM) or a RIFF MIDI
+    file's metadata from midirender (``midirender_info``): its title, the
+    length it plays (0 without midirender — backfilled from a render), the
+    copyright as the comment.  (An XMI file can hold several songs: the
+    first is the one played.)"""
+    name = Path(str(path).split("::")[-1]).stem
+    if info is None:
+        info = midirender_info(path) if "::" not in str(path) else {}
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": fmt,
+        "title": _game_name(info.get("title") or "") or name,
+        "duration": round(_info_seconds(info), 2),
+        "genre": ["MIDI"],
+    }
+    if _game_name(info.get("copyright") or ""):
+        d["comment"] = _game_name(info["copyright"])
+    return d
 
 
 # ── libgme chiptune (NSF / SPC / GBS / VGM / AY / KSS / SAP / HES / GYM) ──
@@ -3345,6 +3536,16 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
             lib_duration = None
     if lib_duration is not None:
         duration = lib_duration
+    # A module with several subsongs: each is a tune of its own (tune 0 its
+    # first) — the count, each one's length, and the first one's as the
+    # track's length (``openmpt_vu.plan``: what a render of a tune plays).
+    tune_lens = None
+    if file_bytes is not None and _LIBOPENMPT_IN_PROCESS and lib_duration:
+        try:
+            from soniqboom.core import openmpt_vu
+            tune_lens = openmpt_vu.subsong_lengths(file_bytes)
+        except Exception:                                   # noqa: BLE001
+            tune_lens = None
     # (a plain ``.mod`` — not an Amiga prefix name, not packed — that
     # libopenmpt refuses: in a worker, no meta and no length from the loaded
     # library; in the server, openmpt123's "error loading".  No player here
@@ -3381,9 +3582,12 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
             # own threads (no libopenmpt in-process), the title and channel
             # count it reads, as a scan worker's ``module_meta`` would
             got_duration = False
+            cli_subsongs = 0
             for line in result.stdout.splitlines():
                 key, _sep, val = line.partition(":")
                 key = key.strip(". ").lower()
+                if key == "subsongs" and val.strip().isdigit():
+                    cli_subsongs = int(val.strip())
                 if by_openmpt and meta is None and _sep:
                     if key == "title" and not title and val.strip():
                         title = val.strip()
@@ -3405,6 +3609,8 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
                     if m:
                         duration = float(m.group(1))
                         got_duration = True
+            if cli_subsongs > 1 and tune_lens is None:
+                tune_lens = _openmpt_cli_tune_lengths(binary, path, cli_subsongs)
     except NotPlayableHere:
         raise
     except Exception:
@@ -3436,6 +3642,10 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         d["patterns"] = patterns
     if tracker_subsongs:
         d["subsongs"] = tracker_subsongs
+    elif tune_lens and len(tune_lens) > 1:
+        d["subsongs"] = len(tune_lens)
+        d["tune_lengths"] = tune_lens
+        d["duration"] = tune_lens[0]
     if ftm_artist and ftm_artist.isprintable():
         d["artist"] = ftm_artist
     if dsik_missing:
@@ -3447,6 +3657,29 @@ def _extract_tracker(path: Path, track_id: str) -> dict:
         # The scene MD5 ``extract`` would otherwise read the file again for.
         d["file_md5"] = hashlib.md5(file_bytes).hexdigest()
     return d
+
+
+def _openmpt_cli_tune_lengths(binary: str, path: Path, count: int) -> "list[float] | None":
+    """Each subsong's length (``openmpt123 --info --subsong N``, its
+    "mm:ss.mmm" Duration) of a module with ``count`` > 1 subsongs, at most
+    ``openmpt_vu.MAX_TUNES`` — the server's own threads, where libopenmpt
+    isn't loaded in-process (``openmpt_vu.subsong_lengths`` elsewhere).
+    None when one can't be read.  Blocking."""
+    from soniqboom.core.openmpt_vu import MAX_TUNES
+    out = []
+    for k in range(min(int(count), MAX_TUNES)):
+        try:
+            r = forksafe.run([binary, "--info", "--subsong", str(k), str(path)],
+                             capture_output=True, text=True, timeout=10)
+        except Exception:                                   # noqa: BLE001
+            return None
+        m = next((re.search(r"(?:(\d+):)?(\d+):(\d+)(?:\.(\d+))?", ln)
+                  for ln in (r.stdout or "").splitlines() if ln.lower().startswith("duration")), None)
+        if not m:
+            return None
+        out.append(((int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3))) * 1000
+                    + int((m.group(4) or "").ljust(3, "0")[:3])) / 1000)
+    return out
 
 
 # ── UADE (exotic Amiga) extraction ────────────────────────────────────────────
@@ -4286,6 +4519,133 @@ def _extract_zxtune(path: Path, track_id: str) -> dict:
     return d
 
 
+# ── ZX Spectrum trackers (zxtune123): the scan's verdict and metadata ────────
+
+_ZX_INFO_TIMEOUT_S = 10
+# zxtune123's null output plays the module through; its info (type, title,
+# author, length) is printed when it ends.  The length comes from the module
+# data, not the sound: chips clocked as low as zxtune accepts and an 8 kHz
+# output make the play-through ~10× cheaper, the length identical (measured
+# on 53 modules of 29 formats: the same "Time" to the hundredth).
+_ZX_INFO_ARGS = ("--quiet", "--null", "--frequency", "8000", "--core-options",
+                 "aym.clockrate=100000,saa.clockrate=100000,fm.clockrate=100000")
+
+
+def _zx_clock(text: str) -> float:
+    """Seconds of a zxtune123 time ("1:39.20", "1:02:03.04"); 0 when unreadable."""
+    secs = 0.0
+    try:
+        for part in text.strip().split(":"):
+            secs = secs * 60 + float(part)
+    except ValueError:
+        return 0.0
+    return secs if math.isfinite(secs) and secs > 0 else 0.0
+
+
+def parse_zxtune_info(text: str) -> dict:
+    """The first module of zxtune123's ``--null`` output ``text``:
+    ``{"type", "container", "program", "title", "author", "seconds",
+    "loop_seconds"}``; empty when it found none.  Pure."""
+    out: dict = {}
+    for line in text.splitlines():
+        if line.startswith("Playing:") and "type" in out:
+            break                       # (the next module of the file)
+        for field in line.split("\t"):
+            key, sep, val = field.partition(":")
+            if not sep:
+                continue
+            key, val = key.strip().lower(), val.strip()
+            if key in ("type", "container", "program", "title", "author") and key not in out:
+                out[key] = val
+            elif key == "time" and "seconds" not in out:
+                out["seconds"] = _zx_clock(val)
+            elif key == "loop duration" and "loop_seconds" not in out:
+                out["loop_seconds"] = _zx_clock(val)
+    return out if out.get("type") else {}
+
+
+def zxtune_info(path: "Path | str", binary: "str | None" = None,
+                timeout: float = _ZX_INFO_TIMEOUT_S) -> dict:
+    """``parse_zxtune_info`` of zxtune123 playing ``path`` to its null output
+    (``_ZX_INFO_ARGS``); empty without zxtune123, for a file it finds no
+    module in, or after ``timeout``.  Blocking (a short subprocess; zxtune
+    exits 0 whatever it found)."""
+    binary = binary or _find_atari_binary("zxtune123_path", "zxtune123")
+    if not binary:
+        return {}
+    try:
+        r = forksafe.run([binary, *_ZX_INFO_ARGS, "--file", str(path)],
+                         capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return parse_zxtune_info((r.stdout or b"").decode("utf-8", "replace"))
+
+
+def zx_verdict(ext: str, info: dict) -> bool:
+    """Does zxtune123's ``info`` (``zxtune_info``) make the file a module of
+    its suffix ``ext`` (``ZX_FORMATS``): a type of that suffix, a length, and
+    — for a suffix other files have too (``_ZX_STRICT``) — at the file's
+    start, not found inside it?  Pure."""
+    entry = ZX_FORMATS.get(ext)
+    if not entry or not info:
+        return False
+    if info.get("type") not in entry[1] or not info.get("seconds"):
+        return False
+    return not (ext in _ZX_STRICT and info.get("container"))
+
+
+def _zx_probe(path: Path, ext: str) -> "dict | None":
+    """zxtune123's info of ``path`` when its verdict makes it a module of its
+    suffix (``zx_verdict``); None otherwise or without zxtune123.
+    Blocking."""
+    info = zxtune_info(path)
+    return info if zx_verdict(ext, info) else None
+
+
+def _zx_scan(path: Path, ext: str) -> dict:
+    """The scan's verdict on a file with a ZX tracker suffix only zxtune
+    plays: its info (``_zx_probe``); without zxtune123, ``{}`` for a suffix
+    only these modules use (listed by its name — its play says zxtune123 is
+    missing) or ``NotPlayableHere`` for one other files have too
+    (``_ZX_STRICT``).  A file zxtune123 doesn't read as one is not listed:
+    ``ValueError`` (``NotPlayableHere`` for a strict suffix — most such
+    files are something else).  Blocking."""
+    fmt = ZX_FORMATS[ext][0]
+    if not _find_atari_binary("zxtune123_path", "zxtune123"):
+        if ext in _ZX_STRICT:
+            raise NotPlayableHere(f"a {ext} file is a {fmt} module only by its content, "
+                                  f"which zxtune123 (not installed here) reads: {path.name}")
+        return {}
+    info = _zx_probe(path, ext)
+    if info is not None:
+        return info
+    if ext in _ZX_STRICT:
+        raise NotPlayableHere(f"not a {fmt} module zxtune123 reads: {path.name}")
+    raise ValueError(f"not a {fmt} module zxtune123 reads: {path.name}")
+
+
+def _extract_zx(path: Path, track_id: str, info: dict) -> dict:
+    """ZX Spectrum tracker module metadata from zxtune123 (``zxtune_info``):
+    title (the file name when it names none), author, the length it plays (0
+    without zxtune123 — backfilled from a render) and the program it was made
+    with as the comment."""
+    ext = path.suffix.lower()
+    name = Path(str(path).split("::")[-1]).stem
+    d: dict = {
+        "id": track_id,
+        "path": str(path),
+        "format": ZX_FORMATS[ext][0],
+        "title": _game_name(info.get("title") or "") or name,
+        "duration": round(float(info.get("seconds") or 0.0), 2),
+        "genre": ["Chiptune"],
+    }
+    if _game_name(info.get("author") or ""):
+        d["artist"] = _game_name(info["author"])
+    if info.get("program"):
+        d["comment"] = info["program"]
+    return d
+
+
 # ── Sharp X68000 MDX (mdxrender) ──────────────────────────────────────────────
 
 MDX_LOOPS = 2                      # loops an MDX song plays before MXDRV fades it out
@@ -4415,6 +4775,7 @@ def _extract_mdx(path: Path, track_id: str) -> dict:
 GOATTRACKER_FORMAT = "GoatTracker"
 FAMITRACKER_FORMAT = "FamiTracker"
 DEFLEMASK_FORMAT = "DefleMask"
+FURNACE_FORMAT = "Furnace"
 _SUNVOX_EXTS = {".sunvox"}
 _MGS_EXTS = {".mgs"}
 _GOAT_IDENTS = (b"GTS!", b"GTS2", b"GTS3", b"GTS4", b"GTS5")
@@ -4754,8 +5115,9 @@ def _extract_goattracker(path: Path, track_id: str) -> dict:
     """GoatTracker 2 song metadata from its header (``goattracker_header``):
     the title (the file name when unset), the author, the copyright text as
     the comment and a year in it; the length is the SID duration setting
-    (the song loops — a render plays that long).  The first subtune is the
-    one played."""
+    (the song loops — a render plays that long, every subtune).  A song
+    with several subtunes lists each as a tune of its own (``subsongs``; a
+    bare play plays the first)."""
     name = Path(str(path).split("::")[-1]).stem
     head = goattracker_header(_read_head(path, 128)) or {}
     d = {
@@ -4766,6 +5128,8 @@ def _extract_goattracker(path: Path, track_id: str) -> dict:
         "duration": float(_one_tune_cap()),
         "genre": ["Chiptune", "C64"],
     }
+    if int(head.get("tunes") or 1) > 1:
+        d["subsongs"] = int(head["tunes"])
     if head.get("author"):
         d["artist"] = head["author"]
     if head.get("copyright"):
@@ -4782,8 +5146,9 @@ def _extract_famitracker(path: Path, track_id: str) -> dict:
     """FamiTracker module metadata from its INFO block
     (``famitracker_header``): title (the file name when unset), author,
     copyright as the comment and a year in it.  The length is 0 until the
-    first play (Furnace's render is the length — backfilled); the first
-    track is the one played."""
+    first play (Furnace's render is the length — backfilled).  A module with
+    several tracks (songs) lists each as a tune of its own (``subsongs``; a
+    bare play plays the first)."""
     name = Path(str(path).split("::")[-1]).stem
     head = famitracker_header(_read_head(path, _FAMI_HEAD_MAX)) or {}
     d = {
@@ -4794,6 +5159,8 @@ def _extract_famitracker(path: Path, track_id: str) -> dict:
         "duration": 0.0,
         "genre": ["Chiptune"],
     }
+    if int(head.get("tracks") or 1) > 1:
+        d["subsongs"] = int(head["tracks"])
     if head.get("author"):
         d["artist"] = head["author"]
     if head.get("copyright"):
@@ -4822,6 +5189,72 @@ def _extract_deflemask(path: Path, track_id: str) -> dict:
         d["artist"] = head["author"]
     if head.get("system"):
         d["comment"] = head["system"]
+    return d
+
+
+_FUR_MAGIC = b"-Furnace module-"
+_FUR_HEAD_MAX = 64 * 1024          # the (inflated) head read for the INFO block
+
+
+def _furnace_plain(raw: bytes) -> bytes:
+    """The start of a Furnace module, inflated (Furnace saves them zlib
+    compressed; an uncompressed one as is) — at most ``_FUR_HEAD_MAX`` bytes;
+    b"" when ``raw`` is neither.  Pure."""
+    if raw[:16] == _FUR_MAGIC:
+        return raw[:_FUR_HEAD_MAX]
+    if len(raw) < 2 or raw[0] & 0x0F != 8 or (raw[0] << 8 | raw[1]) % 31:
+        return b""
+    try:
+        return zlib.decompressobj().decompress(raw, _FUR_HEAD_MAX)
+    except zlib.error:
+        return b""
+
+
+def is_furnace_module(head: bytes) -> bool:
+    """Does ``head`` (the file's first bytes) start a Furnace module
+    ("-Furnace module-", zlib compressed or not)?  Pure."""
+    return _furnace_plain(head)[:16] == _FUR_MAGIC
+
+
+def furnace_header(raw: bytes) -> "dict | None":
+    """``{"version", "title", "author"}`` of the Furnace module ``raw`` (its
+    head): the format version, and the song name and author of its INFO
+    block (the block every version Furnace 0.6 writes; a newer block leaves
+    them empty); None when ``raw`` isn't one.  Pure."""
+    d = _furnace_plain(raw)
+    if d[:16] != _FUR_MAGIC or len(d) < 32:
+        return None
+    version, _res, info_at = struct.unpack_from("<HHI", d, 16)
+    out = {"version": version, "title": "", "author": ""}
+    if d[info_at:info_at + 4] != b"INFO":
+        return out
+    q = info_at + 256           # (after the 24 bytes of timing / counts and 4 × 32 chip bytes)
+    end = d.find(b"\0", q)
+    end2 = d.find(b"\0", end + 1) if end != -1 else -1
+    if end2 == -1:
+        return out
+    out["title"] = _game_name(d[q:end].decode("utf-8", "replace"))
+    out["author"] = _game_name(d[end + 1:end2].decode("utf-8", "replace"))
+    return out
+
+
+def _extract_furnace(path: Path, track_id: str) -> dict:
+    """Furnace module metadata from its INFO block (``furnace_header``): the
+    song name (the file name when unset) and author.  The length is 0 until
+    the first play (Furnace's render is the length — backfilled); its first
+    song is the one played."""
+    name = Path(str(path).split("::")[-1]).stem
+    head = furnace_header(_read_head(path, 512 * 1024)) or {}
+    d = {
+        "id": track_id,
+        "path": str(path),
+        "format": FURNACE_FORMAT,
+        "title": head.get("title") or name,
+        "duration": 0.0,
+        "genre": ["Chiptune"],
+    }
+    if head.get("author"):
+        d["artist"] = head["author"]
     return d
 
 
@@ -5478,30 +5911,42 @@ def write_lyrics(path: Path, lyrics: str) -> bool:
     return False                                 # format not in the write-supported set
 
 
-def _extract_adlib(path: Path, track_id: str) -> dict:
+def _extract_adlib(path: Path, track_id: str, head: "dict | None" = None,
+                   fmt: "str | None" = None) -> dict:
     """Minimal metadata for an AdLib / OPL2 FM tune (id IMF, ROL, CMF, …).
 
     AdPlug renders these at play time; we don't bind libadplug at scan time, so
     the title is the filename and the duration is a sensible default — the
-    rendered WAV carries the real length once the track is played.
+    rendered WAV carries the real length once the track is played.  ``head``:
+    the file's ``adlib_header`` when the caller read it already; ``fmt``: the
+    format name (an AdLib format whose suffix another engine owns —
+    ``ADLIB_SHARED_FORMATS``).
     """
     ext = path.suffix.lower()
-    head = adlib_header(path) if "::" not in str(path) else {}
+    if head is None:
+        head = adlib_header(path) if "::" not in str(path) else {}
+    title = head.get("title") or ""
+    if fmt == "AdLib IMS" and not title.isascii():
+        # (IMPlay is Korean: its song names are Johab — adplay printed the bytes)
+        try:
+            title = title.encode("latin-1").decode("johab")
+        except (UnicodeError, LookupError):
+            title = ""
     return {
         "id": track_id, "path": str(path),
-        "format": FORMAT_NAMES.get(ext, "AdLib"),
-        "title": head.get("title") or path.stem, "artist": head.get("author") or "",
+        "format": fmt or FORMAT_NAMES.get(ext, "AdLib"),
+        "title": title or path.stem, "artist": head.get("author") or "",
         "album": "", "album_artist": "",
         "duration": float(_ADLIB_DEFAULT_DURATION),
     }
 
 
 def adlib_header(path: Path) -> dict:
-    """``{"title", "author"}`` AdPlug reads in the AdLib tune ``path`` (the
-    "Title :" / "Author:" lines adplay prints — it reads them from the
-    formats that hold them: A2M, RAD, D00, …); empty without adplay or when it
-    names none.  adplay with its null output (no rendering — about 10 ms);
-    blocking."""
+    """``{"title", "author", "type"}`` AdPlug reads in the AdLib tune ``path``
+    (the "Title :" / "Author:" lines adplay prints — it reads them from the
+    formats that hold them: A2M, RAD, D00, … — and "Type  :", the player that
+    loaded it: none for a file AdPlug doesn't read); empty without adplay.
+    adplay with its null output (no rendering — about 10 ms); blocking."""
     binary = _find_atari_binary("adplay_path", "adplay")
     if not binary:
         return {}
@@ -5516,9 +5961,75 @@ def adlib_header(path: Path) -> dict:
             "latin-1", "replace").splitlines():
         key, sep, val = line.partition(":")
         key, val = key.strip().lower(), " ".join(val.split())
-        if sep and key in ("title", "author") and _game_name(val) and key not in out:
+        if sep and key in ("title", "author", "type") and _game_name(val) and key not in out:
             out[key] = val
     return out
+
+
+def adlib_verdict(ext: str, head: dict) -> bool:
+    """Does adplay's ``head`` (``adlib_header``) make the file an AdLib tune
+    of its suffix: a player loaded it, and — for a suffix other files have
+    too (``_ADLIB_TYPES``) — one of that suffix's?  Pure."""
+    kind = (head or {}).get("type") or ""
+    if not kind:
+        return False
+    want = _ADLIB_TYPES.get(ext)
+    return not want or kind.startswith(want)
+
+
+def _adlib_scan(path: Path, ext: str) -> dict:
+    """The scan's verdict on a file of an AdLib format AdPlug reads by its
+    verdict (``_ADLIB_VERIFY_EXTS``): its ``adlib_header`` when adplay reads
+    it as one (``adlib_verdict``), else ``NotPlayableHere`` (also without
+    adplay — the suffix alone says too little).  Blocking."""
+    head = adlib_header(path)
+    if not adlib_verdict(ext, head):
+        raise NotPlayableHere(f"not an AdLib tune AdPlug reads (or adplay isn't installed "
+                              f"here): {path.name}")
+    return head
+
+
+def _other_engine(path: Path, ext: str) -> "tuple[str, dict] | None":
+    """The engine that plays ``path`` when its suffix's usual engine doesn't
+    (or isn't here): ``("zx", zxtune123's info)`` for a ZX Spectrum module
+    (``ZX_SHARED_EXTS``: ``_zx_probe``), ``("adlib", adplay's header)`` for
+    an AdLib tune (``ADLIB_SHARED_FORMATS``: ``adlib_verdict``); None.
+    Blocking."""
+    if ext in ZX_SHARED_EXTS:
+        info = _zx_probe(path, ext)
+        if info is not None:
+            return "zx", info
+    if ext in ADLIB_SHARED_FORMATS:
+        head = adlib_header(path)
+        if adlib_verdict(ext, head):
+            return "adlib", head
+    return None
+
+
+def _game_midi_scan(path: Path, ext: str) -> dict:
+    """The scan's check of a game MIDI song / RIFF MIDI file: its header
+    (``_GAME_MIDI_MAGIC``; a KLM file has none — midirender must load it),
+    then ``{"info": midirender's}`` (empty without midirender).  A file whose
+    header isn't one is not listed (``ValueError``).  Blocking."""
+    fmt = GAME_MIDI_FORMATS.get(ext) or MIDI_VARIANT_FORMATS.get(ext, "MIDI")
+    head = _read_head(path, 16)
+    magic = _GAME_MIDI_MAGIC.get(ext)
+    if magic and not head.startswith(magic):
+        raise ValueError(f"not a {fmt} file: {path.name}")
+    if ext == ".xmi" and head[8:12] != b"XDIR":         # (what libADLMIDI reads)
+        raise ValueError(f"not a {fmt} file: {path.name}")
+    if ext == ".rmi":
+        if riff_midi_data(_read_head(path, _RMI_MAX)) is None:
+            raise ValueError(f"not a {fmt} file: {path.name}")
+        return {}
+    info = midirender_info(path) if "::" not in str(path) else {}
+    if not info and ext != ".klm" and find_midirender():
+        raise ValueError(f"a {fmt} file midirender can't load: {path.name}")
+    if ext == ".klm" and not info:
+        raise NotPlayableHere(f"a {ext} file is a KLM song only by its content, which "
+                              f"midirender (not installed here, or it didn't load it) "
+                              f"reads: {path.name}")
+    return {"info": info}
 
 
 def _extract_imf(path: Path, track_id: str) -> dict:
@@ -5656,7 +6167,12 @@ def _extract(
                 raise ValueError(f"a Face The Music module saved without its samples "
                                  f"(libopenmpt doesn't load one): {path.name}")
     # ``.sng``: a GoatTracker 2 song by its "GTS" header (gt2reloc), else
-    # uade's (Amiga ZoundMonitor / Richard Joseph) — where uade is installed.
+    # uade's (Amiga ZoundMonitor / Richard Joseph) — where uade is installed —
+    # else AdPlug's (``_other_engine``: an AdLib SNG it reads).
+    # ``_alt``: a file another engine plays than its suffix's usual one, by
+    # content — (kind, its info): "zx" (zxtune123), "adlib" (AdPlug) or
+    # "gmidi" (a game MIDI song: midirender).
+    _alt: "tuple[str, dict] | None" = None
     _goat = False
     if ext == ".sng":
         try:
@@ -5665,8 +6181,10 @@ def _extract(
         except OSError:
             _goat = False
         if not _goat and ext not in _UADE_SUFFIX_EXTS and _uade.classify(path.name) is None:
-            raise NotPlayableHere(f"not a GoatTracker song (and no Amiga player here reads "
-                                  f".sng files): {path.name}")
+            _alt = _other_engine(path, ext)
+            if _alt is None:
+                raise NotPlayableHere(f"not a GoatTracker song (and no Amiga or AdLib player "
+                                      f"here reads this .sng file): {path.name}")
     elif path.name.lower().startswith("sng."):
         # A GoatTracker song saved under an Amiga prefix name (``sng.NAME``)
         # is no uade module (a ZoundMonitor / Richard Joseph name): say so
@@ -5681,6 +6199,8 @@ def _extract(
                              f"{path.name[4:]}.sng to play it: {path.name}")
     # A SunVox project / an MGSDRV song is one by its header, else not indexed
     # (before the permissive try below, which would list junk as a stub).
+    if ext == ".fur" and not is_furnace_module(_read_head(path, 4096)):
+        raise ValueError(f"not a Furnace module: {path.name}")
     if ext in _SUNVOX_EXTS or ext in _MGS_EXTS:
         try:
             with open(path, "rb") as _fh:
@@ -5723,9 +6243,16 @@ def _extract(
         _pw = prowizard_module(path)
         if _pw is None:
             raise NotPlayableHere(f"not a packed module this server converts: {path.name}")
-    elif ext in _OPENMPT_OPENS_ONLY and ext in OPENMPT_EXTRA_EXTS and not _openmpt_opens(path):
-        raise NotPlayableHere(f"not a {FORMAT_NAMES.get(ext, 'tracker')} module libopenmpt "
-                              f"reads: {path.name}")
+    elif ext in _OPENMPT_OPENS_ONLY and (ext not in OPENMPT_EXTRA_EXTS
+                                         or not _openmpt_opens(path)):
+        # (a ZX Spectrum Pro Sound Maker ``.psm`` / a DeFy AdLib Tracker
+        # ``.dtm``: zxtune123's / AdPlug's — ``_other_engine``)
+        _alt = _other_engine(path, ext)
+        if _alt is None and ext in OPENMPT_EXTRA_EXTS:
+            raise NotPlayableHere(f"not a {FORMAT_NAMES.get(ext, 'tracker')} module libopenmpt "
+                                  f"reads: {path.name}")
+        if _alt is None:
+            raise NotPlayableHere(f"not a module any player here reads: {path.name}")
     if ext in _IFF_SAMPLE_EXTS:
         _iff = _read_head(path, 12)
         if _iff[:4] != b"FORM" or _iff[8:12] not in (b"8SVX", b"16SV"):
@@ -5749,9 +6276,13 @@ def _extract(
         _mus = _read_head(path, 64 * 1024 + 8)
         if is_c64_sidplayer(_mus):
             _c64mus_raw = _mus
+        elif is_dmx_mus(_mus):
+            _alt = ("gmidi", {"format": DMX_MUS_FORMAT})     # (Doom's: midirender)
         elif ext not in _UADE_SUFFIX_EXTS:
-            raise NotPlayableHere(f"not a C64 Sidplayer song (and no Amiga player here reads "
-                                  f".mus files): {path.name}")
+            _alt = _other_engine(path, ext)
+            if _alt is None:
+                raise NotPlayableHere(f"not a C64 Sidplayer, DMX or AdLib MUS song (and no "
+                                      f"Amiga player here reads .mus files): {path.name}")
     _kefrens = ext == ".ksm" and is_kefrens_module(_read_head(path, 16))
     if _kefrens and not _uade.player_map():
         raise NotPlayableHere(f"a Kefrens Sound Machine module (uade plays it; it isn't "
@@ -5791,8 +6322,27 @@ def _extract(
         else:
             _uade_cls = None
     _is_uade = ext in _UADE_SUFFIX_EXTS or _uade_cls is not None or _kefrens
+    if _alt is not None:
+        pass
+    elif ext in GAME_MIDI_EXTS or ext == ".rmi":
+        _alt = ("gmidi", _game_midi_scan(path, ext))
+    elif ext in _ADLIB_VERIFY_EXTS:
+        _alt = ("adlib", _adlib_scan(path, ext))
+    elif ext in ZX_EXTS and ext not in ZX_SHARED_EXTS:
+        _alt = ("zx", _zx_scan(path, ext))
+    elif ext == ".str":
+        if is_c64_sidplayer(_read_head(path, 64 * 1024 + 8)):
+            raise NotPlayableHere(f"the second SID of a Stereo Sidplayer song (it plays with "
+                                  f"the .mus of the same name): {path.name}")
+        _alt = ("zx", _zx_scan(path, ext))
+    elif ((ext in ZX_SHARED_EXTS or ext in ADLIB_SHARED_FORMATS) and not _is_uade
+          and not (_goat or _c64mus_raw is not None) and ext not in _OPENMPT_OPENS_ONLY):
+        # (uade isn't here to have its say: zxtune123's / AdPlug's)
+        _alt = _other_engine(path, ext)
+        if _alt is None:
+            raise NotPlayableHere(f"not a module or tune any player here reads: {path.name}")
     if (_goat or _fami or _defle or _c64mus_raw is not None or _xmp_inf is not None
-            or _pw is not None or _saw_inf is not None):
+            or _pw is not None or _saw_inf is not None or _alt is not None):
         _is_uade = False                # (its own engine — never probed with uade)
         _uade_cls = None
     if _is_uade and _read_head(path, len(FRED_EDITOR_MAGIC)) == FRED_EDITOR_MAGIC:
@@ -5843,7 +6393,12 @@ def _extract(
             raise ValueError(
                 f"not an Amiga module (text or empty content): {path.name}")
         _uade_probe = uade_get_info(path) if not (_texty or not _head) else {"_ok": False}
-        if not _uade_probe.get("_ok") and _owned_prefix:
+        if (not _uade_probe.get("_ok") and not _owned_prefix
+                and (ext in ZX_SHARED_EXTS or ext in ADLIB_SHARED_FORMATS)):
+            _alt = _other_engine(path, ext)     # (uade refused it: zxtune123's / AdPlug's?)
+        if _alt is not None:
+            _uade_probe = None
+        elif not _uade_probe.get("_ok") and _owned_prefix:
             if ext == ".st":            # (no Sawteeth song either: not listed)
                 raise NotPlayableHere(f"neither a Sawteeth song nor an Amiga module uade "
                                       f"plays: {path.name}")
@@ -5899,12 +6454,24 @@ def _extract(
             _uade_probe = {"_ok": False}   # classify-only metadata below
 
     try:
-        if _goat:
+        if _alt is not None and _alt[0] == "zx":
+            d = _extract_zx(path, track_id, _alt[1])
+        elif _alt is not None and _alt[0] == "adlib":
+            d = _extract_adlib(path, track_id, head=_alt[1], fmt=ADLIB_SHARED_FORMATS.get(ext))
+        elif _alt is not None and ext in _MIDI_EXTS:
+            d = _extract_midi(path, track_id)            # (a RIFF MIDI file)
+        elif _alt is not None:
+            d = _extract_game_midi(path, track_id,
+                                   _alt[1].get("format") or GAME_MIDI_FORMATS[ext],
+                                   _alt[1].get("info"))
+        elif _goat:
             d = _extract_goattracker(path, track_id)
         elif _fami:
             d = _extract_famitracker(path, track_id)
         elif _defle:
             d = _extract_deflemask(path, track_id)
+        elif ext == ".fur":
+            d = _extract_furnace(path, track_id)
         elif _saw_inf is not None:
             d = _extract_sawteeth(path, track_id, _saw_inf)
         elif _pw is not None:

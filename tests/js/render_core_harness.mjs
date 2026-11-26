@@ -51,6 +51,9 @@ const FACTORY = new Function('env', `
   function _resetSidPartial() { _sidPartial = false; _provisional = false; }
   let _failToastFor = null, _failToastSeq = -1;       // queue-core state the report shares
   function _nextHint() { return ''; }
+  // (render-status may carry a measured loudness: player.js _takeLoudness —
+  // the levelling itself is tested in its own file)
+  function _takeLoudness(t, j) { if (j && j.loudness) env.loudness = j.loudness; }
   ${extractCore()}
   return {
     // Put the player in the state playTrack leaves it in for track t.

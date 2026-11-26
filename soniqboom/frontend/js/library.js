@@ -13,6 +13,9 @@ import { listTuneCount, tunesBadge } from './tunes.js';
 import { healthBadge, canReport, mark as healthMark, isUnplayable } from './health.js';
 import { onUiStyleChange } from './ui_style.js';
 import { FolderTree } from './foldertree.js';
+import { genreRows, genreToggleText, readShowAllGenres, saveShowAllGenres } from './genre_list.js';
+import { rootLabel, rootKind, rootOf, folderLabel } from './mobile/folders.js';
+import { foldersCrumb, folderParent, folderTrail, rootBlockedText } from './folders_view.js';
 import { askCoverWhenUseful, knownNoCover, noteCoverShown, noteCoverGone } from './cover_status.js';
 
 // A failed request rejects — an error body (``{detail: …}``) must never pass for
@@ -119,6 +122,13 @@ function _scheduleBackgroundRefresh(path) {
 // resetting the whole tree to root on every scan completion.
 let _currentBrowsePath = null;
 let _currentBrowseRecursive = false;
+let _currentFolderOpts = null;    // showFolder's { back, label } (the Folders view's crumbs)
+// The Folders view (showFolders): the music folders as last read, and the Play
+// all / Shuffle of the level of subfolders on screen ({ gen, src }).
+let _fvRoots = null;
+let _fvRootsAt = 0;
+let _folderPlay = null;
+let _folderPlayBusy = false;
 
 function isInFolderView() { return _currentBrowsePath != null; }
 
@@ -349,6 +359,12 @@ const groupFilterBar    = document.getElementById('group-filter-bar');
 const sceneTabsEl       = document.getElementById('scene-tabs');
 const groupFilterLabel  = document.getElementById('group-filter-label');
 const groupFilterInput  = document.getElementById('group-filter-input');
+// The panel over a list (the composer page, the compo winners, On this day,
+// a search's composers — "The panel over a list" further down).
+const scenePanel        = document.getElementById('scene-panel');
+let _scenePanelKeepNext = false;   // (the next renderTracks keeps it)
+let _scenePanelReopen = null;      // (how the view with it opens again)
+let _scenePanelClick = null;       // (the view's click handler, one listener)
 
 // The Scene view's lists (showScene, further down) — read by _applyCounts and
 // renderGroupList too.
@@ -358,6 +374,10 @@ const _FACETS = {
   platform:    { url: 'platforms',    count: 'platforms',    title: 'Platform',    label: 'Platforms' },
   party:       { url: 'parties',      count: 'parties',      title: 'Party',       label: 'Parties' },
   scene_group: { url: 'scene-groups', count: 'scene_groups', title: 'Scene group', label: 'Scene groups', tab: 'Groups' },
+  // the sound chips (``chip:``) and the Discover list (compo winners, on this
+  // day, parties coming up, preset searches) — a key always shown
+  chip:        { url: 'chips',        count: 'chips',        title: 'Chip',        label: 'Chips' },
+  discover:    { url: 'discover',     count: null,           title: 'Discover',    label: 'Discover', always: true },
 };
 const _SCENE_TAB_KEY = 'sb_scene_tab';
 let _sceneCounts = {};       // the lists' sizes from the last counts reply
@@ -733,6 +753,8 @@ const COMPO_COL_KEY = 'sb_compo_col';
 let _compoHas = false;        // the list on screen (loaded whole) has a party's track
 let _compoGrouped = false;    // the list on screen is a party's, grouped by compo
 let _compoGroupNext = false;  // (set by showFacetTracks for the renderTracks it calls)
+let _platformGrouped = false;   // the list on screen is a composer's, grouped by platform
+let _platformGroupNext = false; // (set by showComposer for the renderTracks it calls)
 function _compoPref() {
   try { return localStorage.getItem(COMPO_COL_KEY) || 'auto'; } catch (_) { return 'auto'; }
 }
@@ -805,7 +827,8 @@ function _fmtClass(fmt) {
   if (f.includes('OGG') || f.includes('VORBIS') || f === 'OPUS') return 'ogg';
   if (f === 'AAC' || f === 'M4A') return 'aac';
   if (f === 'SID' || f === 'PSID') return 'sid';
-  if (f === 'MIDI' || f === 'MID') return 'midi';
+  if (f === 'MIDI' || f === 'MID' || f === 'RIFF MIDI' || f === 'XMIDI' || f === 'DMX MUS'
+      || f === 'HMI MIDI' || f === 'HMP MIDI' || f === 'GMF MIDI' || f === 'KLM') return 'midi';
   // Tracker formats
   if (['MOD','S3M','XM','IT','MTM','MED','OCT','669','AHX','HVL'].includes(f))
     return 'tracker';
@@ -1328,6 +1351,7 @@ function _fillTrackRow(tr, t, i) {
     cpTd.textContent = cp || (!unscan && t.scene_party ? '—' : '');
   }
   tr.classList.toggle('compo-group-first', !!t._compoGroupFirst && _compoGrouped);
+  tr.classList.toggle('platform-group-first', !!t._platformFirst && _platformGrouped);
 
   // col-track / col-year
   cells[7].textContent = trackStr;
@@ -1635,7 +1659,7 @@ function _installSearch(ctx, list, { keepScroll = false } = {}) {
   } else {
     restoreFullHeader({ keepHeader: true });
   }
-  setBrowseHeader(_searchHeadText(ctx.q, ctx.total), () => showAll(), ctx.total > 0);
+  setBrowseHeader(_searchHeadText(ctx.q, ctx.total), () => leaveSearch(), ctx.total > 0);
   renderTracks(list, { keepScroll });
   _putSearchCtx(ctx);
   _paintBestMatchBtn(ctx);
@@ -1643,6 +1667,75 @@ function _installSearch(ctx, list, { keepScroll = false } = {}) {
   _paintShuffleAllTitle();
   _setViewReload(`search\0${ctx.q}`, () => _refreshSearchInPlace(), { keepsPlace: true });
   _updateAzRail();
+}
+
+// ── Leaving a search ──────────────────────────────────────────────────────────
+// The search's Back, and the search box emptied or cleared (search.js), go back
+// to the view the search was started from — its list read again and scrolled
+// to where it was — never to All Tracks unless that is where it started.  With
+// no search results on screen (and none loading) an emptied box changes
+// nothing.  ``_viewReturnPoint`` names the view on screen: one that records its
+// reload (the group lists, drills, Folders), a folder, All Tracks, a sidebar
+// entry (a smart view, Galaxy, Duplicates), else the list as it is.
+let _preSearch = null;        // { open, top }: where the search started
+let _searchSeq = 0;           // bumped by every search and by leaving one
+let _searchPending = null;    // { mine, prev, gen }: a search's first page is loading (still the view entry: gen)
+const _searchLoading = () => !!(_searchPending && _searchPending.gen === _browseNavGen);
+function _viewReturnPoint() {
+  const wrap = document.getElementById('track-list-wrap');
+  const top = wrap ? wrap.scrollTop : 0;
+  if (_viewReload && !String(_viewReload.key).startsWith('search\0')) return { open: _viewReload.fn, top };
+  if (_currentBrowsePath != null) {
+    const p = _currentBrowsePath, rec = _currentBrowseRecursive, o = _currentFolderOpts;
+    return { open: () => showFolder(p, rec, o || {}), top };
+  }
+  if (_viewIsAllTracks) return { open: () => showAll(), top };
+  // A sidebar entry's own view (a root view: no Back) opens again from its entry;
+  // anything else (a "Go to …" pivot, a snapshot put back) as the list it is.
+  const li = document.querySelector('#nav-library li.active, #nav-smart li.active');
+  if (li && (browseHdr.hidden || browseBack.hidden)) return { open: () => li.click(), top };
+  if (Array.isArray(currentTracks)) return { open: _snapshotCurrentView(), top };
+  if (li) return { open: () => li.click(), top };
+  return null;
+}
+// The search's flags put back on the view it started from, still on screen (its
+// first page failed, or the search was left while it loaded); a Folders level's
+// Play all is that view's again.
+function _restorePreSearchFlags(prev) {
+  _viewIsAllTracks = prev.all;
+  _currentBrowsePath = prev.path;
+  _viewReload = prev.reload;
+  if (_folderPlay && _folderPlay.gen === prev.gen) _folderPlay.gen = _browseNavGen;
+}
+async function leaveSearch() {
+  const loading = _searchLoading();
+  if (!_searchCtx && !loading) return false;       // no search on screen: stay put
+  _searchSeq++;                                    // a first page still loading lands nowhere
+  const pending = _searchPending;
+  _searchPending = null;
+  const back = _preSearch;
+  _preSearch = null;
+  if (!_searchCtx && loading) {
+    // The view the search started from is still on screen: its flags come back.
+    _restorePreSearchFlags(pending.prev);
+    return true;
+  }
+  if (!back) return true;                          // (nothing known to go back to: stay put)
+  try { await back.open(); } catch (_) { return true; }
+  // Scrolled back to where it was — once the view is drawn, and only while it is
+  // still the one on screen (a newer view wins).
+  const wrap = document.getElementById('track-list-wrap');
+  if (wrap && back.top && !_searchCtx) {
+    const g = _browseNavGen;
+    let tries = 0;
+    const put = () => {
+      if (_browseNavGen !== g || _searchCtx) return;
+      if (_viewLoading() && tries++ < 120) { requestAnimationFrame(put); return; }
+      wrap.scrollTop = back.top;
+    };
+    requestAnimationFrame(put);
+  }
+  return true;
 }
 
 // Open the full results of a search (search.js, on Enter).  A view entry: the
@@ -1653,7 +1746,13 @@ function _installSearch(ctx, list, { keepScroll = false } = {}) {
 async function showSearch(q) {
   // (what the list on screen is — put back if this search's first page fails)
   const prev = { all: _viewIsAllTracks, path: _currentBrowsePath, reload: _viewReload, ctx: _searchCtx };
+  // The view the search starts from — not another search — is where its Back
+  // and an emptied search box return to (leaveSearch).
+  if (!_searchCtx && !_searchLoading()) _preSearch = _viewReturnPoint();
+  const mine = ++_searchSeq;
+  prev.gen = _browseNavGen;
   const gen = ++_browseNavGen;
+  _searchPending = { mine, prev, gen };
   _viewIsAllTracks = false;
   _currentBrowsePath = null;
   _viewReload = null;
@@ -1661,19 +1760,20 @@ async function showSearch(q) {
   try {
     head = await _searchPage(q, null, 0, CHUNK_SIZE, null, null);
   } catch (err) {
-    if (gen !== _browseNavGen) return 'superseded';
+    if (_searchPending && _searchPending.mine === mine) _searchPending = null;
+    if (gen !== _browseNavGen || mine !== _searchSeq) return 'superseded';
     // The list on screen stays the view: its flags, its reload and — a search —
     // its token come back, so it still refreshes and re-reads itself.
-    _viewIsAllTracks = prev.all;
-    _currentBrowsePath = prev.path;
-    _viewReload = prev.reload;
+    _restorePreSearchFlags(prev);
     if (prev.ctx && prev.ctx === _searchCtx) prev.ctx.gen = _browseNavGen;
     throw err;
   }
-  if (gen !== _browseNavGen) return 'superseded';
+  if (_searchPending && _searchPending.mine === mine) _searchPending = null;
+  if (gen !== _browseNavGen || mine !== _searchSeq) return 'superseded';
   const ctx = { q, rs: head.rs, total: head.total || 0, sort: null, order: null, client: null,
                 ranked: head.ranked !== false, artistFirst: head.artist_first === true };
   _installSearch(ctx, ctx.total ? _newSearchStore(ctx, head) : []);
+  _paintSearchComposers(q, ctx);
   return 'ok';
 }
 
@@ -1770,6 +1870,7 @@ function _sortSearchInBrowser(key, asc) {
   const list = currentTracks;
   const rows = Array.isArray(list) ? list : list.loadedSliceFrom(0, list.length);
   const nctx = { ...ctx, client: { key, asc } };
+  _scenePanelKeepNext = !!(scenePanel && !scenePanel.hidden);   // (the composers it names)
   renderTracks(_sortRows(rows, key, asc));
   _putSearchCtx(nctx);
   _paintBestMatchBtn(nctx);
@@ -1974,6 +2075,12 @@ function _currentListPlace() {
 async function renderTracks(tracks, { keepScroll = false } = {}) {
   _compoGrouped = _compoGroupNext;     // (a party's list: rows grouped by compo)
   _compoGroupNext = false;
+  _platformGrouped = _platformGroupNext;   // (a composer's list: rows grouped by platform)
+  _platformGroupNext = false;
+  // The panel over the list stays for the view that asked for it (and an
+  // in-place refresh of it); any other list goes without.
+  if (!(_scenePanelKeepNext || (keepScroll && scenePanel && !scenePanel.hidden))) _hideScenePanel();
+  _scenePanelKeepNext = false;
   keepScroll = keepScroll && _trackVL.active && tracks.length > 0;
   const place = keepScroll ? _currentListPlace() : null;
   _leaveGalaxy();          // switching to a table view exits the galaxy
@@ -3196,7 +3303,12 @@ function _onSortHeaderClick(th) {
   // Small-library path: client-side sort over the full in-memory array.
   const keepSrc = _viewQueueSource;
   const sorted = _sortRows(currentTracks, sortKey, sortAsc);
+  // (the same list sorted: the panel over it stays — a composer's page, the
+  // compo winners' keys — and opens again as it was)
+  const panelReopen = scenePanel && !scenePanel.hidden ? _scenePanelReopen : undefined;
+  _scenePanelKeepNext = panelReopen !== undefined;
   renderTracks(sorted);
+  if (panelReopen !== undefined) _scenePanelReopen = panelReopen;
   _viewIsAllTracks = wasAllTracks;
   // A capped list sorted in the browser no longer matches the server's page
   // order, so sequential extension is off — shuffle still covers the whole set.
@@ -3247,6 +3359,8 @@ function setGroupHeader(label) {
   // with this view's own label + count once the data lands.
   if (groupFilterBar) { groupFilterBar.hidden = true; if (groupFilterInput) groupFilterInput.value = ''; }
   _sceneTab = null;            // (showFacet sets it again for a Scene list)
+  if (_genreToggleBtn) _genreToggleBtn.hidden = true;   // (showGenres shows it again)
+  _hideScenePanel();           // (a group list has no panel over it)
   if (!trackTableHead) return;
   // Same two cells as the group rows below (_makeGroupRow): the label sits right
   // above the names and the count column has a fixed width, instead of one
@@ -3294,6 +3408,7 @@ function restoreFullHeader({ keepHeader = false } = {}) {
   // clearing it here (before that) is safe.
   _viewIsAllTracks = false;
   _viewReload = null;          // (see reloadCurrentView)
+  if (!keepHeader) _hideScenePanel();     // (a view that wants it shows it again)
   if (keepHeader && trackTableHead && trackTableHead.querySelector('th[data-sort]')) return;
   _rebuildTrackHeader();
   _restoreSortState();  // restore sortKey/sortAsc STATE + aria baseline (no paint)
@@ -3681,6 +3796,9 @@ async function showArtists() {
   renderGroupList(artists, 'artist', 'count', 'Tracks', (item) => {
     if (item.label || !item.artist) {
       showUntaggedTracks('artist', '[No Artist]', () => showArtists(), item.count);
+    } else if (item.composer) {
+      // (a scene musician — every spelling of his name in one row: his page)
+      showComposer(item.composer, () => showArtists());
     } else {
       showAlbums(item.artist, null, 'artist');
     }
@@ -3933,6 +4051,9 @@ async function showAlbumArtistTracks(albumArtist, backFn) {
 // restore from an array copy + the header state; the windowed All-Tracks (or an
 // unknown state) falls back to showAll().
 function _snapshotCurrentView() {
+  // (a view with a panel over its list — a composer's page, the compo
+  // winners, "On this day" — opens again as it was)
+  if (_scenePanelReopen && scenePanel && !scenePanel.hidden) return _scenePanelReopen;
   if (Array.isArray(currentTracks)) {
     const snap = currentTracks.slice();
     const snapSrc = _viewQueueSource;
@@ -3982,10 +4103,72 @@ async function showGenres() {
   const genres = await _viewData(_gen, API('/library/genres'), () => showGenres());
   if (!genres || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
   _updateNavBadge('genres', _navCount(genres));
-  renderGroupList(genres, 'genre', 'count', 'Tracks', (item) => ((item.label || !item.genre)
+  // Genres of one track (a game's or group's name in the tag, mostly) are left
+  // out unless the filter bar's key shows them all (genre_list.js).
+  const open = (item) => ((item.label || !item.genre)
     ? showUntaggedTracks('genre', '[No Genre]', () => showGenres(), item.count)
-    : showGenreTracks(item.genre, item.count)));
+    : showGenreTracks(item.genre, item.count));
+  const shown = genreRows(genres, readShowAllGenres());
+  renderGroupList(shown.rows, 'genre', 'count', 'Tracks', open);
+  _paintGenreToggle(genres, shown, open);
   _setViewReload('genres', () => showGenres());
+}
+
+// The Genres view's "Show all N genres" / "Hide N one-track genres" key, in the
+// group filter bar after its count.  Flipping it lists the other set in place:
+// the filter text and the scroll position stay.
+let _genreToggleBtn = null;
+function _paintGenreToggle(all, shown, open) {
+  if (!groupFilterBar) return;
+  if (!_genreToggleBtn) {
+    _genreToggleBtn = document.createElement('button');
+    _genreToggleBtn.type = 'button';
+    _genreToggleBtn.id = 'genre-all-toggle';
+    _genreToggleBtn.className = 'group-filter-toggle';
+    const label = document.getElementById('group-filter-label');
+    if (label && label.parentNode === groupFilterBar) label.after(_genreToggleBtn);
+    else groupFilterBar.appendChild(_genreToggleBtn);
+  }
+  const btn = _genreToggleBtn;
+  const on = readShowAllGenres();
+  const t = genreToggleText(shown, on);
+  btn.hidden = !t;
+  if (!t) return;
+  if (!shown.rows.length) {
+    // Every genre names one track: the bar (and its key) stays, with a word
+    // on why the list is empty (renderGroupList hides the bar of an empty list).
+    groupFilterBar.hidden = false;
+    if (groupFilterLabel) groupFilterLabel.textContent = '0 Genres';
+    _setViewEmpty('No genre has two tracks or more',
+      `${shown.single.toLocaleString()} genre${shown.single === 1 ? '' : 's'} of one track ${shown.single === 1 ? 'is' : 'are'} hidden — “Show all” lists them.`);
+  }
+  btn.textContent = t.text;
+  btn.title = t.title;
+  btn.setAttribute('aria-pressed', String(on));
+  btn.onclick = () => {
+    if (_groupNameKey !== 'genre' || _groupItems === null) return;
+    const next = !readShowAllGenres();
+    saveShowAllGenres(next);
+    const again = genreRows(all, next);
+    if (!again.rows.length) {            // (nothing of two tracks or more: the empty list)
+      renderGroupList(again.rows, 'genre', 'count', 'Tracks', open);
+      _paintGenreToggle(all, again, open);
+      return;
+    }
+    if (!_groupItems.length) {           // (from the empty list: drawn anew)
+      renderGroupList(again.rows, 'genre', 'count', 'Tracks', open);
+      _paintGenreToggle(all, again, open);
+      return;
+    }
+    _groupItems = again.rows;
+    emptyEl.hidden = true;
+    if (groupFilterLabel) groupFilterLabel.textContent = `${again.rows.length.toLocaleString()} Genres`;
+    _paintGenreToggle(all, again, open);
+    // (the filter runs again over the new set — same text: same scroll position)
+    browseFilter.value = groupFilterInput ? groupFilterInput.value : browseFilter.value;
+    browseFilter.dispatchEvent(new Event('input'));
+    _updateAzRail();
+  };
 }
 
 // Drill-down fetch ceiling — the /search/filter endpoint's `le` bound.  The
@@ -4061,7 +4244,7 @@ function showScene(facet) {
     // (before the first counts reply — a reload's restore — the saved list
     // is taken as it is; an empty one still shows the keys to the others)
     const known = Object.keys(_sceneCounts).length > 0;
-    facet = (saved && _FACETS[saved] && (has(saved) || !known)) ? saved
+    facet = (saved && _FACETS[saved] && (has(saved) || !known || _FACETS[saved].always)) ? saved
       : (Object.keys(_FACETS).find(has) || 'composer');
   }
   return showFacet(facet);
@@ -4077,11 +4260,15 @@ async function showFacet(facet) {
   try { localStorage.setItem(_SCENE_TAB_KEY, facet); } catch (_) { /* private mode */ }
   _hideGridToggle();
   _showSkeletonRows(12);
-  const rows = await _viewData(_gen, API(`/library/${f.url}`), () => showFacet(facet));
+  const q = facet === 'discover' ? { date: _localDay() } : {};
+  const rows = await _viewData(_gen, API(`/library/${f.url}`, q), () => showFacet(facet));
   if (!rows || _gen !== _browseNavGen) return;   // failed (said so), or superseded by a newer view while fetching
-  _sceneCounts[f.count] = rows.length;
-  renderGroupList(rows, facet, 'count', 'Tracks',
-                  (item) => showFacetTracks(facet, item[facet], item.count));
+  if (f.count) _sceneCounts[f.count] = rows.length;
+  const open = facet === 'composer' ? (item) => showComposer(item.composer, () => showFacet('composer'))
+    : facet === 'chip' ? (item) => _showChipTracks(item.key, item.chip)
+    : facet === 'discover' ? (item) => _openDiscover(item)
+    : (item) => showFacetTracks(facet, item[facet], item.count);
+  renderGroupList(rows, facet, 'count', 'Tracks', open);
   _setViewReload(`scene\0${facet}`, () => showFacet(facet));
 }
 // (kept: callers of the Scene groups list before it joined the Scene view)
@@ -4147,8 +4334,8 @@ function _paintSceneTabs() {
   const focused = sceneTabsEl.contains(document.activeElement) ? document.activeElement.dataset.facet : null;
   sceneTabsEl.textContent = '';
   for (const [facet, f] of Object.entries(_FACETS)) {
-    const n = _sceneCounts[f.count];
-    if (facet !== _sceneTab && !(n > 0)) continue;
+    const n = f.count ? _sceneCounts[f.count] : undefined;
+    if (facet !== _sceneTab && !(n > 0) && !f.always) continue;
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'scene-tab';
@@ -4187,6 +4374,427 @@ if (sceneTabsEl) {
   });
 }
 
+// ── The panel over a list, the composer page and scene discovery ──────────
+// #scene-panel sits over the track list of the views that have one: a
+// musician's page (showComposer), the compo winners' filters (_showWinners),
+// "On this day" (_showOnThisDay) and the composers a search names
+// (_paintSearchComposers).  A view sets _scenePanelKeepNext right before its
+// renderTracks; every other view entry hides it (setGroupHeader,
+// restoreFullHeader, hideBrowseHeader, renderGroupList via setGroupHeader,
+// renderTracks, Galaxy, Stations).  _scenePanelReopen: how the view opens
+// again (a "Go to …" Back — _snapshotCurrentView).
+function _hideScenePanel() {
+  if (!scenePanel) return;
+  if (!scenePanel.hidden) scenePanel.hidden = true;
+  if (scenePanel.firstChild) scenePanel.textContent = '';
+  scenePanel.className = 'scene-panel';
+  _scenePanelReopen = null;
+  _scenePanelClick = null;
+}
+function _showScenePanel(html, kind, reopen, onClick = null) {
+  if (!scenePanel) return;
+  scenePanel.innerHTML = html;
+  scenePanel.className = `scene-panel scene-panel-${kind}`;
+  scenePanel.hidden = false;
+  _scenePanelReopen = reopen || null;
+  _scenePanelClick = onClick;
+}
+scenePanel?.addEventListener('click', (e) => { if (_scenePanelClick) _scenePanelClick(e); });
+// The listener's own day, "MM-DD" (On this day follows the browser's date).
+function _localDay(d = new Date()) {
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+const _safeUrl = (u) => (/^https?:\/\//i.test(String(u == null ? '' : u)) ? String(u) : '');
+const _linkChip = (u, label, title = '') => {
+  const su = _safeUrl(u);
+  return su ? `<a class="scp-link" href="${esc(su)}" target="_blank" rel="noopener"${title ? ` title="${esc(title)}"` : ''}>${esc(label)}</a>` : '';
+};
+const _yearSpan = (a, b) => (a && b ? (a === b ? String(a) : `${a}–${b}`) : '');
+
+// [composer-groups:begin] — tests/js/composer_page.test.mjs runs this region as is
+// The rows of a composer's page, in the server's platform order
+// (/search/filter?order=platform): the first row of each platform starts its
+// group (``_platformFirst``); ``only``: one platform's rows.
+function composerRows(tracks, formatPlatform, only = null) {
+  const out = [];
+  let prev = null;
+  for (const t of tracks) {
+    const p = (formatPlatform && formatPlatform[t.format]) || 'Other formats';
+    if (only && p !== only) continue;
+    t._platformFirst = p !== prev;
+    prev = p;
+    out.push(t);
+  }
+  return out;
+}
+// A placing as the results list shows it: "1st", "=2nd", "3rd–4th" — the
+// ranking Demozoo gives (a number, a tie, a range), else as written.
+function placeText(rank) {
+  const r = String(rank == null ? '' : rank).trim();
+  const ord = (n) => {
+    const v = n % 100;
+    return n + ((v >= 11 && v <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'));
+  };
+  let m = r.match(/^(=?)(\d+)$/);
+  if (m) return m[1] + ord(Number(m[2]));
+  m = r.match(/^(\d+)\s*-\s*(\d+)$/);
+  if (m) return `${ord(Number(m[1]))}–${ord(Number(m[2]))}`;
+  return r;
+}
+// [composer-groups:end]
+
+// One musician's page: who he is (Demozoo: real name, handles, groups, the
+// profile's notes and photo — the Track Info Scene tab's sources), his party
+// results, the links out, and every tune of his in the library grouped by
+// platform (keys over the list narrow it to one), with Play all / Shuffle.
+async function showComposer(name, backFn = null, only = null) {
+  if (!name) return;
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  const back = typeof backFn === 'function' ? backFn : () => showScene('composer');
+  setBrowseHeader(`Composer: ${name}`, back);
+  _showSkeletonRows();
+  const again = () => showComposer(name, backFn, only);
+  const [page, tracks] = await Promise.all([
+    _viewData(_gen, API('/artist/composer', { name }), again),
+    _viewData(_gen, API('/search/filter', { composer: name, order: 'platform', limit: _DRILL_LIMIT }), again),
+  ]);
+  if (!page || !tracks || _gen !== _browseNavGen) return;   // failed (said so), or superseded
+  if (!page.found) {
+    setBrowseHeader(`Composer: ${name}`, back, false);
+    renderTracks([]);
+    _setViewEmpty('No scene tunes credit this name', 'The composer page lists the musicians of retro and scene tunes.');
+    return;
+  }
+  const shown = page.name;
+  setBrowseHeader(`Composer: ${shown}`, back);
+  const view = { page, tracks, only: null };
+  // (the platform key pressed is part of the view: a refresh, a search's Back
+  // and the panel reopen it with that key)
+  const known = (page.platforms || []).some((x) => x.platform === only);
+  if (only && known) view.only = only;
+  const reopen = () => showComposer(shown, back, view.only);
+  view.reload = () => _setViewReload(`composer\0${shown}\0${view.only || ''}`, reopen);
+  _paintComposerPanel(view, reopen);
+  _renderComposerList(view);
+  view.reload();
+  _loadComposerProfile(page, _gen);
+}
+
+function _renderComposerList(view) {
+  const { page, tracks, only } = view;
+  const rows = composerRows(tracks, page.format_platform, only);
+  _platformGroupNext = true;
+  _scenePanelKeepNext = true;
+  renderTracks(rows);
+  if (only) {
+    _viewQueueSource = null;               // (the platform's rows: the list itself)
+    if (tracks.length < page.count) {
+      try {
+        browseCrumb.textContent += ` \u2014 ${only} among the first ${tracks.length.toLocaleString()} of ${page.count.toLocaleString()}`;
+        browseCrumb.title = browseCrumb.textContent;
+      } catch (_) { /* no crumb */ }
+    }
+  } else {
+    _setCappedSource(tracks.length, _DRILL_LIMIT, page.count, { composer: page.name },
+                     { url: '/api/search/filter', params: { composer: page.name, order: 'platform' } },
+                     `Composer: ${page.name}`);
+    _noteDrillCap(tracks.length, page.count);
+  }
+  _paintShuffleAllTitle();
+}
+
+function _paintComposerPanel(view, reopen) {
+  const p = view.page;
+  const sub = [];
+  if (p.real_name && p.real_name.toLowerCase() !== p.name.toLowerCase()) sub.push(esc(p.real_name));
+  if (p.location) sub.push(esc(p.location));
+  const lines = [];
+  const handles = (p.handles || []).filter((h) => h && h !== p.name && h !== p.real_name);
+  if (handles.length) lines.push(`<div class="scp-line"><span class="scp-k">Handles</span>${esc(handles.slice(0, 8).join(', '))}</div>`);
+  if ((p.aliases || []).length) lines.push(`<div class="scp-line"><span class="scp-k">Also credited as</span>${esc(p.aliases.slice(0, 8).join(', '))}</div>`);
+  if ((p.groups || []).length) lines.push(`<div class="scp-line"><span class="scp-k">Groups</span>${esc(p.groups.slice(0, 8).join(', '))}</div>`);
+  const links = (p.links || []).slice(0, 12).map((l) => _linkChip(l.url, l.label, l.title || '')).filter(Boolean).join('');
+  const total = (p.platforms || []).reduce((n, x) => n + x.count, 0);
+  const keys = [`<button type="button" class="scene-tab" data-plat="" aria-pressed="${view.only ? 'false' : 'true'}">All<span class="scene-tab-count">${total.toLocaleString()}</span></button>`]
+    .concat((p.platforms || []).map((x) => {
+      const yrs = _yearSpan(x.year_min, x.year_max);
+      const fm = (x.formats || []).slice(0, 4).join(', ');
+      return `<button type="button" class="scene-tab" data-plat="${esc(x.platform)}" aria-pressed="${view.only === x.platform ? 'true' : 'false'}"`
+        + ` title="${esc(fm)}${yrs ? ` · ${esc(yrs)}` : ''}">${esc(x.platform)}`
+        + `<span class="scene-tab-count">${x.count.toLocaleString()}${yrs ? ` · ${esc(yrs)}` : ''}</span></button>`;
+    }));
+  let results = '';
+  if ((p.results || []).length) {
+    const items = p.results.map((r) => {
+      const where = [r.competition, r.party].filter(Boolean).map(esc).join(' · ');
+      const title = _safeUrl(r.url) ? `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}</a>` : esc(r.title);
+      return `<li><span class="scp-place">${esc(placeText(r.rank)) || '—'}</span>${title}<span class="scp-where">${where}${r.year ? ` · ${esc(r.year)}` : ''}</span></li>`;
+    }).join('');
+    const more = p.results_total > p.results.length ? ` (the newest ${p.results.length})` : '';
+    results = `<details class="scp-results"><summary>Party results · ${p.results_total.toLocaleString()}${more}</summary><ol>${items}</ol></details>`;
+  }
+  const html = `<div class="scp-top">`
+    + `<div class="scp-photo" hidden><img alt="" decoding="async"></div>`
+    + `<div class="scp-id"><h2 class="scp-name">${esc(p.name)}</h2>`
+    + (sub.length ? `<div class="scp-sub">${sub.join(' · ')}</div>` : '')
+    + lines.join('')
+    + (links ? `<div class="scp-links">${links}</div>` : '')
+    + `</div>`
+    + `<div class="scp-count"><b>${p.count.toLocaleString()}</b> ${p.count === 1 ? 'tune' : 'tunes'}`
+    + (p.scene < p.count ? `<span>${p.scene.toLocaleString()} scene · ${(p.count - p.scene).toLocaleString()} other</span>` : '')
+    + `</div></div>`
+    + `<p class="scp-notes" hidden></p>`
+    + results
+    + `<div class="scp-keys" role="group" aria-label="Platforms">${keys.join('')}</div>`;
+  _showScenePanel(html, 'composer', reopen, (e) => {
+    const b = e.target.closest('.scp-keys button[data-plat]');
+    if (!b) return;
+    view.only = b.dataset.plat || null;
+    for (const k of scenePanel.querySelectorAll('.scp-keys button')) k.setAttribute('aria-pressed', k === b ? 'true' : 'false');
+    _renderComposerList(view);
+    if (view.reload) view.reload();      // (renderTracks cleared it: this key's view)
+  });
+}
+
+// The profile's notes and photo — Track Info's own (GET /api/artist/info:
+// Demozoo-first for scene music), painted when they come, if the page is
+// still the one on screen.
+async function _loadComposerProfile(page, gen) {
+  // (only for a musician Demozoo knows — the card must be his own profile,
+  // never a namesake's article a name lookup would find)
+  if (page.releaser_id == null) return;
+  let info = null;
+  try { info = await API('/artist/info', { name: page.name, retro: 1 }); } catch (_) { return; }
+  // (still this page: the panel a composer's, of this name — the nav token
+  // moved with its own renderTracks)
+  if (!scenePanel || scenePanel.hidden || !scenePanel.classList.contains('scene-panel-composer')) return;
+  const name = scenePanel.querySelector('.scp-name');
+  if (!name || name.textContent !== page.name) return;
+  if (!info || info.source !== 'Demozoo' || !String(info.url || '').endsWith(`/sceners/${page.releaser_id}/`)) return;
+  if (info && info.found && info.local_bio && info.bio) {
+    const notes = scenePanel.querySelector('.scp-notes');
+    if (notes) { notes.textContent = info.bio; notes.hidden = false; }
+  }
+  const src = info && info.found ? _safeUrl(info.image) : '';
+  if (src) {
+    const wrap = scenePanel.querySelector('.scp-photo');
+    const img = wrap && wrap.querySelector('img');
+    if (img) {
+      img.addEventListener('load', () => { wrap.hidden = false; }, { once: true });
+      img.addEventListener('error', () => { wrap.hidden = true; }, { once: true });
+      img.src = src;
+    }
+  }
+}
+
+// Track Info's "Composer page" (and any other view's) — the page, Back
+// returning to the view on screen.
+document.addEventListener('sb:open-composer', (e) => {
+  const n = String(e.detail?.name || '').trim();
+  if (!n) return;
+  // (from over the Stations view: the library takes the pane back first)
+  const st = document.getElementById('stations-view');
+  if (st && !st.hidden) window.Stations?.hide?.();
+  // Back reopens the view on screen as a view (a group list — Artists, a
+  // Folders level — has no track rows a snapshot could hold) at its scroll.
+  showComposer(n, _backToReturnPoint(_viewReturnPoint()));
+});
+
+// A Back handler from a _viewReturnPoint(): open that view, then scroll it back
+// once drawn, while it is still the one on screen.  null → the default Back.
+function _backToReturnPoint(rp) {
+  if (!rp) return null;
+  return async () => {
+    await rp.open();
+    const wrap = document.getElementById('track-list-wrap');
+    if (!wrap || !rp.top) return;
+    const g = _browseNavGen;
+    let tries = 0;
+    const put = () => {
+      if (_browseNavGen !== g) return;
+      if (_viewLoading() && tries++ < 120) { requestAnimationFrame(put); return; }
+      wrap.scrollTop = rp.top;
+    };
+    requestAnimationFrame(put);
+  };
+}
+
+// A search's free text naming scene musicians (any spelling, handle or real
+// name — GET /api/artist/composers): their pages, over the results.
+async function _paintSearchComposers(q, ctx) {
+  const text = String(q || '').replace(/(^|\s)-?\w+:("[^"]*"|\S+)/g, ' ').replace(/"/g, ' ').trim();
+  if (text.length < 2) return;
+  const gen = _browseNavGen;     // (Galaxy / Stations leave _searchCtx set: the nav token says)
+  let found = null;
+  try { found = await API('/artist/composers', { q: text, limit: 6 }); } catch (_) { return; }
+  if (!Array.isArray(found) || !found.length || _searchCtx !== ctx || gen !== _browseNavGen) return;
+  const chips = found.map((c) => `<button type="button" class="scene-tab scp-composer" data-name="${esc(c.name)}"`
+    + ` title="${esc(c.real_name || c.name)}">${esc(c.name)}`
+    + (c.also ? ` <span class="scp-also">(${esc(c.also)})</span>` : '')
+    + `<span class="scene-tab-count">${c.count.toLocaleString()}</span></button>`).join('');
+  _showScenePanel(`<div class="scp-row"><span class="scp-k">Composers</span>${chips}</div>`, 'search', null, (e) => {
+    const b = e.target.closest('button[data-name]');
+    if (b) showComposer(b.dataset.name, _snapshotCurrentView());
+  });
+}
+
+// ── Discover ──
+function _openDiscover(item) {
+  if (!item) return;
+  if (item.kind === 'winners') return _showWinners({ placeMax: item.place_max || 1 });
+  if (item.kind === 'on-this-day') return _showOnThisDay(item.date || _localDay());
+  if (item.kind === 'upcoming') return _showUpcoming(item.weeks || 6);
+  if (item.kind === 'search' && item.q) {
+    document.dispatchEvent(new CustomEvent('sb:search-for', { detail: { q: item.q } }));
+    return;
+  }
+  if (item.kind === 'needs-index') window.Toast?.info?.('Refresh the Demozoo index in Settings → Metadata to add the party dates.');
+}
+
+// A chip's tunes (the chip: search operator) — the Chips list's rows.
+async function _showChipTracks(key, label) {
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  setBrowseHeader(`Chip: ${label}`, () => showFacet('chip'));
+  _showSkeletonRows();
+  const q = `chip:${key}`;
+  const tracks = await _viewData(_gen, API('/search/filter', { q, limit: _DRILL_LIMIT }), () => _showChipTracks(key, label));
+  if (!tracks || _gen !== _browseNavGen) return;
+  renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, 0, { q }, { url: '/api/search/filter', params: { q } }, `Chip: ${label}`);
+  _noteDrillCap(tracks.length, 0);
+  _setViewReload(`chip\0${key}`, () => _showChipTracks(key, label));
+}
+
+// [winners-query:begin] — tests/js/composer_page.test.mjs runs this region as is
+// The compo winners' search: the place, then the chip, the decade and the
+// competition the keys over the list chose (the search box's operators).
+function winnersQuery(f) {
+  const parts = [`place:<=${Math.max(1, Number(f.placeMax) || 1)}`];
+  if (f.chip) parts.push(`chip:${f.chip}`);
+  if (f.decade) parts.push(`year:${f.decade}-${f.decade + 9}`);
+  if (f.compo) parts.push(`compo:"${String(f.compo).replace(/"/g, ' ').trim()}"`);
+  return parts.join(' ');
+}
+// [winners-query:end]
+
+async function _showWinners(f = {}) {
+  const filt = { placeMax: f.placeMax || 1, chip: f.chip || '', decade: f.decade || 0, compo: f.compo || '' };
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  const label = filt.placeMax > 1 ? `Top ${filt.placeMax} at every party` : 'Compo winners — every party';
+  setBrowseHeader(label, () => showFacet('discover'));
+  _showSkeletonRows();
+  const q = winnersQuery(filt);
+  const again = () => _showWinners(filt);
+  const [summary, tracks] = await Promise.all([
+    _viewData(_gen, API('/library/compo-summary', { place_max: filt.placeMax }), again),
+    _viewData(_gen, API('/search/filter', { q, order: 'compo', limit: _DRILL_LIMIT }), again),
+  ]);
+  if (!summary || !tracks || _gen !== _browseNavGen) return;
+  const key = (attr, val, text, n, on) => `<button type="button" class="scene-tab" data-${attr}="${esc(String(val))}" aria-pressed="${on ? 'true' : 'false'}">${esc(text)}`
+    + (n != null ? `<span class="scene-tab-count">${n.toLocaleString()}</span>` : '') + '</button>';
+  const places = [1, 3].map((n) => key('place', n, n === 1 ? 'Winners' : 'Top 3', null, filt.placeMax === n)).join('');
+  const chips = [key('chip', '', 'Every chip', null, !filt.chip)]
+    .concat((summary.chips || []).slice(0, 10).map((c) => key('chip', c.key, c.chip.replace(/\s*\(.*\)$/, ''), c.count, filt.chip === c.key))).join('');
+  const decades = {};
+  for (const y of summary.years || []) { const d = Math.floor(y.year / 10) * 10; decades[d] = (decades[d] || 0) + y.count; }
+  const dec = [key('decade', 0, 'Every year', null, !filt.decade)]
+    .concat(Object.keys(decades).map(Number).sort((a, b) => b - a).map((d) => key('decade', d, `${d}s`, decades[d], filt.decade === d))).join('');
+  const compos = (summary.compos || []).slice(0, 40).map((c) => `<option value="${esc(c.name)}"></option>`).join('');
+  const html = `<div class="scp-row" data-group="place"><span class="scp-k">Place</span>${places}</div>`
+    + `<div class="scp-row" data-group="chip"><span class="scp-k">Chip</span>${chips}</div>`
+    + `<div class="scp-row" data-group="decade"><span class="scp-k">Years</span>${dec}</div>`
+    + `<div class="scp-row"><label class="scp-k" for="scp-compo">Competition</label>`
+    + `<input id="scp-compo" class="scp-input" type="search" list="scp-compos" placeholder="Any competition (e.g. Amiga Music)" value="${esc(filt.compo)}">`
+    + `<datalist id="scp-compos">${compos}</datalist></div>`;
+  _showScenePanel(html, 'winners', again, (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.place) _showWinners({ ...filt, placeMax: Number(b.dataset.place) });
+    else if (b.dataset.chip !== undefined) _showWinners({ ...filt, chip: b.dataset.chip });
+    else if (b.dataset.decade !== undefined) _showWinners({ ...filt, decade: Number(b.dataset.decade) });
+  });
+  const inp = scenePanel ? scenePanel.querySelector('#scp-compo') : null;
+  let asked = filt.compo;                    // (Enter and the change it fires: one request)
+  const ask = () => {
+    const v = inp.value.trim();
+    if (v === asked) return;
+    asked = v;
+    _showWinners({ ...filt, compo: v });
+  };
+  inp?.addEventListener('change', ask);
+  inp?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); ask(); } });
+  _compoGroupNext = false;
+  _scenePanelKeepNext = true;
+  renderTracks(tracks);
+  _setCappedSource(tracks.length, _DRILL_LIMIT, 0, { q }, { url: '/api/search/filter', params: { q, order: 'compo' } }, label);
+  _noteDrillCap(tracks.length, 0);
+  _setViewReload(`winners\0${q}`, again);
+}
+
+async function _showOnThisDay(date) {
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  setBrowseHeader('On this day', () => showFacet('discover'));
+  _showSkeletonRows();
+  const again = () => _showOnThisDay(date);
+  const res = await _viewData(_gen, API('/library/on-this-day', { date }), again);
+  if (!res || _gen !== _browseNavGen) return;
+  const [mm, dd] = String(res.date || date).split('-').map(Number);
+  const day = new Date(2000, (mm || 1) - 1, dd || 1).toLocaleDateString(undefined, { day: 'numeric', month: 'long' });
+  setBrowseHeader(`On this day — ${day}`, () => showFacet('discover'));
+  const parties = (res.parties || []).map((p) => `<span class="scp-party">${esc(p.name)}<span class="scene-tab-count">${p.count.toLocaleString()}</span></span>`).join('');
+  const msg = res.needs_index ? '<span class="scp-note">Refresh the Demozoo index (Settings → Metadata) to add the party dates.</span>' : '';
+  _showScenePanel(`<div class="scp-row"><span class="scp-k">Parties held on ${esc(day)}</span>${parties || msg || '<span class="scp-note">None in your library.</span>'}</div>`, 'day', again);
+  _scenePanelKeepNext = true;
+  renderTracks(res.tracks || []);
+  // (no server shuffle for several parties: Play / Shuffle take the rows listed)
+  _viewQueueSource = null;
+  _setViewReload(`day\0${date}`, again);
+}
+
+async function _showUpcoming(weeks) {
+  const _gen = ++_browseNavGen;
+  hideBrowseHeader();
+  setGroupHeader('Party coming up');
+  _hideGridToggle();
+  _showSkeletonRows(8);
+  const res = await _viewData(_gen, API('/library/upcoming-parties', { weeks }), () => _showUpcoming(weeks));
+  if (!res || _gen !== _browseNavGen) return;
+  const rows = (res.series || []).map((s) => {
+    const when = new Date(`${s.date}T12:00:00`).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' });
+    return { ...s, upcoming: `${s.series} — ${s.scheduled ? (s.next || 'next edition') + ', ' : 'expected around '}${when}` };
+  });
+  setBrowseHeader(`Parties coming up — the next ${weeks} weeks`, () => showFacet('discover'), false);
+  renderGroupList(rows, 'upcoming', 'count', 'Tracks', (item) => _showSeriesTracks(item, weeks), rows.length > 0);
+  _setViewReload(`upcoming\0${weeks}`, () => _showUpcoming(weeks));
+}
+
+async function _showSeriesTracks(item, weeks) {
+  const _gen = ++_browseNavGen;
+  _hideGroupFilter();
+  _hideGridToggle();
+  restoreFullHeader();
+  const label = `${item.series}: past editions`;
+  setBrowseHeader(label, () => _showUpcoming(weeks));
+  _showSkeletonRows();
+  const res = await _viewData(_gen, API('/library/upcoming-parties', { weeks, series: item.key }), () => _showSeriesTracks(item, weeks));
+  if (!res || _gen !== _browseNavGen) return;
+  renderTracks(res.tracks || []);
+  _viewQueueSource = null;                   // (the rows listed: no server shuffle for a series)
+  _setViewReload(`series\0${item.key}`, () => _showSeriesTracks(item, weeks));
+}
+
 // ── Library Galaxy view (viz #6) ──────────────────────────────────────────
 let _galaxy = null;
 function _leaveGalaxy() {
@@ -4204,6 +4812,7 @@ async function showGalaxy() {
   hideBrowseHeader();
   _hideGroupFilter();
   _hideGridToggle();
+  _hideScenePanel();
   // Galaxy is a canvas viz, not a track list — it never goes through
   // renderTracks(), so clear the All-Tracks flag explicitly.  Otherwise, coming
   // from All Tracks, a post-scan refresh would think we're still on All Tracks
@@ -4662,6 +5271,7 @@ function renderGroupList(items, nameKey, countKey, countLabel, onClick, showFilt
         : nameKey === 'album' ? 'Albums'
         : nameKey === 'genre' ? 'Genres'
         : nameKey === 'year' ? 'Years'
+        : nameKey === 'folder' ? 'Folders'
         : _FACETS[nameKey] ? _FACETS[nameKey].label
         : nameKey.charAt(0).toUpperCase() + nameKey.slice(1);
       groupFilterLabel.textContent = `${items.length.toLocaleString()} ${viewLabel}`;
@@ -4730,7 +5340,14 @@ function _fillGroupRow(tr, i) {
   const title = tr.cells[0];
   title.textContent = _groupRowName(item, g.nameKey);
   title.classList.toggle('group-untagged', !!item.label);   // "[No Artist]" etc.
-  tr.cells[1].textContent = _countText(item[g.countKey] || 0, g.countLabel);
+  // (the Folders view: a folder that can't be reached is greyed with its note;
+  // its own count text — a subfolder has none)
+  tr.classList.toggle('group-unavailable', !!item.unavailable);
+  tr.title = item.rowTitle || '';
+  // (an Artists row of a scene musician opens his composer page)
+  title.classList.toggle('group-composer', !!item.composer && g.nameKey === 'artist');
+  title.title = item.composer && g.nameKey === 'artist' ? 'Opens the composer page' : '';
+  tr.cells[1].textContent = item.countText != null ? item.countText : _countText(item[g.countKey] || 0, g.countLabel);
 }
 
 const _groupVL = createVirtualList({
@@ -4827,6 +5444,7 @@ browseFilter.addEventListener('keydown', (e) => {
 //     array.
 //   • Play → from the first track, in list order.
 function _playAll(shuffle) {
+  if (_folderPlayActive()) { _playFolderLevel(shuffle); return; }   // (a Folders level of subfolders)
   const store = currentTracks;
   const src = _viewQueueSource;
   const playable = store && (store._isWindowedStore || (Array.isArray(store) && store.length));
@@ -4961,6 +5579,10 @@ function setBrowseHeader(label, backFn, playable = true) {
 // the rows listed (the crumb's "showing first N" describes the list only).
 function _paintShuffleAllTitle() {
   if (!_shuffleAllBtn) return;
+  // (a Folders level of subfolders: both keys cover everything under it)
+  const folder = _folderPlayActive();
+  if (_playAllBtn) _playAllBtn.title = folder ? 'Play everything in this folder and its subfolders (P)' : 'Play all (P)';
+  if (folder) { _shuffleAllBtn.title = 'Shuffle everything in this folder and its subfolders (Shift+P)'; return; }
   const src = _viewQueueSource;
   const n = src && typeof src.total === 'number' && src.total > 0 ? src.total : 0;
   _shuffleAllBtn.title = (src && src.shuffle)
@@ -4989,7 +5611,7 @@ function _modalOpen() {
   return false;
 }
 
-function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _hideExportBtn(); _currentBrowsePath = null; }
+function hideBrowseHeader() { browseHdr.hidden = true; _dupViewActive = false; _hideExportBtn(); _currentBrowsePath = null; _hideScenePanel(); }
 
 // Keyboard: P = Play all, Shift+P = Shuffle all — whenever a playable track list
 // is showing and focus isn't in a text field.
@@ -4998,8 +5620,8 @@ document.addEventListener('keydown', (e) => {
   const el = document.activeElement;
   if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
   if (_modalOpen()) return;                // never play "behind" an open dialog
-  const playable = currentTracks && (currentTracks._isWindowedStore ||
-    (Array.isArray(currentTracks) && currentTracks.length));
+  const playable = _folderPlayActive() || (currentTracks && (currentTracks._isWindowedStore ||
+    (Array.isArray(currentTracks) && currentTracks.length)));
   if (!playable) return;
   e.preventDefault();
   _playAll(e.shiftKey);
@@ -5620,6 +6242,167 @@ Player.on('trackchange', (track) => {
   }
 });
 
+// ── Folders: the music folders in the main pane ──────────────────────────────
+// The desktop counterpart of the phone's Library › Folders (the sidebar tree
+// shows one row on common screens).  Home: the music folders (GET
+// /api/library/dirs, named by their alias or collection label), each with its
+// track count; one that can't be reached is greyed with its note and opens
+// nothing (no request goes to it), as in the tree — an online collection that
+// is offline still opens (it lists from its index).  A folder with subfolders
+// lists them (GET /api/fstree/children), its own tracks behind a first row
+// "Tracks in this folder" — Play all / Shuffle there cover everything under it
+// (the folder view's queue source, recursive).  A folder without subfolders
+// opens its tracks in the folder track view (showFolder), with the Folders
+// crumb and Back.  Each level is a view entry (``_browseNavGen``, flags cleared
+// by setGroupHeader) and records its reload; Back and the system Back go up a
+// level (setBrowseHeader's history entry).
+// (its state is declared with the other view state, near the top: _fvRoots …)
+const _FV_ROOTS_FRESH_MS = 15000;   // a level opens with its root's status at most this old
+
+async function _fvLoadRoots() {
+  const r = await fetch('/api/library/dirs');
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const dirs = (((await r.json()) || {}).dirs || []).filter((d) => d && typeof d.path === 'string' && d.path);
+  const aliases = (window.__sbConfig && window.__sbConfig.folder_aliases) || {};
+  _fvRoots = dirs.map((d) => ({
+    path: d.path, name: rootLabel(d, aliases), kind: rootKind(d),
+    unavailable: d.status === 'unavailable', catalogue: d.catalogue || '',
+    count: Number(d.track_count) || 0,
+  }));
+  _fvRootsAt = Date.now();
+  return _fvRoots;
+}
+
+// (and still on screen: the Stations view takes the pane without a nav token)
+function _folderPlayActive() { return !!(_folderPlay && _folderPlay.gen === _browseNavGen && !browseHdr.hidden); }
+
+async function _playFolderLevel(shuffle) {
+  const src = _folderPlay && _folderPlay.src;
+  if (!src || _folderPlayBusy) return;
+  _folderPlayBusy = true;
+  const key = shuffle ? _shuffleAllBtn : _playAllBtn;
+  if (key) key.setAttribute('aria-busy', 'true');
+  try {
+    const ok = shuffle ? await Player.playSource(src, { shuffle: true })
+                       : await Player.playSource(src, { offset: 0, explicit: false });
+    if (ok && shuffle) window.Toast?.ok?.(_shuffleScopeText(src));
+    else if (ok === false && !Player.lastStartAllOffline) {
+      window.Toast?.error?.(shuffle ? 'Couldn’t start shuffle — try again.' : 'Couldn’t start playback — try again.');
+    }
+  } catch (_) {
+    window.Toast?.error?.('Couldn’t start playback — try again.');
+  } finally {
+    _folderPlayBusy = false;
+    if (key) key.removeAttribute('aria-busy');
+  }
+}
+
+// ``path`` null: the music folders.  ``root``: the music folder ``path`` lies in.
+async function showFolders(path = null, root = null) {
+  const _gen = ++_browseNavGen;
+  _folderPlay = null;
+  // (app.js: what a pick in the sidebar tree does first — free the connection
+  // slots of waveform / VU fetches, note a share for its freshness check)
+  if (path) document.dispatchEvent(new CustomEvent('sb:folder-open', { detail: { path } }));
+  if (!path) hideBrowseHeader();
+  setGroupHeader(path ? 'Folder' : 'Music folder');   // (clears the view flags at once)
+  _hideGridToggle();
+  _showSkeletonRows(12);
+  if (!path) {
+    const roots = await _viewData(_gen, _fvLoadRoots(), () => showFolders());
+    if (!roots || _gen !== _browseNavGen) return;
+    const items = roots.map((r) => {
+      const blocked = r.unavailable && !r.catalogue;
+      return {
+        folder: r.name, path: r.path, root: r.path, count: r.count, unavailable: r.unavailable,
+        countText: blocked ? 'unavailable' : r.unavailable ? `${_countText(r.count, 'Tracks')} · offline` : null,
+        // (a share's address may hold a user name and password: never shown)
+        rowTitle: r.unavailable ? rootBlockedText(r) : (r.kind === 'drive' ? r.path : ''),
+      };
+    });
+    renderGroupList(items, 'folder', 'count', 'Tracks', (item) => {
+      const r = (_fvRoots || []).find((x) => x.path === item.path);
+      if (r && r.unavailable && !r.catalogue) { window.Toast?.error?.(rootBlockedText(r)); return; }
+      showFolders(item.path, item.path);
+    });
+    if (!items.length) _setViewEmpty('No music folders yet', 'Open Settings → Library to add one.');
+    _setViewReload('folders', () => showFolders());
+    return;
+  }
+  // The music folder's status, read again when it is older than a few seconds.
+  if (!_fvRoots || Date.now() - _fvRootsAt > _FV_ROOTS_FRESH_MS) {
+    try { await _fvLoadRoots(); } catch (_) { /* as it was known */ }
+    if (_gen !== _browseNavGen) return;
+  }
+  const r = (root && (_fvRoots || []).find((x) => x.path === root)) || rootOf(path, _fvRoots || []);
+  const rootPath = r ? r.path : (root || path);
+  // (never a share's address — it may hold a user name and password: rootLabel)
+  const trail = folderTrail(path, rootPath, r ? r.name : rootLabel({ path: rootPath }));
+  const crumb = foldersCrumb(trail);
+  const parent = folderParent(path, rootPath);
+  const back = () => (parent ? showFolders(parent, rootPath) : showFolders());
+  if (r && r.unavailable && !r.catalogue) {
+    // (no request goes to a drive or share that can't be reached)
+    setBrowseHeader(crumb, back, false);
+    renderTracks([]);
+    _setViewEmpty(`${r.name} can’t be reached`, rootBlockedText(r));
+    _setViewReload(`folders\0${path}`, () => showFolders(path, rootPath));
+    return;
+  }
+  const q = (o) => new URLSearchParams(o).toString();
+  const listing = (async () => {
+    const [cRes, tRes] = await Promise.all([
+      fetch(`/api/fstree/children?${q({ path, root: rootPath })}`),
+      // (how many tracks of its own — a failed count only leaves out its row)
+      fetch(`/api/fstree/tracks-with-meta?${q({ path, recursive: 'false', offset: '0', limit: '1' })}`).catch(() => null),
+    ]);
+    if (cRes.status === 404) return { gone: true };
+    if (!cRes.ok) throw new Error(`HTTP ${cRes.status}`);
+    const c = await cRes.json();
+    const t = tRes && tRes.ok ? await tRes.json().catch(() => null) : null;
+    const children = Array.isArray(c && c.children)
+      ? c.children.filter((x) => x && typeof x.path === 'string' && x.path) : [];
+    const own = t && typeof t.total === 'number' ? t.total : (Array.isArray(t) ? t.length : 0);
+    return { children, own };
+  })();
+  const got = await _viewData(_gen, listing, () => showFolders(path, rootPath));
+  if (!got || _gen !== _browseNavGen) return;
+  if (got.gone) {
+    setBrowseHeader(crumb, back, false);
+    renderTracks([]);
+    _setViewEmpty('This folder is gone', 'It was moved, renamed or deleted since it was listed.');
+    return;
+  }
+  if (!got.children.length) {
+    // A folder of tracks: the folder track view, with this view's crumb and Back.
+    showFolder(path, false, { label: crumb, back });
+    return;
+  }
+  const items = got.children.map((ch) => ({
+    folder: folderLabel(ch.name || ch.path.split('/').filter(Boolean).pop() || ch.path),
+    path: ch.path, countText: '\u203a',
+  }));
+  if (got.own > 0) {
+    items.unshift({ folder: '\u266a Tracks in this folder', path, own: true, count: got.own, countText: null });
+  }
+  const src = {
+    ordered: { url: '/api/fstree/tracks-with-meta', params: { path, recursive: 'true' } },
+    shuffle: { url: '/api/fstree/tracks-with-meta', params: { path, recursive: 'true' }, seedParam: 'shuffle_seed' },
+    total: null, label: trail[trail.length - 1].name,
+  };
+  setBrowseHeader(crumb, back, true);
+  renderGroupList(items, 'folder', 'count', 'Tracks', (item) => {
+    if (item.own) showFolder(path, false, { label: `${crumb} › Tracks`, back: () => showFolders(path, rootPath) });
+    else showFolders(item.path, rootPath);
+  });
+  // (the count says folders: the "Tracks in this folder" row is not one)
+  if (got.own > 0 && groupFilterLabel) groupFilterLabel.textContent = `${got.children.length.toLocaleString()} Folders`;
+  _folderPlay = { gen: _browseNavGen, src };
+  _viewQueueSource = null;
+  _paintShuffleAllTitle();
+  _setViewReload(`folders\0${path}`, () => showFolders(path, rootPath));
+}
+
 async function showFolder(path, recursive = false, opts = {}) {
   // A real folder navigation bumps the nav token; a quiet in-place refresh only
   // CAPTURES it (no bump) so it stays a background op — but it still bails below
@@ -5627,12 +6410,19 @@ async function showFolder(path, recursive = false, opts = {}) {
   // compares against the NEW view's currentTracks, so it can't catch that on its
   // own — a quiet refresh landing under a genre list would wipe it otherwise.)
   const _gen = opts.quiet ? _browseNavGen : ++_browseNavGen;
+  // (a folder has no panel over its list: a composer page's keys must not stay
+  // live over the folder while it loads)
+  if (!opts.quiet) _hideScenePanel();
   _currentBrowsePath = path;
   _viewReload = null;         // a folder refreshes its own way (refreshCurrentFolderInPlace)
   _viewIsAllTracks = false;   // a folder is never All Tracks — keep both flags consistent
                               // (showFolder doesn't call restoreFullHeader, which is where
                               // the other flat-track views clear this)
   _currentBrowseRecursive = recursive;
+  // The Folders view opens a folder's tracks here with its own crumb and Back
+  // (``opts.label`` / ``opts.back``); a quiet refresh keeps them.
+  const fo = opts.quiet ? (_currentFolderOpts || {}) : { label: opts.label || null, back: opts.back || null };
+  _currentFolderOpts = fo;
   _hideGridToggle();
   // ``opts.quiet`` = an in-place freshness refresh (not a user navigation):
   // skip the skeleton flash and don't re-schedule another background scan.
@@ -5647,10 +6437,10 @@ async function showFolder(path, recursive = false, opts = {}) {
     _showSkeletonRows();
   }
 
-  setBrowseHeader(path.split('/').filter(Boolean).pop() || path, () => {
+  setBrowseHeader(fo.label || path.split('/').filter(Boolean).pop() || path, fo.back || (() => {
     hideBrowseHeader();
     document.querySelectorAll('#nav-library li')[0]?.click();
-  });
+  }));
 
   // Drill-down freshness: kick a debounced background scan of THIS folder
   // (POST /api/fstree/refresh).  The view still renders instantly from the
@@ -6357,8 +7147,9 @@ async function _reflagShownRows() {
 export const Library = {
   patchTrackDuration, patchTrack, refreshAvailability,
   showAll, showArtists, showAlbumArtists, showAlbums, showNameAlbums, showAlbumTracks,
-  showGenres, showYears, showSceneGroups, showScene, showFacet, showFacetTracks, showGalaxy, showFolder, renderTracks,
-  showSearch,
+  showGenres, showYears, showSceneGroups, showScene, showFacet, showFacetTracks, showGalaxy, showFolder, showFolders, renderTracks,
+  showComposer,
+  showSearch, leaveSearch,
   // The search results on screen: re-read in place (a scan finished, …).
   isInSearchView: () => !!_searchCtx,
   refreshSearchInPlace: () => _refreshSearchInPlace(),

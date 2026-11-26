@@ -1077,7 +1077,7 @@ async def test_a_stalled_sid_render_is_padded_for_the_web_ui_and_aborted_for_oth
     monkeypatch.setattr(stream, "ensure_sid_vu_sidecar", lambda *a, **k: None)
     monkeypatch.setattr(stream, "_find_renderer", lambda *a: sys.executable)
     monkeypatch.setattr(stream, "_sid_render_cmd",
-                        lambda binary, path, subsong, dur, out, mute=(), start=1:
+                        lambda binary, path, subsong, dur, out, mute=(), start=1, stereo=False:
                         [sys.executable, str(script), out, "0.5", "30"])
     monkeypatch.setattr(stream, "_GROWING_READ_TIMEOUT", 0.4)
     sid = _silent_psid(tmp_path / "x.sid")          # content ignored by the fake

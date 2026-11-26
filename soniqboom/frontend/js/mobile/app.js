@@ -43,6 +43,7 @@ window.Toast = Toast;
 import { MobileRadio, paintStationArt, forgetStationArt } from './radio-player.js';
 import { freshArt, reaskArt, noteArtChanged, noteArtMissed } from './views/_common.js';
 import { forgetCover, forgetAllCovers } from '../cover_status.js';
+import { watchPlays } from '../art_intent.js';
 // A cover changed (art_ready: that track; art_refresh or a reconnect: any —
 // _common.js sends 'soniqboom:art-changed' for each): forget what the batched
 // cover status (cover_status.js) said, so list rows told "no cover" ask again.
@@ -150,13 +151,13 @@ const PLAY_GLYPH = '\u25B6\uFE0E', PAUSE_GLYPH = '\u23F8\uFE0E';
 function renderMini(track) {
   // Radio takes precedence: while a station plays it's the active source.
   if (MobileRadio.active) { renderMiniStation(MobileRadio.station); return; }
-  // Hide when there's nothing, OR when a radio takeover detached the shared
-  // element (src cleared) so ``track`` is no longer resumable — otherwise the
-  // mini would show a dead ▶ that playPause() ignores after radio stops.
+  // A loaded track shows while the element holds it (a track whose element
+  // lost its source can't be resumed: no dead ▶).
   const resumable = track && (Player.playing || (Player.audio && Player.audio.getAttribute('src')));
-  // Nothing loaded, but a queue waits (restored after a reload, or resumed from
-  // another device): show the track ▶ starts — playPause starts exactly this
-  // one (Player.cuedTrack is null in the radio-takeover case above).
+  // Nothing loaded, but a queue waits (restored after a reload, resumed from
+  // another device, or parked when a station took the output — player.js
+  // _parkForExternalAudio): show the track ▶ starts — playPause starts exactly
+  // this one, at Player.cuedSec.  Neither: hidden.
   const cued = resumable ? null : (Player.cuedTrack || null);
   _miniCuedKey = cued ? `${cued.id}~${cued.subsong ?? ''}` : null;
   if (!resumable && !cued) {
@@ -215,6 +216,7 @@ function renderMiniStation(st) {
 }
 
 Player.on('trackchange', renderMini);
+watchPlays(Player);              // a played retro track's game box cover (art_intent.js)
 // The shown track's cover changed (art_ready / art_refresh — _common.js).
 document.addEventListener('soniqboom:art-changed', (e) => {
   if (!MobileRadio.active) reaskArt(miniArt, miniArt, e.detail && e.detail.id, e.detail && e.detail.missing);

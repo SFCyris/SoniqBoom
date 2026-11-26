@@ -328,7 +328,11 @@ def test_c64_sidplayer_songs_are_told_from_ufo_by_content(tmp_path):
     ufo.write_bytes(b"FORM\x00\x00\x10\x00SMUS" + bytes(4096))
     assert not md.is_c64_sidplayer(ufo.read_bytes())
     assert stream._render_ident(str(ufo), {"format": "UFO"})[0] == ".mus"
-    assert not md.is_supported_music_name("song.str")
+    # (``.str`` is also ZX Spectrum Sample Tracker's suffix: scanned, but a
+    # Stereo Sidplayer song's second SID is never listed)
+    for f in _files("sidplay-stereo", ".str"):
+        with pytest.raises(md.NotPlayableHere):
+            md.extract(f, "x")
 
 
 @needs_np
@@ -447,8 +451,11 @@ def test_every_new_suffix_is_scanned_and_companions_are_not():
         if ext in md._OPENMPT_OPTIONAL and ext not in md.OPENMPT_EXTRA_EXTS:
             continue
         assert md.is_supported_music_name(name), name
-    for name in ("a.str", "a.sam"):
+    for name in ("a.sam",):
         assert not md.is_supported_music_name(name), name
+    # (``.str`` — ZX Spectrum Sample Tracker's — is scanned; a Stereo
+    # Sidplayer song's second SID under it is refused by content)
+    assert md.is_supported_music_name("a.str")
 
 
 @needs_np

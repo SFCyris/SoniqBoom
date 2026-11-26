@@ -11,7 +11,8 @@ import { STRONG_RULE, passwordHint, passwordProblem,
          strongPasswordsRequired, setStrongPasswordsKnown } from './password-rule.js';
 import { Player }         from './player.js';
 import { Toast, trapFocus } from './utils.js';
-import { getUiStyle, setUiStyle } from './ui_style.js';
+import { getUiStyle, setUiStyle, onUiStyleChange } from './ui_style.js';
+import { confirmKeyAction, confirmInitialFocus } from './confirm_keys.js';
 import { vizGroupEnabled, getVizSettings, setVizSettings } from './viz/engine.js';
 // Experimental in-browser SID playback toggle (see sid-wasm-player.js).
 import { sidWasmPlaybackEnabled, setSidWasmPlayback } from './sid-wasm-player.js';
@@ -196,7 +197,9 @@ function styledConfirm(message, { title = 'Confirm', okLabel = 'OK', dangerColor
     overlay.classList.toggle('confirm-standalone', standalone);
     confirmDialog.classList.remove('hidden');
     overlay.classList.remove('hidden');
-    confirmOk.focus();
+    // A destructive confirm (``dangerColor``, the default) opens on Cancel: a
+    // stray Enter right after it appeared changes nothing (confirm_keys.js).
+    confirmInitialFocus(dangerColor, confirmOk, confirmCancel).focus();
     // Trap Tab within the confirm so focus can't wander to the (inert-looking)
     // page behind a standalone confirm (bug 4.3); released on close.
     _confirmTrapRelease = trapFocus(confirmDialog);
@@ -204,6 +207,7 @@ function styledConfirm(message, { title = 'Confirm', okLabel = 'OK', dangerColor
 }
 
 function _closeConfirmDialog(result) {
+  if (confirmDialog.classList.contains('hidden')) return;   // (answered already: a key and its click)
   if (_confirmTrapRelease) { _confirmTrapRelease(); _confirmTrapRelease = null; }
   confirmDialog.classList.add('hidden');
   // Restore the previous dialog, or hide overlay if confirm was standalone
@@ -219,6 +223,18 @@ function _closeConfirmDialog(result) {
 
 confirmOk.addEventListener('click', (e) => { e.stopPropagation(); _closeConfirmDialog(true); });
 confirmCancel.addEventListener('click', (e) => { e.stopPropagation(); _closeConfirmDialog(false); });
+confirmDialog.tabIndex = -1;   // (a click on its text keeps the focus — and its keys — in it)
+// Enter / Space answer for the focused button only — with the focus on neither
+// they answer nothing (confirm_keys.js; Escape: the document handler below).
+confirmDialog.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' || e.key === 'Esc') return;
+  const act = confirmKeyAction(e.key, document.activeElement, confirmOk, confirmCancel);
+  if (act === null) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (act === 'ok') _closeConfirmDialog(true);
+  else if (act === 'cancel') _closeConfirmDialog(false);
+});
 
 // Expose styledConfirm globally so other modules (e.g. playlist.js) can
 // fall back to it before admin.js's deeper-bodied init runs.  Install at
@@ -226,6 +242,16 @@ confirmCancel.addEventListener('click', (e) => { e.stopPropagation(); _closeConf
 // any module that imports admin.js can rely on ``window.__sbConfirm``
 // being defined immediately, not 1700 lines later in the file.
 window.__sbConfirm = styledConfirm;
+
+// Settings › Appearance › Style (and the Preferences dialog's) follow the
+// style chosen anywhere else — the top bar's Retro hi-fi / Modern switch,
+// another tab — so an open Settings never shows (or saves back) the old one.
+onUiStyleChange((style) => {
+  for (const id of ['setting-ui-style', 'dp-ui-style']) {
+    const el = document.getElementById(id);
+    if (el) { el.value = style; el.dataset.loaded = style; }
+  }
+});
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -380,6 +406,7 @@ document.querySelectorAll('.admin-tab').forEach(tab => {
       loadSettings();
     } else if (tab.dataset.tab === 'tab-metadata') {
       loadDiscogsStatus();
+      loadIgdbStatus();
       loadSceneStatus();
       loadSongdbStatus();
       loadGameTitlesStatus();
@@ -2370,7 +2397,8 @@ async function loadRendererStatus() {
                  'uade123', 'hvl2wav', 'gme', 'adplay',
                  'psgplay', 'ym2wav', 'sc68', 'zxtune123', 'kssrender', 'dsfrender',
                  'milkyrender', 'mlrender', 'mdxrender',
-                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender'];
+                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender',
+                 'midirender'];
   // Set all to loading state \u2014 ``renderer-loading`` adds a subtle pulse
   // animation so the user sees the row is actively probing rather than
   // frozen at "\u2026".
@@ -3425,6 +3453,88 @@ document.getElementById('btn-discogs-test')?.addEventListener('click', (ev) => _
   }
 }));
 
+// ── IGDB credentials (Metadata tab) ──────────────────────────────────────────
+// A Twitch application's client id and secret; the server sends the id back,
+// never the secret.  Test asks Twitch for a token with the typed pair, else
+// the saved one.
+
+let _igdbState = null;
+
+function _showIgdbState(state) {
+  _igdbState = state;
+  const el = document.getElementById('md-igdb-status');
+  if (!el) return;
+  if (!state) { el.textContent = 'Status: —'; return; }
+  let text;
+  if (state.from_env) text = 'Status: SONIQBOOM_IGDB_CLIENT_ID / _SECRET set the credentials — change them there.';
+  else if (state.set) text = `Status: saved (client id ${state.client_id}). Game covers are looked up when a track plays or its Track Info opens.`;
+  else text = 'Status: not set — retro tracks show a drawn cover when they have none.';
+  if (state.offline) text += ' Offline mode is on: nothing is looked up.';
+  el.textContent = text;
+  for (const id of ['setting-igdb-client-id', 'setting-igdb-client-secret', 'btn-igdb-save', 'btn-igdb-remove']) {
+    const b = document.getElementById(id);
+    if (b) b.disabled = !!state.from_env || (id === 'btn-igdb-remove' && !state.set);
+  }
+}
+
+async function loadIgdbStatus() {
+  try {
+    const res = await api('/admin/igdb');
+    _showIgdbState(await res.json());
+  } catch {
+    _showIgdbState(null);
+  }
+}
+
+function _igdbTyped() {
+  return {
+    client_id: (document.getElementById('setting-igdb-client-id')?.value || '').trim(),
+    client_secret: (document.getElementById('setting-igdb-client-secret')?.value || '').trim(),
+  };
+}
+
+document.getElementById('btn-igdb-save')?.addEventListener('click', (ev) => _discogsRun(ev.currentTarget, async () => {
+  const typed = _igdbTyped();
+  if (!typed.client_id || !typed.client_secret) { showMsg('md-igdb-msg', 'Paste the client id and a client secret first.', 'err'); return; }
+  try {
+    const res = await api('/admin/igdb', { method: 'PUT', body: JSON.stringify(typed) });
+    _showIgdbState(await res.json());
+    const sec = document.getElementById('setting-igdb-client-secret');
+    if (sec) sec.value = '';
+    showMsg('md-igdb-msg', 'Saved — game covers are looked up from the next play or Track Info.', 'ok');
+  } catch (e) {
+    showMsg('md-igdb-msg', _apiErrText(e, 'Could not save the credentials.'), 'err');
+  }
+}));
+
+document.getElementById('btn-igdb-remove')?.addEventListener('click', (ev) => _discogsRun(ev.currentTarget, async () => {
+  try {
+    const res = await api('/admin/igdb', { method: 'PUT', body: JSON.stringify({ client_id: '', client_secret: '' }) });
+    _showIgdbState(await res.json());
+    showMsg('md-igdb-msg', 'Removed — IGDB is no longer asked.', 'ok');
+    document.getElementById('setting-igdb-client-id')?.focus();
+  } catch (e) {
+    showMsg('md-igdb-msg', _apiErrText(e, 'Could not remove the credentials.'), 'err');
+  }
+}));
+
+document.getElementById('btn-igdb-test')?.addEventListener('click', (ev) => _discogsRun(ev.currentTarget, async () => {
+  const typed = _igdbTyped();
+  if (!(typed.client_id && typed.client_secret) && !(_igdbState && _igdbState.set)) {
+    showMsg('md-igdb-msg', 'Paste a client id and secret to test them.', 'err');
+    return;
+  }
+  showMsg('md-igdb-msg', 'Checking with Twitch…', 'ok');
+  try {
+    const res = await api('/admin/igdb/test', { method: 'POST', body: JSON.stringify(typed) });
+    const r = await res.json();
+    const which = typed.client_id && typed.client_secret ? 'The credentials you typed' : 'The saved credentials';
+    showMsg('md-igdb-msg', r.ok ? `${which} work.` : `${which} don't work: ${r.error || 'unknown error'}`, r.ok ? 'ok' : 'err');
+  } catch (e) {
+    showMsg('md-igdb-msg', _apiErrText(e, 'Could not test the credentials.'), 'err');
+  }
+}));
+
 // Server toggles that save as soon as they change (they sit away from the
 // Settings grid's Save button).  Each checkbox ships ``disabled`` and is enabled
 // by loadSettings only once the server has told us its real value, so a failed
@@ -3938,6 +4048,12 @@ function _openDevicePrefs() {
     <label style="${row}" for="dp-delay">\u201cConverting\u2026\u201d notice delay (ms)
       <input id="dp-delay" aria-describedby="dp-delay-hint" class="pl-modal-input" type="number" min="0" max="30000" step="100" style="width:80px;margin:0"></label>
     <div id="dp-delay-hint" style="${hint}">How long a slow conversion (formats your browser can\u2019t play directly, such as DSD or ALAC) may take before the \u201cConverting\u2026\u201d notice appears. Retro and Amiga tracks show \u201cRendering\u2026\u201d after 1 second instead.</div>
+    <label style="${row}" for="dp-stereo-width">Stereo width of retro tunes
+      <select id="dp-stereo-width" aria-describedby="dp-stereo-width-hint" class="pl-modal-input" style="width:150px;margin:0"><option value="">Same as server</option><option value="0">Mono (0 %)</option><option value="25">25 %</option><option value="50">50 %</option><option value="60">Headphones (60 %)</option><option value="75">75 %</option><option value="100">As rendered (100 %)</option><option value="125">Wider (125 %)</option><option value="150">Wider (150 %)</option></select></label>
+    <div id="dp-stereo-width-hint" style="${hint}">Narrows the hard-panned stereo of chip, tracker and Amiga tunes — Headphones is easier on the ears. Applies at once.</div>
+    <label style="${row}" for="dp-endless">Play looping tunes endlessly
+      <input id="dp-endless" aria-describedby="dp-endless-hint" type="checkbox"></label>
+    <div id="dp-endless-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Tracker, console and Amiga tunes go on through their own loop until you skip. Repeat-One does this for the tune it repeats either way.</div>
     <label style="${row}" for="dp-shuffle-replay">Let shuffle repeat tracks you’ve heard
       <input id="dp-shuffle-replay" aria-describedby="dp-shuffle-replay-hint" type="checkbox"></label>
     <div id="dp-shuffle-replay-hint" style="color:var(--text2,#bbb);font-size:12px;margin:2px 0 10px">Off: a shuffle plays each track once before anything repeats. Takes effect the next time you turn shuffle on.</div>
@@ -3979,6 +4095,8 @@ function _openDevicePrefs() {
   $('dp-preload').value = _prefValue('sb_preload_buffer');
   $('dp-delay').value = _prefValue('sb_convert_delay');
   $('dp-shuffle-replay').checked = localStorage.getItem('sb_shuffle_replay') === '1';
+  _fillWidthSelect($('dp-stereo-width'), Player.stereoWidthOwn);
+  $('dp-endless').checked = Player.endlessPref;
   $('dp-queue-sync').checked = Player.queueSync;
   $('dp-theme').value = localStorage.getItem('sb_theme') || 'dark';
   $('dp-ui-style').value = $('dp-ui-style').dataset.loaded = getUiStyle();
@@ -4013,6 +4131,8 @@ function _openDevicePrefs() {
     localStorage.setItem('sb_preload_buffer', String(_readNumPref($('dp-preload'), 'sb_preload_buffer', 0, 30, 'Preload buffer', notes)));
     localStorage.setItem('sb_convert_delay', String(Math.round(_readNumPref($('dp-delay'), 'sb_convert_delay', 0, 30000, '\u201cConverting\u2026\u201d notice delay', notes))));
     localStorage.setItem('sb_shuffle_replay', $('dp-shuffle-replay').checked ? '1' : '0');
+    Player.setStereoWidth($('dp-stereo-width').value === '' ? null : Number($('dp-stereo-width').value));
+    Player.setEndlessPref($('dp-endless').checked);
     Player.setStreamQuality($('dp-quality').value);
     Player.setQueueSync($('dp-queue-sync').checked);
     const theme = $('dp-theme').value === 'light' ? 'light' : 'dark';
@@ -4065,6 +4185,9 @@ async function loadSettings() {
   if (delayEl)   delayEl.value   = _prefValue('sb_convert_delay');
   const shufReplayEl = document.getElementById('setting-shuffle-replay');
   if (shufReplayEl) shufReplayEl.checked = localStorage.getItem('sb_shuffle_replay') === '1';
+  _fillWidthSelect(document.getElementById('setting-stereo-width-own'), Player.stereoWidthOwn);
+  const endlessEl = document.getElementById('setting-endless');
+  if (endlessEl) endlessEl.checked = Player.endlessPref;
   const qsyncEl = document.getElementById('setting-queue-sync');
   if (qsyncEl) qsyncEl.checked = Player.queueSync;
   const qsyncRow = document.getElementById('setting-queue-sync-row');
@@ -4114,6 +4237,10 @@ async function loadSettings() {
     if (folderArtEl) folderArtEl.checked = s.use_folder_art !== false;
     const onlineCoverEl = document.getElementById('setting-online-cover-lookup');
     if (onlineCoverEl) onlineCoverEl.checked = s.online_cover_lookup !== false;
+    const genCoverEl = document.getElementById('setting-generated-covers');
+    if (genCoverEl) genCoverEl.checked = s.generated_covers !== false;
+    const csdbEl = document.getElementById('setting-csdb-lookup');
+    if (csdbEl) csdbEl.checked = s.csdb_lookup !== false;
     const lyricsWbEl = document.getElementById('setting-lyrics-writeback');
     if (lyricsWbEl) lyricsWbEl.checked = !!s.lyrics_writeback;
     const lyricsCountEl = document.getElementById('lyrics-cache-count');
@@ -4150,11 +4277,24 @@ async function loadSettings() {
     }
     const sidBoostEl = document.getElementById('setting-sid-digiboost');
     if (sidBoostEl) sidBoostEl.checked = !!r.sid_digiboost;
+    // Amiga resampler, stereo width, loops / endings (Renderers tab)
+    _fillRenderOptions(r);
+    // MIDI synths (Renderers tab)
+    const midiSynthEl = document.getElementById('setting-midi-synth');
+    if (midiSynthEl) midiSynthEl.value = r.midi_synth || 'soundfont';
+    const gameSynthEl = document.getElementById('setting-game-midi-synth');
+    if (gameSynthEl) gameSynthEl.value = r.game_midi_synth || 'opl3';
+    const mt32DirEl = document.getElementById('setting-mt32-rom-dir');
+    if (mt32DirEl) {
+      mt32DirEl.value = r.mt32_rom_dir || '';
+      loadMt32State();
+    }
     // Renderer binary paths (Renderers tab)
     for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
                         'zxtune123', 'kssrender', 'dsfrender',
                       'milkyrender', 'mlrender', 'mdxrender',
-                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender']) {
+                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender',
+                 'midirender']) {
       const el = document.getElementById(`setting-path-${name}`);
       if (el) el.value = r[`${name}_path`] || '';
     }
@@ -4207,6 +4347,11 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
   // Read by the player at the next shuffle deal (player.js ``sb_shuffle_replay``).
   localStorage.setItem('sb_shuffle_replay',
     document.getElementById('setting-shuffle-replay')?.checked ? '1' : '0');
+  // Stereo width (applies at once) and endless play (from the next track).
+  const _widthOwnEl = document.getElementById('setting-stereo-width-own');
+  if (_widthOwnEl) Player.setStereoWidth(_widthOwnEl.value === '' ? null : Number(_widthOwnEl.value));
+  const _endlessEl = document.getElementById('setting-endless');
+  if (_endlessEl) Player.setEndlessPref(_endlessEl.checked);
   const _qsyncEl = document.getElementById('setting-queue-sync');
   if (_qsyncEl) Player.setQueueSync(_qsyncEl.checked);
   localStorage.setItem('sb_theme', theme);
@@ -4228,6 +4373,8 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
     const skipShort = Number(document.getElementById('setting-skip-short-tunes')?.value || 0);
     const useFolderArt = document.getElementById('setting-use-folder-art')?.checked ?? true;
     const onlineCovers = document.getElementById('setting-online-cover-lookup')?.checked ?? true;
+    const genCovers = document.getElementById('setting-generated-covers')?.checked ?? true;
+    const csdbLookup = document.getElementById('setting-csdb-lookup')?.checked ?? true;
     // ``folder_art_names`` is a CSV the server trims, lower-cases, and
     // dedupes server-side (api/art.py:_parse_folder_art_names).  We send
     // the raw textbox value so the user's capitalisation round-trips for
@@ -4251,6 +4398,8 @@ document.getElementById('btn-save-settings')?.addEventListener('click', async ()
         skip_short_tunes: skipShort,
         use_folder_art: useFolderArt,
         online_cover_lookup: onlineCovers,
+        generated_covers: genCovers,
+        csdb_lookup: csdbLookup,
         folder_art_names: folderArtNames,
         remote_cache_max_mb: remoteCacheMb,
         log_level: logLevel,
@@ -5279,6 +5428,72 @@ document.getElementById('btn-hvsc-cleanup')?.addEventListener('click', async () 
   }
 });
 
+// ── Amiga resampler, stereo width, loops / endings (Renderers tab) ──────────
+// core/render_options.py — the server validates every value; a width saved
+// outside the presets (SoniqBoom.conf) is shown as its own option.
+function _fillWidthSelect(el, value) {
+  if (!el) return;
+  const v = value === null || value === undefined ? '' : String(value);
+  if (v !== '' && ![...el.options].some((o) => o.value === v)) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = `${v} %`;
+    el.appendChild(o);
+  }
+  el.value = v;
+}
+function _fillSelect(id, value) {
+  const el = document.getElementById(id);
+  if (!el || value === undefined || value === null) return;
+  const v = String(value);
+  if (![...el.options].some((o) => o.value === v)) {
+    const o = document.createElement('option');
+    o.value = v;
+    o.textContent = id.endsWith('-loops') ? `${v} times` : `${v} s`;
+    el.appendChild(o);
+  }
+  el.value = v;
+}
+function _fillRenderOptions(r) {
+  if (!r) return;
+  _fillSelect('setting-amiga-resampler', r.amiga_resampler || 'auto');
+  _fillWidthSelect(document.getElementById('setting-stereo-width'),
+                   Number.isFinite(Number(r.stereo_width)) ? Number(r.stereo_width) : 100);
+  _fillSelect('setting-tracker-loops', Number(r.tracker_loops) || 0);
+  _fillSelect('setting-tracker-fade', Number(r.tracker_fade) >= 0 ? Number(r.tracker_fade) : -1);
+  _fillSelect('setting-chip-loops', Number(r.chip_loops) || 0);
+  _fillSelect('setting-chip-fade', Number(r.chip_fade) >= 0 ? Number(r.chip_fade) : -1);
+  _fillSelect('setting-sid-fade', Number(r.sid_fade) || 0);
+}
+
+document.getElementById('btn-save-render-options')?.addEventListener('click', async () => {
+  const val = (id) => document.getElementById(id)?.value;
+  const renderers = {
+    amiga_resampler: val('setting-amiga-resampler') || 'auto',
+    stereo_width: Number(val('setting-stereo-width') ?? 100),
+    tracker_loops: Number(val('setting-tracker-loops') || 0),
+    tracker_fade: Number(val('setting-tracker-fade') ?? -1),
+    chip_loops: Number(val('setting-chip-loops') || 0),
+    chip_fade: Number(val('setting-chip-fade') ?? -1),
+    sid_fade: Number(val('setting-sid-fade') || 0),
+  };
+  try {
+    await api('/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ renderers }),
+    });
+    // The web player's default width is the server's: this page follows it now.
+    window.__sbConfig = { ...(window.__sbConfig || {}), stereo_width: renderers.stereo_width };
+    Player.setStereoWidth(Player.stereoWidthOwn);
+    showMsg('admin-render-options-msg',
+            'Saved. Tunes are rendered with these options from their next play; '
+            + 'the stereo width applies at once.', 'ok');
+  } catch (err) {
+    showMsg('admin-render-options-msg', `Save failed: ${err.message}`, 'err');
+  }
+});
+
 // ── SID fidelity (Renderers tab) ─────────────────────────────────────────────
 
 document.getElementById('btn-save-sidfid')?.addEventListener('click', async () => {
@@ -5320,6 +5535,66 @@ document.getElementById('btn-save-sidfid')?.addEventListener('click', async () =
   }
 });
 
+// ── MIDI synths (Renderers tab) ──────────────────────────────────────────────
+
+// The MT-32 ROM folder's state line: "not set", what libmt32emu found in it,
+// or why it can't be used (``GET /admin/mt32``; ``path``: a typed folder,
+// not saved yet).
+function _renderMt32State(st) {
+  const el = document.getElementById('mt32-rom-state');
+  if (!el) return;
+  el.classList.remove('mt32-ok', 'mt32-bad');
+  if (!st || st.state === 'not_set') {
+    el.textContent = 'MT-32 ROMs not set.';
+  } else if (st.state === 'ok') {
+    const machine = String(st.machine || '').toUpperCase().replace(/_/g, ' ');
+    el.textContent = `ROMs found: ${st.control || 'control ROM'} and ${st.pcm || 'PCM ROM'}`
+      + (machine ? ` (${machine})` : '') + '.';
+    el.classList.add('mt32-ok');
+  } else {
+    el.textContent = `MT-32 ROMs not usable: ${st.error || 'no ROMs found.'}`;
+    el.classList.add('mt32-bad');
+  }
+}
+
+async function loadMt32State(path) {
+  try {
+    const q = path === undefined ? '' : `?path=${encodeURIComponent(path)}`;
+    const res = await api(`/admin/mt32${q}`);
+    _renderMt32State(await res.json());
+  } catch {
+    _renderMt32State({ state: 'invalid', error: 'the server didn\u2019t answer.' });
+  }
+}
+
+document.getElementById('btn-check-mt32')?.addEventListener('click', () => {
+  const el = document.getElementById('setting-mt32-rom-dir');
+  loadMt32State((el?.value || '').trim());
+});
+
+document.getElementById('btn-save-midi-synths')?.addEventListener('click', async () => {
+  const midi = document.getElementById('setting-midi-synth')?.value || 'soundfont';
+  const game = document.getElementById('setting-game-midi-synth')?.value || 'opl3';
+  const dir = (document.getElementById('setting-mt32-rom-dir')?.value || '').trim();
+  try {
+    await api('/admin/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ renderers: {
+        midi_synth: midi, game_midi_synth: game, mt32_rom_dir: dir,
+      } }),
+    });
+    const mt32 = midi === 'mt32' || game === 'mt32';
+    showMsg('admin-midisynth-msg',
+            mt32 && !dir ? 'Saved. MT-32 ROMs not set — MT-32 songs won\u2019t play until '
+                           + 'you choose the ROM folder.'
+                         : 'Saved. Songs play on the new synth from their next play.', 'ok');
+    loadMt32State();
+  } catch (err) {
+    showMsg('admin-midisynth-msg', `Save failed: ${err.message}`, 'err');
+  }
+});
+
 // ── Renderer binary paths (Renderers tab) ────────────────────────────────────
 
 document.getElementById('btn-save-renderer-paths')?.addEventListener('click', async () => {
@@ -5327,7 +5602,8 @@ document.getElementById('btn-save-renderer-paths')?.addEventListener('click', as
   for (const name of ['uade123', 'gme', 'adplay', 'psgplay', 'sc68',
                       'zxtune123', 'kssrender', 'dsfrender',
                       'milkyrender', 'mlrender', 'mdxrender',
-                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender']) {
+                 'gt2reloc', 'sunvoxrender', 'furnace', 'xmprender', 'sawteethrender',
+                 'midirender']) {
     const el = document.getElementById(`setting-path-${name}`);
     if (el) renderers[`${name}_path`] = el.value.trim();
   }

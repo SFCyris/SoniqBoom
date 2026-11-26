@@ -69,8 +69,9 @@ def test_separate_subsonic_password_never_locks_the_account(env, users, monkeypa
 
 def test_locked_account_refuses_even_the_correct_fast_path_password(env, users, monkeypatch):
     _real_auth(monkeypatch)
+    # (the lockout is per client address — TestClient's peer is "testclient")
     for _ in range(15):
-        users.note_failed_attempt("bob")
+        users.note_failed_attempt("bob", client="testclient")
     assert users.is_locked("bob")
     assert env.fail("ping.view", u="bob", p="bobpass12")["code"] == 40
 

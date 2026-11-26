@@ -6,7 +6,8 @@
  * Exports: Player singleton
  */
 // version bump needed in index.html for player.js (queue/race/EQ chain fixes)
-import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, XMP_FORMAT_NAMES, Toast, subsongWireToTune, subsongStartOf, staticArtUrl } from './utils.js';
+import { TRACKER_FORMAT_NAMES, CHIP_FORMAT_NAMES, XMP_FORMAT_NAMES, ZX_FORMAT_NAMES, MIDI_FORMAT_NAMES, Toast, subsongWireToTune, subsongStartOf, staticArtUrl,
+         levelingGain, loudnessTuneKey, measuredLoudness } from './utils.js';
 // Experimental, flag-gated in-browser SID playback (see sid-wasm-player.js).
 // Remove the feature by deleting this import + the one branch it guards below.
 import { sidWasmPlaybackEnabled, isC64SidTrack, renderSidForPlayback,
@@ -429,7 +430,7 @@ export const Player = (() => {
   // FileResponse with Accept-Ranges — so they ARE natively seekable, not transcoded.
   // Using ?seek= on these does nothing; the server ignores that param for rendered formats.
   const RENDERED_SEEKABLE_FORMATS = new Set([
-    'SID', 'PSID', 'MIDI', 'MID',
+    'SID', 'PSID', 'MIDI', 'MID', ...MIDI_FORMAT_NAMES,
     ...TRACKER_FORMAT_NAMES,   // ProTracker, ScreamTracker 3, FastTracker 2, etc.
   ]);
 
@@ -445,8 +446,9 @@ export const Player = (() => {
     ['SID', 'PSID', 'MIDI', 'MID',
      'SNDH', 'YM', 'SC68',
      'PSF', 'PSF2', 'USF', 'GSF', '2SF', 'SSF', 'DSF (DREAMCAST)', 'NCSF', 'S98', 'V2M', 'MDX',
-     'SUNVOX', 'MGSDRV', 'GOATTRACKER', 'FAMITRACKER', 'DEFLEMASK', 'C64 SIDPLAYER', 'SAWTEETH',
-     ...TRACKER_FORMAT_NAMES, ...CHIP_FORMAT_NAMES, ...XMP_FORMAT_NAMES,
+     'SUNVOX', 'MGSDRV', 'GOATTRACKER', 'FAMITRACKER', 'DEFLEMASK', 'FURNACE', 'C64 SIDPLAYER',
+     'SAWTEETH', ...TRACKER_FORMAT_NAMES, ...CHIP_FORMAT_NAMES, ...XMP_FORMAT_NAMES,
+     ...ZX_FORMAT_NAMES, ...MIDI_FORMAT_NAMES,
     ].map(s => s.toUpperCase())
   );
   // The ~175 exotic-Amiga uade formats carry dynamic names ("TFMX Pro", …);
@@ -457,6 +459,23 @@ export const Player = (() => {
   // trackers, chip formats, Amiga modules).
   const _isRenderedTrack = (t) => !!t
     && (SERVER_RENDERED_FORMATS.has(String(t.format || '').toUpperCase()) || _isUadeAmiga(t));
+  // Endless play (``/api/stream/{id}/endless`` — core/endless.py): a looping
+  // tune the engine plays on through its own loop, seamless at the loop point,
+  // never faded.  Used for Repeat-One on such a tune, and for every such tune
+  // with "Play looping tunes endlessly" (``sb_endless``) on.  The trackers
+  // (libopenmpt), the libgme console formats and the uade Amiga formats; the
+  // server says no (422) for any other tune, which then plays as usual.
+  // SID repeats from its start (sidplayfp can't record endlessly).
+  const ENDLESS_KEY = 'sb_endless';
+  const _ENDLESS_FORMATS = new Set(
+    [...TRACKER_FORMAT_NAMES, 'NSF', 'NSFe', 'SPC', 'GBS', 'VGM', 'VGZ', 'AY', 'SAP', 'HES']
+      .map(s => s.toUpperCase()));
+  const _endlessCapable = (t) => !!t && !!t.id
+    && String(t.format || '').toUpperCase() !== 'HVL'
+    && (_ENDLESS_FORMATS.has(String(t.format || '').toUpperCase()) || _isUadeAmiga(t));
+  function _endlessPref() {
+    try { return localStorage.getItem(ENDLESS_KEY) === '1'; } catch (_) { return false; }
+  }
   // Show the "Rendering…" badge after this delay (ms).  Long enough that a
   // warm-cache hit — whose audio starts well under it — clears the timer
   // before it fires (no flash on replays), short enough that a cold render
@@ -736,6 +755,10 @@ export const Player = (() => {
     try {
       if (!_xfChain) {
         const src = ctx.createMediaElementSource(tail);
+        // (its own stereo-width stage — the outgoing track's width, see
+        // _applyStereoWidth — ahead of the EQ copy, as on the player's chain)
+        const wd = (typeof _mkWidthStage === 'function' && ctx.createChannelSplitter)
+          ? _mkWidthStage() : null;
         const pre = ctx.createGain();
         const eq = (eqFilters || []).map((f) => {
           const n = ctx.createBiquadFilter();
@@ -744,12 +767,14 @@ export const Player = (() => {
         });
         const rg = ctx.createGain();
         let node = src;
-        node.connect(pre); node = pre;
+        if (wd) { node.connect(wd.in); wd.out.connect(pre); } else node.connect(pre);
+        node = pre;
         for (const f of eq) { node.connect(f); node = f; }
         node.connect(rg);
         rg.connect(analyser || ctx.destination);
-        _xfChain = { pre, eq, rg };
+        _xfChain = { pre, eq, rg, wd };
       }
+      if (_xfChain.wd) _setWidthGains(_xfChain.wd, _widthOn ? _widthPct : 100, false);
       _xfChain.pre.gain.value = eqPreGain ? eqPreGain.gain.value : 1;
       _xfChain.eq.forEach((n, i) => { if (eqFilters[i]) n.gain.value = eqFilters[i].gain.value; });
       _xfChain.rg.gain.value = replayGain.gain.value;
@@ -1087,6 +1112,16 @@ export const Player = (() => {
   // analyser so the visualiser sees the levelled signal.  Default 1.0
   // (no adjustment) until a track exposes replaygain_* fields.
   let replayGain = null;
+  // Stereo width of a retro tune (rendered formats) — a mid/side matrix
+  // between the source and the EQ (_mkWidthStage), in the chain only while
+  // a width other than 100 % applies (_applyStereoWidth): at 100 % the chain
+  // is exactly the one without it.  The render stays the reference; the
+  // server's setting (/api/ui-config ``stereo_width``) or this browser's own
+  // (``sb_stereo_width``) says how wide it plays.
+  let _width = null;          // the stage on the player's chain
+  let _widthOn = false;       // spliced in (source → stage → eqPreGain)
+  let _widthPct = 100;        // the width it is set to
+  let _widthOffTimer = null;  // the unsplice after a ramp back to 100 %
 
   const EQ_BAND_DEFS = [
     { freq:    32, type: 'lowshelf',  Q: 1.0 },
@@ -1306,6 +1341,168 @@ export const Player = (() => {
       ctx.resume().catch(() => {});
     }
   });
+
+  // ── Stereo width (retro tunes) ────────────────────────────────────────────
+  // [width-core:begin] — what tests/js/stereo_width.test.mjs extracts and
+  // runs with a fake Web Audio graph; keep it self-contained.
+  const STEREO_WIDTH_KEY = 'sb_stereo_width';    // '' / unset: the server's setting
+  const WIDTH_RAMP_S = 0.03;                     // a change glides this long (no click)
+  const _clampWidth = (v) => Math.round(Math.max(0, Math.min(200, v)));
+  // This browser's own width (percent), or null: the server's.
+  function _ownWidth() {
+    let raw = null;
+    try { raw = localStorage.getItem(STEREO_WIDTH_KEY); } catch (_) {}
+    if (raw === null || raw === '') return null;
+    const v = Number(raw);
+    return Number.isFinite(v) ? _clampWidth(v) : null;
+  }
+  // The server's width (/api/ui-config, which the desktop page reads at
+  // start; a page that doesn't — the phone's — asks once, when a retro tune
+  // first needs it, and the width follows when the answer comes).
+  let _cfgAsked = false;
+  function _serverWidth() {
+    const cfg = window.__sbConfig || {};
+    if (!('stereo_width' in cfg) && !_cfgAsked) {
+      _cfgAsked = true;
+      fetch('/api/ui-config', { credentials: 'same-origin' }).then((r) => r.json()).then((c) => {
+        window.__sbConfig = { ...(window.__sbConfig || {}), stereo_width: c.stereo_width };
+        try { _applyStereoWidth(_track); } catch (_) {}
+      }).catch(() => {});
+    }
+    const v = Number(cfg.stereo_width);
+    return Number.isFinite(v) ? _clampWidth(v) : 100;
+  }
+  function _stereoWidthPct() {
+    const own = _ownWidth();
+    return own !== null ? own : _serverWidth();
+  }
+  // The width (percent) track ``t`` plays at: a retro tune's setting; 100 for
+  // anything else (ordinary audio, a station, the phone's radio).
+  function _widthFor(t) {
+    if (!t || _extAudio || _stationMode || !_isRenderedTrack(t)) return 100;
+    return _stereoWidthPct();
+  }
+  // L' = same·L + cross·R, R' = cross·L + same·R: the mid (L+R)/2 kept, the
+  // side (L−R)/2 scaled by w = pct / 100.  (1, 0) at 100 %, exactly.
+  function _widthGains(pct) {
+    const w = _clampWidth(pct) / 100;
+    return [(1 + w) / 2, (1 - w) / 2];
+  }
+  // The stage: a 2-channel "speakers" gain (a mono source is up-mixed to both
+  // sides first — a splitter alone leaves channel 1 silent), a splitter, the
+  // four matrix gains and a merger.
+  function _mkWidthStage() {
+    const up = ctx.createGain();
+    up.channelCount = 2;
+    up.channelCountMode = 'explicit';
+    up.channelInterpretation = 'speakers';
+    const split = ctx.createChannelSplitter(2);
+    const merge = ctx.createChannelMerger(2);
+    const ll = ctx.createGain(), lr = ctx.createGain(), rl = ctx.createGain(), rr = ctx.createGain();
+    ll.gain.value = rr.gain.value = 1;
+    lr.gain.value = rl.gain.value = 0;
+    up.connect(split);
+    split.connect(ll, 0); split.connect(rl, 0);
+    split.connect(lr, 1); split.connect(rr, 1);
+    ll.connect(merge, 0, 0); lr.connect(merge, 0, 0);
+    rl.connect(merge, 0, 1); rr.connect(merge, 0, 1);
+    return { in: up, out: merge, same: [ll, rr], cross: [lr, rl] };
+  }
+  function _setWidthGains(stage, pct, ramp) {
+    if (!stage) return;
+    const [a, b] = _widthGains(pct);
+    const now = ctx ? ctx.currentTime : 0;
+    for (const [nodes, v] of [[stage.same, a], [stage.cross, b]]) {
+      for (const n of nodes) {
+        const g = n.gain;
+        try {
+          g.cancelScheduledValues(now);
+          if (ramp && ctx && ctx.state === 'running') {
+            g.setValueAtTime(g.value, now);
+            g.linearRampToValueAtTime(v, now + WIDTH_RAMP_S);
+          } else {
+            g.value = v;
+          }
+        } catch (_) { g.value = v; }
+      }
+    }
+  }
+  // Put the width track ``t`` plays at on the chain: spliced in at its old
+  // value 100 % (the same sound) and glided to the new one; back at 100 % it
+  // glides there and is taken out again.
+  function _applyStereoWidth(t) {
+    if (!ctx || !source || !eqPreGain) return;
+    const want = _widthFor(t);
+    if (want === _widthPct && (_widthOn === (want !== 100))) return;
+    try {
+      if (!_width) _width = _mkWidthStage();
+      if (_widthOffTimer) { clearTimeout(_widthOffTimer); _widthOffTimer = null; }
+      if (want !== 100 && !_widthOn) {
+        _setWidthGains(_width, 100, false);
+        _widthOn = true;
+        try { _spliceSource(); } catch (e) { _widthOn = false; throw e; }
+      }
+      _widthPct = want;
+      _setWidthGains(_width, want, true);
+      if (want === 100 && _widthOn) {
+        const unsplice = () => {
+          _widthOffTimer = null;
+          if (_widthPct !== 100 || !_widthOn) return;
+          _widthOn = false;
+          try { _spliceSource(); } catch (_) {}
+        };
+        if (ctx.state === 'running') _widthOffTimer = setTimeout(unsplice, WIDTH_RAMP_S * 1000 + 20);
+        else unsplice();
+      }
+    } catch (e) {
+      console.warn('stereo width unavailable:', e);
+    }
+  }
+  // The one place the element's source is wired to the EQ: source →
+  // [voice gate → voice join] → [width stage] → eqPreGain, each stage there
+  // only while it applies.  Every stage (the width, the voice mixer's gate)
+  // changes its flag and calls this, so they compose and undo in any order;
+  // it remembers the links it made and touches only those (disconnecting a
+  // link that isn't there throws InvalidAccessError).
+  let _srcChain = null;       // the chain it last wired (null: source → eqPreGain)
+  const _srcLinks = (chain) => chain.slice(1).map((n, i) => [chain[i].out || chain[i], n.in || n]);
+  function _spliceSource() {
+    const want = [source];
+    if (_voiceGate) want.push(_voiceGate, _voiceJoin);
+    if (_widthOn && _width) want.push(_width);
+    want.push(eqPreGain);
+    const had = _srcLinks(_srcChain || [source, eqPreGain]), next = _srcLinks(want);
+    const has = (list, e) => list.some((x) => x[0] === e[0] && x[1] === e[1]);
+    for (const e of next) if (!has(had, e)) e[0].connect(e[1]);     // the new path first (no gap)
+    for (const e of had) if (!has(next, e)) e[0].disconnect(e[1]);
+    _srcChain = want;
+  }
+  // ── Voice mixer overlay (voices/mixer.js) ────────────────────────────────
+  // The mixer plays a render with voices muted in place of the track: its
+  // buffers go into the voice join, where the element's signal arrives
+  // through this gate — unity unless the mixer closes it — so both take the
+  // same path on (the width stage, the EQ) and the gate takes the element out
+  // of what is heard meanwhile.  Built on first use; the graph is unchanged
+  // until then.
+  let _voiceGate = null, _voiceJoin = null;
+  function voiceOverlay() {
+    _initAudioContext();
+    if (!ctx || !source || !eqPreGain) return null;
+    if (!_voiceGate) {
+      try {
+        _voiceGate = ctx.createGain();
+        _voiceJoin = ctx.createGain();
+        _spliceSource();
+      } catch (_) {
+        _voiceGate = _voiceJoin = null;
+        try { _spliceSource(); } catch (_) {}
+        return null;
+      }
+    }
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    return { ctx, input: _voiceJoin, gate: _voiceGate };
+  }
+  // [width-core:end]
 
   // ── Web Audio setup ───────────────────────────────────────────────────────
   function _initAudioContext() {
@@ -1548,6 +1745,9 @@ export const Player = (() => {
   // and neither does the row's stored length (it is the default tune's, or
   // one the server did not trust), so the length reads as unknown.
   let _provisional = false;
+  // The element plays the current track's endless stream (ENDLESS_KEY): no
+  // length, no end.
+  let _endlessOn = false;
   // A provisional "read to the end" WAV header makes the element claim hours
   // (0xFFFFFFFF bytes ≈ 6.8 h); no rendered tune is that long.  Caught here
   // too because the element reports it before the render-status watch answers.
@@ -1556,6 +1756,7 @@ export const Player = (() => {
     return _isRenderedTrack(_track) && isFinite(d) && d > PROVISIONAL_LENGTH_SEC;
   }
   function _duration() {
+    if (_endlessOn) return 0;               // (an endless stream has no end)
     if (_sidPartial && _sidTargetSec > 0) return _sidTargetSec;
     if (_provisional) return 0;
     if (_isTranscoded) return _metaDuration || 0;
@@ -1567,6 +1768,7 @@ export const Player = (() => {
   // while a growing render's provisional header is on the element — the
   // complete-file switch reloads it, and its real length is reported then.
   function _knownLength() {
+    if (_endlessOn) return 0;
     const d = audio.duration;
     if (!isFinite(d) || d <= 0 || _provisional || _provisionalLength(d)) return 0;
     return d;
@@ -1669,6 +1871,7 @@ export const Player = (() => {
       if (requestedTrackId !== trackId) return;   // user switched — abandon
       const j   = await res.json();
       if (requestedTrackId !== trackId) return;   // race after JSON parse
+      _takeLoudness(track, j);
 
       if (j.partial && j.cached_seconds > 0 && j.target_seconds > j.cached_seconds) {
         _sidPartial   = true;
@@ -1728,18 +1931,19 @@ export const Player = (() => {
 
   // ── ReplayGain helper ─────────────────────────────────────────────────────
   // Apply ReplayGain (track_gain / album_gain) from the track metadata to
-  // the post-EQ GainNode.  If the track object doesn't expose these
-  // fields (older library scans without RG tags read), default to unity
-  // gain so the listener hears no change.  Album-gain preferred when
-  // available so the relative track levels within an album are preserved;
-  // falls back to track-gain otherwise.
+  // the post-EQ GainNode — or, for a track without those tags, the loudness
+  // the server measured (``loudness``: SID, modules, chip rips, untagged
+  // files — core/loudness.py) — through ``utils.js levelingGain``.  With
+  // neither, unity gain.  Per album prefers the album gain (the relative
+  // levels within an album are kept), falling back to the track gain; Auto
+  // takes the album gain only while the queue plays an album in order.
   //
   // `replaygain_track_gain` / `replaygain_album_gain` are expected in dB
   // (the conventional Vorbis-comment format, e.g. "-6.8 dB" or the
-  // numeric value).  `replaygain_track_peak` is used for clip prevention:
-  // a +6 dB gain on a track that already peaks at 0.95 would clip, so we
-  // back off to keep peak <= 0.99.
-  const RG_KEY = 'sb_replaygain';        // 'off' | 'track' | 'album'
+  // numeric value).  `replaygain_track_peak` (a measurement's true peak) is
+  // used for clip prevention: a +6 dB gain on a track that already peaks at
+  // 0.95 would clip, so we back off to keep peak <= 0.99.
+  const RG_KEY = 'sb_replaygain';        // 'off' | 'track' | 'album' | 'auto'
   function _getRgMode() {
     const v = localStorage.getItem(RG_KEY);
     return v || 'album';                  // default: album-gain
@@ -1770,60 +1974,89 @@ export const Player = (() => {
     if (_track && _track.id === t.id) { try { _applyReplayGain(_track); } catch (_) {} }
   }
 
-  function _applyReplayGain(track) {
+  // Loudness the server measured (render-status ``loudness``, ``_noteLoudness``)
+  // for a tune whose track object carries none yet: `${id}~${tune key}` →
+  // { e: entry, seq: the play it was learnt in, early: learnt as that play
+  // started }.  One learnt late in a play levels the NEXT play of the tune —
+  // never this one (a re-apply mid-play — a render's peak, a switch to the
+  // cached render — must not change the level either).
+  const _loudSeen = new Map();
+  function _loudKey(t) { return t ? `${t.id}~${loudnessTuneKey(t)}` : ''; }
+  function _noteLoudness(t, entry, early) {
+    if (!t || !Array.isArray(entry) || !(entry.length >= 2)) return false;
+    const k = _loudKey(t);
+    if (_loudSeen.has(k)) return false;
+    _loudSeen.set(k, { e: entry, seq: _playSeq, early: !!early });
+    if (_loudSeen.size > 2000) _loudSeen.delete(_loudSeen.keys().next().value);
+    return true;
+  }
+  function _loudFor(t) {
+    const m = t ? _loudSeen.get(_loudKey(t)) : null;
+    return m && (m.early || m.seq !== _playSeq || _track !== t) ? m.e : null;
+  }
+  // 'auto': album gain while the queue plays an album in order (not shuffled,
+  // and the track before or after it in the queue is from the same album).
+  function _albumRun(track) {
+    if (shuffle || !track) return false;
+    const al = String(track.album || '').trim().toLowerCase();
+    if (!al) return false;
+    const i = queueIdx >= 0 && queue[queueIdx] && queue[queueIdx].id === track.id ? queueIdx
+            : queue.findIndex((q) => q && q.id === track.id);
+    if (i < 0) return false;
+    return [queue[i - 1], queue[i + 1]].some((q) => q && String(q.album || '').trim().toLowerCase() === al);
+  }
+
+  // ``ramp``: glide to the new gain (a measurement that came in as the track
+  // started) instead of a step.
+  function _applyReplayGain(track, { ramp = false } = {}) {
     if (!replayGain) return;             // Web Audio not initialised yet
+    // (the stereo width is the track's too — applied at the same moments)
+    try { _applyStereoWidth(_extAudio ? null : track); } catch (_) {}
     if (_extAudio) { replayGain.gain.value = 1.0; return; }   // the phone's radio plays through it
     const mode = _getRgMode();
-    const render = _renderGainFor(track);
-    if (mode === 'off' || !track) {
-      replayGain.gain.value = render;
-      return;
+    const g = levelingGain(track, mode, {
+      render: _renderGainFor(track),
+      measured: _loudFor(track),
+      albumRun: mode === 'auto' && _albumRun(track),
+    });
+    if (ramp && ctx && typeof replayGain.gain.setTargetAtTime === 'function') {
+      try {
+        replayGain.gain.cancelScheduledValues(ctx.currentTime);
+        replayGain.gain.setTargetAtTime(g, ctx.currentTime, 0.08);
+        return;
+      } catch (_) { /* (an old engine) — set it */ }
     }
-    const albumDb   = _parseRgDb(track.replaygain_album_gain);
-    const trackDb   = _parseRgDb(track.replaygain_track_gain);
-    const albumPeak = _parseRgDb(track.replaygain_album_peak);
-    const trackPeak = _parseRgDb(track.replaygain_track_peak);
-    // Prefer the selected mode's gain; fall back to the other tag so a track
-    // tagged for only one still gets levelled (better than unity).  Pair each
-    // gain WITH ITS OWN peak (album gain ↔ album peak, track gain ↔ track peak)
-    // so the 0.99/peak clip headroom below matches the gain actually applied —
-    // and carry that source's peak through the fallback, never a mismatched one.
-    let db, peak;
-    if (mode === 'album') {
-      if (albumDb !== null) { db = albumDb; peak = albumPeak; }
-      else                  { db = trackDb; peak = trackPeak; }
-    } else {                          // 'track'
-      if (trackDb !== null) { db = trackDb; peak = trackPeak; }
-      else                  { db = albumDb; peak = albumPeak; }
+    // (an earlier glide still scheduled would otherwise go on under the new value)
+    try { if (ctx) replayGain.gain.cancelScheduledValues(ctx.currentTime); } catch (_) {}
+    replayGain.gain.value = g;
+  }
+
+  // A track with no ReplayGain tags and no measured loudness on its object:
+  // ask the server (render-status carries a measurement it holds) as the play
+  // starts, so a tune measured since the queue was loaded is levelled from
+  // its first second.  An answer that comes in after the first second of
+  // playback is kept for the next play instead of changing the level mid-way.
+  const LOUD_LATE_SEC = 1.0;
+  function _fetchLoudness(t, seq) {
+    if (!t || !t.id || _getRgMode() === 'off') return;
+    if (_parseRgDb(t.replaygain_track_gain) !== null || _parseRgDb(t.replaygain_album_gain) !== null) return;
+    if (measuredLoudness(t) || _loudSeen.has(_loudKey(t))) return;
+    fetch(`/api/stream/${encodeURIComponent(t.id)}/render-status${_subQs(t)}`,
+          { cache: 'no-store', credentials: 'same-origin' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => { if (j) _takeLoudness(t, j, seq); })
+      .catch(() => {});
+  }
+  // A render-status answer ``j`` about ``t``: keep its measurement and level the
+  // current play by it while that play is still at its start.
+  function _takeLoudness(t, j, seq) {
+    if (!j || !Array.isArray(j.loudness)) return;
+    const now = _track === t && trackId === t.id && (seq === undefined || seq === _playSeq)
+        && !_stationMode && (audio.currentTime || 0) < LOUD_LATE_SEC;
+    if (!_noteLoudness(t, j.loudness, now)) return;
+    if (now) {
+      try { _applyReplayGain(_track, { ramp: !audio.paused }); } catch (_) {}
     }
-    // If the mode-matched peak is missing, fall back to whichever peak IS
-    // tagged so clip protection still engages — a file tagged with a gain but
-    // no matching peak would otherwise apply that gain UNCAPPED (bounded only
-    // by the +12 dB hard cap below) and a hot master could clip. The other
-    // scope's peak is an imperfect but safe-enough ceiling; unity has none.
-    if (peak === null || peak === undefined) {
-      peak = (trackPeak !== null && trackPeak !== undefined) ? trackPeak
-           : ((albumPeak !== null && albumPeak !== undefined) ? albumPeak : null);
-    }
-    if (db === null || db === undefined) {
-      // No tags — leave the chain at unity gain (but an overloaded render's).
-      replayGain.gain.value = render;
-      return;
-    }
-    // Convert dB → linear: 10^(dB/20).
-    let linear = Math.pow(10, db / 20);
-    // Clip protection: if the track has a known peak, cap the gain so
-    // the post-gain peak stays under 0.99 — otherwise a positive RG
-    // value on a hot master could clip the output.
-    if (peak !== null && peak > 0) {
-      const maxLinear = 0.99 / peak;
-      if (linear > maxLinear) linear = maxLinear;
-    }
-    // Hard sanity cap regardless of metadata — never apply > +12 dB.
-    linear = Math.max(0.001, Math.min(linear, 3.98));
-    // Defence in depth: a non-finite value would throw on gain.value assignment.
-    if (!Number.isFinite(linear)) linear = 1.0;
-    replayGain.gain.value = linear * render;
   }
 
   // ── Internet-radio station mode ────────────────────────────────────────────
@@ -1872,6 +2105,10 @@ export const Player = (() => {
 
   async function playStation(station, relayUrl, codec = '') {
     _noteStart();
+    // The library track a station replaces is parked like the phone's
+    // (_parkForExternalAudio): Play after the station stops resumes it where it
+    // was.  Station → station keeps the first park (trackId is already null).
+    if (!_stationMode && !_extAudio) _parkForExternalAudio();
     _stationMode  = true;
     _suppressBufferingBadge = false;   // stations surface their own status
     _station      = station;
@@ -1952,7 +2189,11 @@ export const Player = (() => {
     // as playStation's teardown.  Without it the last station's decoder/socket
     // leaks until GC.
     audio.load();
+    // The synthetic station "track" goes with the station: the bar paints the
+    // cued queue entry (app.js _paintCued is skipped while a track is current).
+    if (_track && _track.station) _track = null;
     emit('statechange', { playing: false });
+    _emitCue();                  // the parked queue entry is what Play starts now
   }
 
   // ── Core playback ─────────────────────────────────────────────────────────
@@ -2003,6 +2244,7 @@ export const Player = (() => {
     _suppressBufferingBadge = _serverRendered;
     trackId        = track.id;
     _playRecorded  = false;
+    _fetchLoudness(track, attempt);   // (a tune measured since its row was loaded)
     _resetSidPartial();
 
     // Crossfade: the start it asked for keeps the fade (this track fades in);
@@ -2053,8 +2295,9 @@ export const Player = (() => {
       if (track.id) {
         const base = `${location.origin}/api/art/${encodeURIComponent(track.id)}`;
         artwork.push(
-          { src: `${base}/sm.jpg`, sizes: '256x256', type: 'image/jpeg' },
-          { src: `${base}/lg.jpg`, sizes: '512x512', type: 'image/jpeg' },
+          // (``fallback=placeholder``: see app.js glowSrc)
+          { src: `${base}/sm.jpg?fallback=placeholder`, sizes: '256x256', type: 'image/jpeg' },
+          { src: `${base}/lg.jpg?fallback=placeholder`, sizes: '512x512', type: 'image/jpeg' },
         );
       } else if (track.cover_art) {
         artwork.push({ src: staticArtUrl(track.cover_art), sizes: '512x512', type: 'image/jpeg' });
@@ -2143,6 +2386,9 @@ export const Player = (() => {
         audio.src = _activeBlobUrl;
       } else {
         _dropNextPreload();                 // stale preload for some other track/tune
+        // Repeat-One / "endlessly" on a looping tune: its endless stream.
+        _endlessOn = _endlessWanted(track) && await _endlessOk(track);
+        if (attempt !== _playSeq) return;
         audio.src = _streamUrlFor(track.id);
       }
     }
@@ -2182,7 +2428,7 @@ export const Player = (() => {
       const fmt = (track.format || '').toUpperCase();
       if (fmt === 'SID' || fmt === 'PSID') {
         _checkSidPartial(track);
-      } else {
+      } else if (!_endlessOn) {
         _watchRenderLength(track, attempt);   // a growing render of unknown length
       }
     } catch (err) {
@@ -2753,6 +2999,7 @@ export const Player = (() => {
           if (r.ok) j = await r.json();
         } catch (_) { /* transient — ask again */ }
         if (!current()) return;
+        if (j) _takeLoudness(t, j, seq);
         // A provisional header's length is far off: hours, or none at all.
         const d = audio.duration;
         const exact = (j && Number(j.duration_seconds)) || 0;
@@ -3696,7 +3943,11 @@ export const Player = (() => {
     }
     if (cur < 0) return null;                    // the current entry is not a library track
     const entry = queue[queueIdx];
-    const sec = (entry && trackId === entry.id) ? (_currentTime() || 0) : 0;
+    // Loaded: where it is now.  Cued (a queue resumed from another device, or
+    // the track a station parked): the place Play will start it at, so saving
+    // never overwrites a resumable position with 0.
+    const sec = (entry && trackId === entry.id) ? (_currentTime() || 0)
+      : (_resumeAt && _resumeAt.entry === entry) ? (Number(_resumeAt.sec) || 0) : 0;
     return { ids, current_index: cur, position: Math.max(0, Math.round(sec * 1000)),
              client: _qsyncClient() };
   }
@@ -3846,8 +4097,8 @@ export const Player = (() => {
   // The queue's current entry while nothing is loaded yet (a queue restored
   // after a reload, or resumed from another device): what Play starts \u2014
   // playPause's own test.  null while a track is loaded or starting (trackId is
-  // set at once), while radio owns the output (its takeover leaves trackId on
-  // the old entry), or with no queue.
+  // set at once), while radio owns the output (_extAudio; its takeover parks
+  // the track — _parkForExternalAudio), or with no queue.
   function _cuedTrack() {
     if (_extAudio || _stationMode || audio.getAttribute('src')) return null;
     const cur = queue.length ? queue[Math.max(0, queueIdx)] : null;
@@ -4068,10 +4319,30 @@ export const Player = (() => {
       _clearSource();
       queue    = [];
       queueIdx = -1;
+      _resumeAt = null;              // (no entry left to resume)
       _cancelCrossfade();
+      // A station owns the element (desktop _stationMode, the phone's radio
+      // _extAudio): clearing the queue clears the queue only — the station
+      // plays on, its key keeps showing ❚❚.
+      if (_stationMode || _extAudio) {
+        emit('queuechange', { queue, queueIdx });
+        _emitCue();
+        _saveQueueSoon();
+        return;
+      }
       try { audio.pause(); } catch (_) {}
       audio.removeAttribute('src');
       emit('queuechange', { queue, queueIdx });
+      // Stopped: the element's own 'pause' says nothing to the UI, so the Play
+      // key, the OS media controls and every other 'statechange' listener are
+      // told here — a queue cleared mid-play left the key showing ❚❚.  (Not
+      // while the phone's radio owns the output: it plays on.)
+      if (!_extAudio) {
+        emit('statechange', { playing: false });
+        try {
+          if (typeof navigator !== 'undefined' && navigator.mediaSession) navigator.mediaSession.playbackState = 'none';
+        } catch (_) { /* not supported */ }
+      }
       _saveQueueSoon();
       return;
     }
@@ -4480,10 +4751,37 @@ export const Player = (() => {
     _extAudio = !!v;
     if (_extAudio) _cancelCrossfade();   // (the output went elsewhere: no tail fading on here)
     if (_extAudio) _noteStart();     // the phone's radio took the output
+    if (_extAudio) _parkForExternalAudio();
     if (_extAudio && replayGain) replayGain.gain.value = 1.0;   // (routeExternalAudio's listener)
     // Back to the library: its track's gain again (routeExternalAudio held it
     // at 1 — also for a tune-in that never went live and left the track loaded).
     if (!_extAudio) { try { _applyReplayGain(_track); } catch (_) { /* never fatal */ } }
+    if (!_extAudio) _emitCue();      // (the parked entry is what Play starts now)
+  }
+  // The phone's radio is about to detach this element (it clears ``src`` once
+  // the station plays): the track loaded here is PARKED like a queue restored
+  // after a reload — nothing loaded (trackId / _track cleared), the queue's
+  // current entry cued (``_cuedTrack``) at the place it had reached
+  // (``_resumeAt``; not when that entry isn't the track that played, or the
+  // track was at its end).  So Play after the station stops starts that entry
+  // there, where it used to do nothing (playPause saw no source and the old
+  // trackId on the entry).  The desktop's playStation parks the same way, so
+  // its Play after a station also resumes the entry at its place.
+  // A second station (already parked) changes nothing.
+  function _parkForExternalAudio() {
+    if (!trackId) return;
+    const entry = queue.length ? queue[Math.max(0, queueIdx)] : null;
+    const same = !!entry && typeof entry === 'object' && !!_track && (entry === _track
+      || (entry.id === _track.id && (entry.subsong ?? null) === (_track.subsong ?? null)));
+    // (a resumed entry still loading has its place in _resumeSeek, not yet on
+    // the element: keep that, or the station would cost it and the next queue
+    // save would write 0 over the other device's place)
+    const pending = (_resumeSeek && _resumeSeek.seq === _playSeq) ? (Number(_resumeSeek.sec) || 0) : 0;
+    const sec = same ? Math.max(Number(_currentTime()) || 0, pending) : 0;
+    const len = Number(entry && entry.duration) || 0;
+    _resumeAt = (same && sec > 1 && !(len > 0 && sec >= len - 1)) ? { entry, sec } : null;
+    trackId = null;
+    _track = null;
   }
 
   function toggleRepeat() {
@@ -4492,6 +4790,25 @@ export const Player = (() => {
     return repeatMode;
   }
   // [queue-core:end]
+
+  // The repeat button: ``toggleRepeat``, and out of Repeat-One while the tune
+  // plays endlessly (with "endlessly" off) back on its usual stream where it
+  // is — or, past its own length, on to what comes next.
+  function _toggleRepeatButton() {
+    const mode = toggleRepeat();
+    if (mode !== 'one' && _endlessOn && !_endlessPref()) {
+      try { _leaveEndless(); } catch (_) {}
+    }
+    return mode;
+  }
+  function _leaveEndless() {
+    const at = _currentTime();
+    const len = Number(_track && _track.duration) || 0;
+    if (len > 0 && at < len - 1) { _setEndless(false, at); return; }
+    _endlessOn = false;
+    if (repeatMode === 'all' || _hasNextTrack()) _advance();
+    else { audio.pause(); emit('statechange', { playing: false }); }
+  }
 
   // A reload / tab close inside the 250 ms debounce (or in a background tab,
   // where timers are throttled) must not lose the latest queue state.
@@ -4513,6 +4830,7 @@ export const Player = (() => {
       current,
       duration: dur,
       pct: dur ? Math.min(100, (current / dur) * 100) : 0,
+      endless: _endlessOn,
     });
     _maybeCrossfade(dur, current);
     _maybeGaplessPreload(dur, current);
@@ -4601,6 +4919,7 @@ export const Player = (() => {
       current,
       duration: dur,
       pct: dur ? Math.min(100, (current / dur) * 100) : 0,
+      endless: _endlessOn,
     });
   });
 
@@ -4836,6 +5155,16 @@ export const Player = (() => {
           fetch(`/api/tracks/${t.id}/waveform`, { cache: 'no-cache', priority: 'low' })
             .catch(() => {});
         } catch { /* ignore */ }
+        // A file without ReplayGain tags or a measured loudness: the server's
+        // look-ahead measures it now (its prewarm of a native file does only
+        // that), so it plays levelled (core/loudness.py).
+        if (_getRgMode() !== 'off' && !measuredLoudness(t)
+            && _parseRgDb(t.replaygain_track_gain) === null && _parseRgDb(t.replaygain_album_gain) === null) {
+          try {
+            fetch(_prewarmUrl(t, true), { method: 'POST', cache: 'no-store', priority: 'low' })
+              .catch(() => {});
+          } catch { /* ignore */ }
+        }
       } else {
         // Server-side cached transcode/render prewarm.  Renders are heavy:
         // one track ahead (the NEXT one, served first), a second only for a
@@ -5008,6 +5337,12 @@ export const Player = (() => {
     if (_crossfading) { _crossfading = false; return; }
     if (repeatMode === 'one') {
       _seekOffset = 0;
+      if (!_endlessOn && _endlessWanted(_track)) {
+        // (Repeat-One switched on during the play: from here on the tune
+        // repeats through its own loop, without a gap)
+        _setEndless(true, 0);
+        return;
+      }
       audio.currentTime = 0;
       audio.play().catch(() => {});
     } else if (repeatMode === 'all' || _hasNextTrack()) {
@@ -5038,7 +5373,55 @@ export const Player = (() => {
     } catch (_) { /* quota / private-mode — best effort */ }
   }
   /** Public hook used by ``playTrack`` to apply the persistent mark. */
+  function _endlessWanted(t) {
+    return (repeatMode === 'one' || _endlessPref()) && _endlessCapable(t)
+      && !_stationMode && !_extAudio && !_isDownloaded(t.id);
+  }
+  function _endlessUrl(id) {
+    const qs = new URLSearchParams();
+    if (_track && _track.id === id && Number.isInteger(_track.subsong)) qs.set('subsong', String(_track.subsong));
+    qs.set('pg', PREWARM_PAGE_ID);
+    return `/api/stream/${id}/endless?${qs}`;
+  }
+  // Does the server play ``t`` endlessly?  A 1-byte Range GET inside the WAV
+  // header: it starts no engine.
+  async function _endlessOk(t) {
+    try {
+      const r = await fetch(_endlessUrl(t.id), { headers: { Range: 'bytes=0-0' },
+                                                credentials: 'same-origin', cache: 'no-store' });
+      return r.status === 206;
+    } catch (_) { return false; }
+  }
+  // Move the playing track onto its endless stream from ``at`` seconds (the
+  // same timeline: the engine starts there), or off it back onto the usual
+  // stream (``on`` false) — the track then ends at its own length.
+  async function _setEndless(on, at) {
+    if (!trackId || !_track || _stationMode || _extAudio) return;
+    const id = trackId, seq = _playSeq;
+    if (on && !(await _endlessOk(_track))) {
+      if (trackId === id && _playSeq === seq) { audio.currentTime = 0; audio.play().catch(() => {}); }
+      return;
+    }
+    if (trackId !== id || _playSeq !== seq) return;
+    _endlessOn = !!on;
+    const wasPlaying = !audio.paused || on;
+    audio.pause();
+    audio.src = _streamUrlFor(id);
+    audio.load();
+    if (at > 0) {
+      await new Promise((res) => {
+        const done = () => { audio.removeEventListener('loadedmetadata', done); res(); };
+        audio.addEventListener('loadedmetadata', done);
+        setTimeout(done, 8000);
+      });
+      if (trackId !== id || _playSeq !== seq) return;
+      try { audio.currentTime = at; } catch (_) {}
+    }
+    if (wasPlaying) audio.play().catch(() => {});
+  }
+
   function _streamUrlFor(id) {
+    if (_endlessOn && _track && _track.id === id) return _endlessUrl(id);
     const params = {};
     if (_forcedIds.has(id)) params.force_transcode = '1';
     // Subsong is 0-based on the wire (matches the server's ?subsong=).  The
@@ -5361,7 +5744,7 @@ export const Player = (() => {
     // The EQ band definitions {freq, type, Q} (exist before the graph does).
     get eqBandDefs()     { return EQ_BAND_DEFS.map(d => ({ ...d })); },
     eqTaps, releaseEqTaps,
-    vuTaps, releaseVuTaps, routeExternalAudio,
+    vuTaps, releaseVuTaps, routeExternalAudio, voiceOverlay,
     get replayGain()     { return replayGain; },
     get currentTrackId() { return trackId; },
     // The track the now-playing markers show: the current one, unless its
@@ -5424,7 +5807,7 @@ export const Player = (() => {
     // What Play starts while nothing is loaded (a restored / resumed queue), and where.
     get cuedTrack()          { return _cuedTrack(); },
     get cuedSec()            { return _cuedSec(); },
-    toggleShuffle, toggleRepeat, setRadioActive, suspendForExternalAudio,
+    toggleShuffle, toggleRepeat: _toggleRepeatButton, setRadioActive, suspendForExternalAudio,
     // Stop the transcode-status poll + WS-fallback watchdog and abort any
     // in-flight transcode-status fetch.  Called by app.js's
     // _cancelAncillaryFetches() on folder navigation to free a browser
@@ -5472,9 +5855,30 @@ export const Player = (() => {
     },
     get crossfade()          { return _getCrossfade(); },
     setCrossfade(sec)        { localStorage.setItem(CROSSFADE_KEY, String(Math.max(0, Math.min(12, sec)))); },
+    // Stereo width of retro tunes, percent: this browser's own (null: the
+    // server's setting) — ``setStereoWidth(null)`` follows the server again.
+    // Endless play of looping tunes in this browser (see ENDLESS_KEY), and
+    // whether the current track plays endlessly now.
+    get endlessPref()        { return _endlessPref(); },
+    setEndlessPref(on)       { try { localStorage.setItem(ENDLESS_KEY, on ? '1' : '0'); } catch (_) {} },
+    get endless()            { return _endlessOn; },
+    get stereoWidthOwn()     { return _ownWidth(); },
+    get stereoWidth()        { return _stereoWidthPct(); },
+    setStereoWidth(pct)      {
+      try {
+        if (pct === null || pct === undefined || pct === '') localStorage.removeItem(STEREO_WIDTH_KEY);
+        else localStorage.setItem(STEREO_WIDTH_KEY, String(_clampWidth(Number(pct))));
+      } catch (_) {}
+      try { _applyStereoWidth(_track); } catch (_) {}
+    },
+    // What the chain does now (tests, diagnostics): {pct, on, same, cross}.
+    widthState()             {
+      const g = _width ? [_width.same[0].gain.value, _width.cross[0].gain.value] : [1, 0];
+      return { pct: _widthPct, on: _widthOn, same: g[0], cross: g[1] };
+    },
     get replayGainMode()     { return _getRgMode(); },
     setReplayGainMode(m)     {
-      const next = (m === 'off' || m === 'track' || m === 'album') ? m : 'album';
+      const next = (m === 'off' || m === 'track' || m === 'album' || m === 'auto') ? m : 'album';
       localStorage.setItem(RG_KEY, next);
       // Re-apply for the currently loaded track so the user hears the
       // change immediately instead of waiting for the next track.

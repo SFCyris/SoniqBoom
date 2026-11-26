@@ -48,8 +48,10 @@ async def test_pipe_render_is_byte_identical_to_uades_own_wav(tmp_path):
     ref = tmp_path / "ref.wav"
     # Same invocation as the renderer: in the module's folder, by bare name
     # (the emulated player sees the name, so the path changes the output).
+    # (Paula's own stereo since 2.3.0: render_options.UADE_STEREO_ARGS)
+    from soniqboom.core.render_options import UADE_STEREO_ARGS
     proc = await asyncio.create_subprocess_exec(
-        "uade123", "-1", "--filter=A1200", "--headphones", "-e", "wav",
+        "uade123", "-1", "--filter=A1200", *UADE_STEREO_ARGS, "-e", "wav",
         "-f", str(ref), "--", DW.name, cwd=str(DW.parent),
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
     await proc.wait()

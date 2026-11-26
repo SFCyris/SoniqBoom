@@ -149,9 +149,10 @@ class _Hold:
         self.reached, self.go = threading.Event(), threading.Event()
         taken = threading.Lock()
         held: list = []
-        real = fstree.TrackMeta
+        real = fstree.public_track
 
-        def make(**kw):
+        def make(d):
+            kw = dict(d)                 # (the row's values, read before the hold)
             if (threading.current_thread() is not threading.main_thread()
                     and kw.get("path") == path):
                 with taken:
@@ -160,9 +161,8 @@ class _Hold:
                 if hold:
                     self.reached.set()
                     self.go.wait(10)
-            return real(**kw)
-        make.model_fields = real.model_fields
-        monkeypatch.setattr(fstree, "TrackMeta", make)
+            return real(kw)
+        monkeypatch.setattr(fstree, "public_track", make)
 
     async def reached_it(self) -> None:
         assert await asyncio.to_thread(self.reached.wait, 10), "the build never got there"

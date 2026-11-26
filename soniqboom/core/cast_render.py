@@ -49,7 +49,10 @@ log = logging.getLogger(__name__)
 # the FastAPI router registration in main.py).
 
 from soniqboom.core.metadata import SID_EXTS as _SID_EXTS   # .sid / .psid / .rsid
-_MIDI_EXTS = {".mid", ".midi"}
+from soniqboom.core import metadata as _md                   # noqa: E402
+# (Standard MIDI files and the game MIDI formats; a DMX MUS by its routing
+# name, ``stream._DMXMUS_ROUTE`` — ``_is_dmx_mus``)
+_MIDI_EXTS = {*_md._MIDI_EXTS, *_md.GAME_MIDI_EXTS, ".dmxmus"}
 # AHX needs uade123, NOT openmpt123.  HVL (HivelyTracker) needs the bundled
 # hvl2wav (neither uade nor openmpt decodes it).  Both kept separate from the
 # openmpt-handled tracker set so the cast dispatcher picks the right renderer.
@@ -73,10 +76,20 @@ _TRACKER_EXTS |= set(_TRACKER_ALT_EXTS)       # (.ptm, OctaMED's / ChipTracker's
 # remote one is fetched before it is told apart.
 from soniqboom.core.metadata import XMP_EXT_NAMES as _XMP_NAMES, PW_EXT_NAMES as _PW_NAMES  # noqa: E402
 _ONE_TUNE_ROUTE_EXTS = {".mdx", ".sunvox", ".mgs", ".goattracker", ".famitracker", ".deflemask",
-                        ".sidplayer", ".sawteeth",
+                        ".sidplayer", ".sawteeth", ".fur",
                         *_XMP_NAMES, *_PW_NAMES}
-_ONE_TUNE_SUFFIXES = {".mdx", ".sunvox", ".mgs", ".sng", ".ftm", ".dmf", ".mus", ".st", *_XMP_NAMES,
-                      *_PW_NAMES}
+_ONE_TUNE_SUFFIXES = {".mdx", ".sunvox", ".mgs", ".sng", ".ftm", ".dmf", ".mus", ".st", ".fur",
+                      *_XMP_NAMES, *_PW_NAMES}
+
+
+def _is_dmx_mus(track_id: str, track_path: str, ext: str) -> bool:
+    """Is this ``.mus`` a DMX MUS song (the MIDI route — its record's format:
+    ``stream._render_ident``)?"""
+    if ext != ".mus":
+        return False
+    from soniqboom.api.stream import _DMXMUS_ROUTE, _render_ident
+    from soniqboom.core.store import get_store
+    return _render_ident(track_path or "", get_store().get_track(track_id))[0] == _DMXMUS_ROUTE
 # Stream-supported libgme containers (matches _GME_EXTS_STREAM in stream.py).
 _GME_EXTS = {
     ".nsf", ".nsfe", ".spc", ".gbs", ".vgm", ".vgz",
@@ -86,18 +99,48 @@ _GME_EXTS = {
 
 def is_rendered_format(source_ext: str) -> bool:
     """True if ``source_ext`` needs an external renderer before
-    ffmpeg can ingest it."""
+    ffmpeg can ingest it — every suffix the web player renders
+    (``stream._is_rendered_ext``: also the PSF family, SNDH, YM, SC68, AdLib
+    and the uade suffix formats, which until 2.3.0 reached ffmpeg raw and
+    cast 0 bytes).  An Amiga prefix-form name (``mdat.song``) or a Dreamcast
+    ``.dsf`` rip is told by ``is_rendered_source``."""
     e = (source_ext or "").lower()
     if not e.startswith("."):
         e = "." + e
-    return (e in _SID_EXTS
+    if (e in _SID_EXTS
             or e in _MIDI_EXTS
             or e in _UADE_EXTS
             or e in _HVL_EXTS
             or e in _TRACKER_EXTS
             or e in _GME_EXTS
             or e in _ONE_TUNE_ROUTE_EXTS
-            or e in _ONE_TUNE_SUFFIXES)
+            or e in _ONE_TUNE_SUFFIXES):
+        return True
+    from soniqboom.api.stream import _is_rendered_ext
+    return _is_rendered_ext(e)
+
+
+async def is_rendered_source(track_path: str, track=None,
+                             local_path: "Path | None" = None) -> bool:
+    """Does this track need a renderer before ffmpeg can ingest it?  By its
+    suffix (``is_rendered_format``), its name (``stream._render_ident``: an
+    Amiga prefix-form module, a SoundFactory ``.psf``), or — for ``.dsf`` —
+    the local file's magic (a Dreamcast rip, not DSD audio)."""
+    from soniqboom.api.stream import _dsf_is_dreamcast, _is_rendered_ext, _render_ident
+    ext, uade_named = _render_ident(track_path or "", track)
+    if uade_named or is_rendered_format(ext) or _is_rendered_ext(ext, uade_named):
+        return True
+    if ext == ".dsf" and local_path is not None:
+        return await asyncio.to_thread(_dsf_is_dreamcast, Path(local_path))
+    return False
+
+
+# (track id, subsong as asked) → the cache key the last chip-family render
+# of it was made under (``prepare_source_for_stream``) — a PSF-route render's
+# variant depends on the file (``stream._route_variant``), so
+# ``rendered_cache_key`` reads it back here.  Bounded.
+_CHIP_KEYS: "dict[tuple[str, int], str]" = {}
+_CHIP_KEYS_MAX = 2048
 
 
 def one_tune_route(track_id: str, track_path: str, track=None) -> "str | None":
@@ -127,9 +170,17 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
     if not e.startswith("."):
         e = "." + e
     from soniqboom.core.conversion_cache import _cache_key
+    hit = _CHIP_KEYS.get((track_id, int(subsong or 0)))
+    if hit is not None:
+        return hit            # (a chip-family render made here: its very key)
     if e in _ONE_TUNE_ROUTE_EXTS:
-        from soniqboom.api.stream import _own_engine, _own_variant
-        return _cache_key(track_id, "psf", subsong=0, variant=_own_variant(_own_engine(e)[0]))
+        from soniqboom.api.stream import _own_engine, _own_variant, _psf_tuned, tune_index
+        from soniqboom.core.store import get_store
+        rec = get_store().get_track(track_id)
+        tuned = _psf_tuned(e, rec)          # (a GoatTracker / FamiTracker tune of several)
+        return _cache_key(track_id, "psf",
+                          subsong=tune_index(track_id, rec, subsong or None) if tuned else 0,
+                          variant=_own_variant(_own_engine(e)[0]), tuned=tuned)
     # ``subsong`` 0 is the bare play: the file's default tune, which for a
     # multi-tune Amiga / libgme file may not be its first (``stream.tune_index``).
     # SID maps the wire itself.
@@ -139,12 +190,14 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
         subsong = tune_index(track_id, get_store().get_track(track_id), subsong or None)
     if e in _SID_EXTS:
         from soniqboom.config import settings
+        from soniqboom.api.stream import sid_stereo_by_id
         dur = int(getattr(settings, "sid_default_duration", 180))
-        return _cache_key(track_id, "sid", subsong=subsong, duration=dur)
+        return _cache_key(track_id, "sid", subsong=subsong, duration=dur,
+                          variant="st" if sid_stereo_by_id(track_id) else None)
     if e in _MIDI_EXTS:
-        from soniqboom.config import get_active_soundfont
-        sf = get_active_soundfont()
-        return _cache_key(track_id, "midi", soundfont_path=str(sf) if sf else "")
+        # (the synth it plays on now: ``stream.midi_variant``)
+        from soniqboom.api.stream import midi_variant
+        return _cache_key(track_id, "midi", soundfont_path=midi_variant(e))
     if e in _HVL_EXTS:
         return _cache_key(track_id, "hvl", subsong=subsong)
     if e in _UADE_EXTS:
@@ -153,12 +206,36 @@ def rendered_cache_key(track_id: str, source_ext: str, subsong: int = 0) -> str 
         # module numbered from 1.
         from soniqboom.api.stream import uade_cache_key_known
         return uade_cache_key_known(track_id, subsong)
-    if e in _TRACKER_EXTS:
+    if e in _TRACKER_EXTS and e != ".imf":           # (.imf: AdLib or tracker, below)
         return _cache_key(track_id, "tracker", subsong=subsong)
     if e in _GME_EXTS:
         from soniqboom.api.stream import _gme_variant
         return _cache_key(track_id, "gme", subsong=subsong, variant=_gme_variant(e))
-    return None
+    # The families cast renders through the web player's dispatch
+    # (``stream.render_chip_family``), by name: SNDH, YM, SC68, AdLib / IMF,
+    # the uade family (by its known subsong base).  A PSF-route render's key
+    # needs its file (``_CHIP_KEYS`` above has it once rendered here).
+    from soniqboom.api.stream import (
+        _ADLIB_EXTS, _SC68_EXTS, _SNDH_EXTS, _YM_EXTS, _render_ident, chip_family_key)
+    from soniqboom.core.store import get_store
+    track = get_store().get_track(track_id)
+    ident, uade_named = _render_ident((track or {}).get("path") or e, track)
+    if ident in _MIDI_EXTS:
+        from soniqboom.api.stream import midi_variant
+        return _cache_key(track_id, "midi", soundfont_path=midi_variant(ident))
+    fam = ("sndh" if ident in _SNDH_EXTS else "ym" if ident in _YM_EXTS
+           else "sc68" if ident in _SC68_EXTS
+           else "adlib" if (ident == ".imf" or ident in _ADLIB_EXTS)
+           else "uade" if uade_named or is_rendered_format(ident) and _is_uade_suffix(ident)
+           else None)
+    if fam is None:
+        return None
+    return chip_family_key(fam, track_id, ident, subsong, track=track)
+
+
+def _is_uade_suffix(ext: str) -> bool:
+    from soniqboom.api.stream import _UADE_EXTS as _STREAM_UADE_EXTS
+    return ext in _STREAM_UADE_EXTS
 
 
 async def materialize_source(
@@ -288,17 +365,31 @@ async def _render_input(track_id: str, track_path: str,
     # renderer plays — by its record, ``one_tune_route`` — plays as one track:
     # no tune to probe; a uade ``.sng`` / ``.mus`` / prefix-named ``.st`` is
     # probed like any Amiga module.)
-    if src_ext not in _SID_EXTS and is_rendered_format(src_ext):
+    if src_ext in _SID_EXTS:
+        return path_obj, src_ext, subsong
+    from soniqboom.core.data import get_track
+    _track = await get_track(track_id) if not is_rendered_format(src_ext) else None
+    # (an Amiga prefix-form name — ``mdat.song`` — is told by the record, as
+    # ``stream_track`` tells it: its default tune is probed the same way)
+    named = bool(_track is not None and _uade_named(_track))
+    if is_rendered_format(src_ext) or named:
         from soniqboom.api.stream import _bare_play_track, _probe_family, tune_index
-        from soniqboom.core.data import get_track
-        _track = await get_track(track_id)
+        if _track is None:
+            _track = await get_track(track_id)
         if one_tune_route(track_id, track_path, _track if _track is not None else {}):
             return path_obj, src_ext, subsong
         if not subsong and await asyncio.to_thread(path_obj.exists):
             _track = await _bare_play_track(track_id, _track, path_obj,
-                                            _probe_family(src_ext, False, path_obj))
+                                            _probe_family(src_ext, named, path_obj))
         subsong = tune_index(track_id, _track, subsong or None)
     return path_obj, src_ext, subsong
+
+
+def _uade_named(track) -> bool:
+    """Does ``stream._render_ident`` route this record to uade by its NAME
+    (an Amiga prefix-form module, a SoundFactory ``.psf``)?"""
+    from soniqboom.api.stream import _render_ident
+    return _render_ident(getattr(track, "path", "") or "", track)[1]
 
 
 async def prepare_live_source(
@@ -312,7 +403,8 @@ async def prepare_live_source(
     ``src_feed``): ffmpeg then starts on the render's first audio instead of
     its end.  For the formats whose render is slow enough to wait on and can
     be read while it grows — SID (sidplayfp), MIDI (fluidsynth), AHX
-    (uade123) and the libgme chiptunes — under the same cache keys
+    (uade123), the libgme chiptunes and the trackers (openmpt123) — under the
+    same cache keys
     ``prepare_source_for_stream`` renders them to (the render is cached as
     usual).  None when there is nothing live to offer: another format, the
     render is already cached, or it ended before it was audible (failed,
@@ -322,8 +414,9 @@ async def prepare_live_source(
     raises the cache's 422."""
     visible_path = track_path.split("::")[-1] if "::" in track_path else track_path
     ext = Path(visible_path).suffix.lower()
+    dmx = ext == ".mus" and await asyncio.to_thread(_is_dmx_mus, track_id, track_path, ext)
     if not (ext in _SID_EXTS or ext in _MIDI_EXTS or ext in _UADE_EXTS
-            or ext in _GME_EXTS):
+            or ext in _GME_EXTS or (ext in _TRACKER_EXTS and ext != ".imf") or dmx):
         return None
     path_obj, src_ext, subsong = await _render_input(track_id, track_path, subsong)
     if not await asyncio.to_thread(path_obj.exists):       # (a stat: off the loop)
@@ -335,19 +428,29 @@ async def prepare_live_source(
             return None
         from soniqboom.config import settings
         target_dur = int(getattr(settings, "sid_default_duration", 180))
-        key = _cache_key(track_id, "sid", subsong=subsong, duration=target_dur)
+        stereo = _st.sid_stereo_by_id(track_id)     # (a 2SID / 3SID tune: stereo)
+        key = _cache_key(track_id, "sid", subsong=subsong, duration=target_dur,
+                         variant="st" if stereo else None)
         if await get_cached(key) is not None:
             return None
-        return await _st.sid_wav_feed(path_obj, subsong, target_dur, key)
-    if src_ext in _MIDI_EXTS:
-        from soniqboom.config import active_soundfont_async
-        sf = await active_soundfont_async()
-        sfp = str(sf) if sf else ""
+        return await _st.sid_wav_feed(path_obj, subsong, target_dur, key, stereo=stereo)
+    if src_ext in _MIDI_EXTS or dmx:
+        sfp = await _st.midi_variant_async(path_obj)
         key = _cache_key(track_id, "midi", soundfont_path=sfp)
         return await _st.live_wav_feed(
             track_id, format_type="midi", subsong=0, key=key,
             render_fn=lambda: _st._render_midi(path_obj, live_key=key),
             cache_kw={"soundfont_path": sfp})
+    if src_ext in _TRACKER_EXTS and src_ext != ".imf":
+        # A module libopenmpt plays (not one a uade name routes to uade): its
+        # render as it grows — the Amiga resampler (2.3.0) made a whole
+        # render about 12× slower to wait on.
+        if _st._render_ident(track_path)[1]:
+            return None
+        key = _cache_key(track_id, "tracker", subsong=subsong)
+        return await _st.live_wav_feed(
+            track_id, format_type="tracker", subsong=subsong, key=key,
+            render_fn=lambda: _st._render_tracker(path_obj, subsong=subsong, live_key=key))
     if src_ext in _UADE_EXTS:
         base = await _st._uade_resolve_base(track_id, None, path_obj, subsong)
         key = _st.uade_cache_key(track_id, subsong, base)
@@ -360,7 +463,8 @@ async def prepare_live_source(
     key = _cache_key(track_id, "gme", subsong=subsong, variant=var)
     return await _st.live_wav_feed(
         track_id, format_type="gme", subsong=subsong, key=key,
-        render_fn=lambda: _st._render_gme(path_obj, subsong=subsong, live_key=key),
+        render_fn=lambda: _st._render_gme(path_obj, subsong=_st.gme_slot(track_id, subsong),
+                                          live_key=key),
         cache_kw={"variant": var} if var else None)
 
 
@@ -379,7 +483,11 @@ async def prepare_source_for_stream(
     For rendered formats (SID, MIDI, tracker, GME), this runs the right
     renderer (cached via ``conversion_cache.get_or_render`` so a second
     play hits the on-disk cache) and returns the resulting WAV path
-    with ``effective_codec = "wav"``.
+    with ``effective_codec = "wav"``.  The PSF family (a Dreamcast ``.dsf``
+    rip included), SNDH, YM, SC68, AdLib / IMF and the uade family (suffix
+    and prefix-form names, a SidMon ``.sid``) render through the web
+    player's own dispatch (``stream.chip_family`` / ``render_chip_family``),
+    under the keys a web play renders them to.
 
     ``subsong`` is honoured for SID / tracker / GME; ignored for MIDI
     and other single-track formats.
@@ -389,21 +497,30 @@ async def prepare_source_for_stream(
     ``HTTPException(501, "<binary> not installed")`` when the required renderer
     binary is missing, which cast_stream re-raises unchanged.
     """
+    wire = int(subsong or 0)
     path_obj, src_ext, subsong = await _render_input(track_id, track_path, subsong)
 
-    if one_tune_route(track_id, track_path) is not None:
+    one = one_tune_route(track_id, track_path)
+    if one is not None:
         # MDX, SunVox, MGSDRV, GoatTracker, FamiTracker, DefleMask, C64 Sidplayer, Sawteeth,
         # xmprender's modules: their own renderer
-        # (stream's PSF route), under the cache key a web play renders to.
-        from soniqboom.api.stream import _render_psf, _route_variant
+        # (stream's PSF route), under the cache key a web play renders to —
+        # per tune for a GoatTracker song / FamiTracker module with several.
+        from soniqboom.api.stream import _psf_tuned, _render_psf, _route_variant
+        from soniqboom.core.store import get_store
+        tuned = _psf_tuned(one, get_store().get_track(track_id))
+        tune = int(subsong or 0) if tuned else 0
         variant = await asyncio.to_thread(_route_variant, path_obj)
         cached_path, _hit = await get_or_render(
-            track_id=track_id, format_type="psf", subsong=0, variant=variant,
-            render_fn=lambda: _render_psf(path_obj),
+            track_id=track_id, format_type="psf", subsong=tune, variant=variant, tuned=tuned,
+            render_fn=lambda: _render_psf(path_obj, tune),
         )
         return cached_path, "wav"
 
-    if src_ext in _SID_EXTS:
+    from soniqboom.api import stream as _st
+    c64 = (src_ext in _SID_EXTS
+           and await asyncio.to_thread(_st._is_c64_sid, path_obj))   # (SidMon: uade)
+    if c64:
         # Late import — keeps the cast modules independently loadable
         # even if the SID renderer fails to import for any reason
         # (sidplayfp not installed, HVSC unconfigured, etc.).
@@ -412,21 +529,23 @@ async def prepare_source_for_stream(
         # We don't have a per-tune target_dur here without an HVSC
         # lookup; let _render_sid honour its own settings default.
         target_dur = int(getattr(settings, "sid_default_duration", 180))
+        stereo = _st.sid_stereo_by_id(track_id)     # (a 2SID / 3SID tune: stereo)
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="sid", subsong=subsong,
-            duration=target_dur,
-            render_fn=lambda: _render_sid(path_obj, subsong=subsong, duration=target_dur),
+            duration=target_dur, variant="st" if stereo else None,
+            render_fn=lambda: _render_sid(path_obj, subsong=subsong, duration=target_dur,
+                                          stereo=stereo),
         )
         return cached_path, "wav"
 
-    if src_ext in _MIDI_EXTS:
-        from soniqboom.api.stream import _render_midi
-        from soniqboom.config import active_soundfont_async
-        sf = await active_soundfont_async()
+    if src_ext in _MIDI_EXTS or (src_ext == ".mus" and await asyncio.to_thread(
+            _is_dmx_mus, track_id, track_path, src_ext)):
+        from soniqboom.api.stream import _render_midi, midi_variant_async
+        sfp = await midi_variant_async(path_obj)
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="midi", subsong=0,
             render_fn=lambda: _render_midi(path_obj),
-            soundfont_path=str(sf) if sf else "",
+            soundfont_path=sfp,
         )
         return cached_path, "wav"
 
@@ -456,6 +575,25 @@ async def prepare_source_for_stream(
         )
         return cached_path, "wav"
 
+    # The families only the web player's dispatch knew until 2.3.0 — PSF,
+    # SNDH, YM, SC68, AdLib / IMF (an id / Apogee ``.imf`` is AdLib, told
+    # by content), the uade family: in ``stream_track``'s order, before the
+    # trackers (a uade prefix-form name never takes a tracker suffix).
+    from soniqboom.core.data import get_track
+    track = await get_track(track_id)
+    ident, uade_named = _st._render_ident(
+        (getattr(track, "path", None) or track_path), track)
+    fam = await _st.chip_family(ident, path_obj, uade_named, track, c64=c64)
+    if fam is not None:
+        idx = (_st.tune_index(track_id, track, wire or None)
+               if src_ext in _SID_EXTS else subsong)       # (a SidMon .sid: by its tune)
+        cached_path, key = await _st.render_chip_family(
+            fam, track_id, path_obj, ident, idx, track=track)
+        if len(_CHIP_KEYS) >= _CHIP_KEYS_MAX:
+            _CHIP_KEYS.clear()
+        _CHIP_KEYS[(track_id, wire)] = key
+        return cached_path, "wav"
+
     if src_ext in _TRACKER_EXTS:
         from soniqboom.api.stream import _render_tracker
         cached_path, _hit = await get_or_render(
@@ -465,11 +603,11 @@ async def prepare_source_for_stream(
         return cached_path, "wav"
 
     if src_ext in _GME_EXTS:
-        from soniqboom.api.stream import _gme_variant, _render_gme
+        from soniqboom.api.stream import _gme_variant, _render_gme, gme_slot
         cached_path, _hit = await get_or_render(
             track_id=track_id, format_type="gme", subsong=subsong,
             variant=_gme_variant(src_ext),
-            render_fn=lambda: _render_gme(path_obj, subsong=subsong),
+            render_fn=lambda: _render_gme(path_obj, subsong=gme_slot(track_id, subsong)),
         )
         return cached_path, "wav"
 

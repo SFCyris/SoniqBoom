@@ -173,8 +173,10 @@ def test_old_sndh_and_libgme_renders_are_not_reused():
     assert _cache_key("t", "gme", subsong=0) == "t__sub0__r3"     # (3: SAP TIMEs)
     assert _cache_key("t", "psf", subsong=0) == "t__r1"      # PSF: the fade (no subsongs)
     # uade's revision: modules played staged (``xpk.stage_for_uade``)
-    assert _cache_key("t", "uade", subsong=2) == "t__sub2__r2"
-    assert _cache_key("t", "tracker", subsong=0) == "t__sub0__r2"    # (own float WAV, song-end loops)
+    # (+ ``pan0``: Paula's stereo; ``amauto``: the Amiga resampler at its
+    # default — core/render_options.py, 2.3.0)
+    assert _cache_key("t", "uade", subsong=2) == "t__sub2__r2__pan0"
+    assert _cache_key("t", "tracker", subsong=0) == "t__sub0__r3__amauto"    # (own float WAV, song-end loops; one subsong per tune)
 
 
 # ── AHX: stop uade at the song end ──────────────────────────────────────────

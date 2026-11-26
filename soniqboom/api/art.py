@@ -17,7 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
-from soniqboom.core import art_cache, folder_art_index, folder_covers, online_cover
+from soniqboom.core import art_cache, folder_art_index, folder_covers, gen_cover, igdb_cover, online_cover
 from soniqboom.core.filesource import is_remote_path
 from soniqboom.core.data import get_track, get_config
 from soniqboom.core.metadata import cap_full_cover, id3_picture, resize_cover
@@ -1499,10 +1499,17 @@ async def art_status(request: Request):
     candidates = await asyncio.to_thread(_no_cover_candidates, ids, use_folder)
     none: list[str] = []
     lookups_off = online_cover.lookups_off()
+    generated = gen_cover.enabled_now()
     for tid in candidates:
         track = await get_track(tid)
         if track is None or folder_covers.pending(track):
             continue
+        if generated and gen_cover.applies(track):
+            continue                        # a generated cover (or a box cover) is always there
+        if igdb_cover.configured():
+            box_sub, box = await igdb_cover.stored(track)
+            if (box and box.get("ok")) or igdb_cover.pending(box_sub):
+                continue                    # a game box cover is there or on its way
         online = await online_cover.state(track)
         if online.hit or (online.open and not lookups_off):
             continue                        # an online cover is there or may come
@@ -1593,6 +1600,10 @@ async def cover_art(
             mtime = None
         if track is not None:
             online = await online_cover.state(track)
+    # Retro tracks: a stored game box cover (core/igdb_cover.py) and the
+    # generated cover (core/gen_cover.py) stand in after the online one.
+    gen = await gen_cover.spec_if_on(track) if track is not None else None
+    box_sub, box = await igdb_cover.stored(track) if track is not None else (None, None)
     etag = _make_etag(track_id, size, mtime)
     # The answer that carries an online cover (``_online_response``) has its
     # own tag; the track's own cover and "no cover" keep ``etag``.
@@ -1606,8 +1617,17 @@ async def cover_art(
     # the track a cover without changing ``etag``; the request then resolves
     # again below.
     if_none_match = request.headers.get("if-none-match")
+    if if_none_match and track is not None and (gen is not None or box_sub is not None):
+        stood_in = await _stand_in_304(if_none_match, track_id, track, etag, gen, box_sub, box, mtime,
+                                       online)
+        if stood_in is not None:
+            return stood_in
     if if_none_match and if_none_match == etag_online and (
-            not online.hit or _own_cover_missing(track_id, track, mtime)):
+            not online.hit or _own_cover_missing(track_id, track, mtime)) and not (
+            # (a retro track's stand-in replaces "no cover": a client holding
+            # that older answer gets the picture, not a 304)
+            not online.hit and track is not None
+            and (gen is not None or _box_shown(track_id, track, box, mtime))):
         etag = etag_online
         headers = {"ETag": etag}
         if online.hit:
@@ -1665,6 +1685,9 @@ async def cover_art(
             return found
         pending = pending or (track is not None and (folder_covers.pending(track)
                                              or _backfill_pending(track_id)))
+        stand_in = await _stand_in(track_id, track, size, etag, gen, box_sub, box, mtime, pending)
+        if stand_in is not None:
+            return stand_in
         if fallback != "placeholder":
             return _no_art_response(etag, pending=pending)
         return _placeholder_response(_placeholder_cc(online, pending))
@@ -1682,9 +1705,95 @@ async def cover_art(
         return found
     pending = pending or (track is not None and (folder_covers.pending(track)
                                          or _backfill_pending(track_id)))
+    stand_in = await _stand_in(track_id, track, size, etag, gen, box_sub, box, mtime, pending)
+    if stand_in is not None:
+        return stand_in
     if fallback != "placeholder":
         return _no_art_response(etag, pending=pending)
     return _placeholder_response(_placeholder_cc(online, pending))
+
+
+@router.post("/{track_id}/intent")
+async def art_intent(track_id: str):
+    """The web player started ``track_id``, or its Track Info opened: look
+    up its game's box cover (core/igdb_cover.py) when IGDB is set up and
+    nothing is known yet — the only way such a lookup starts (never a list
+    row).  ``{"queued": bool}``; ``art_ready`` follows a cover."""
+    if len(track_id) > 256:
+        raise HTTPException(404, "Unknown track")
+    track = await get_track(track_id)
+    if track is None:
+        raise HTTPException(404, "Unknown track")
+    return {"queued": await igdb_cover.on_intent(track, track_id)}
+
+
+# ── Stand-in covers for retro tracks ─────────────────────────────────────────
+# After the track's own cover and the online one: a stored game box cover
+# (core/igdb_cover.py, only for a track known to have no cover of its own,
+# like the online cover), else the generated cover (core/gen_cover.py), which
+# stands in like the format emoji did — so also while the track's own cover
+# is still on its way (then asked again at every use: ``_LOOKUP_PENDING_CC``).
+# Both answers have their own ETag (``gen_cover.etag`` / ``igdb_cover.etag``
+# on the track's tag), so a cover the track gains changes the tag.
+_GENERATED_CC = "public, max-age=60, must-revalidate"
+
+
+def _box_shown(track_id: str, track, box, source_mtime: float | None) -> bool:
+    """Is the stored box cover the one to show — the track known to have no
+    cover of its own (an online-collection tune: none in the file)?"""
+    if not (box and box.get("ok")):
+        return False
+    if _own_cover_missing(track_id, track, source_mtime):
+        return True
+    try:
+        from soniqboom.core import catalogue
+        return catalogue.is_catalogue_path(track.path) and not getattr(track, "cover_art", None)
+    except Exception:                               # noqa: BLE001
+        return False
+
+
+async def _stand_in(track_id: str, track, size: str, etag: str, gen, box_sub, box,
+                    source_mtime: float | None, pending: bool) -> Response | None:
+    """The box cover or the generated cover as a response, or None."""
+    if track is None:
+        return None
+    if _box_shown(track_id, track, box, source_mtime):
+        data = await igdb_cover.image(track, size)
+        if data:
+            return Response(content=data, media_type="image/jpeg", headers={
+                "Cache-Control": _ONLINE_CC,
+                "ETag": igdb_cover.etag(etag, box),
+                "X-SoniqBoom-Art": "boxart",
+            })
+    if gen is None:
+        return None
+    data = await gen_cover.picture(gen, size)
+    if not data:
+        return None
+    pending = pending or igdb_cover.pending(box_sub)
+    return Response(content=data, media_type="image/jpeg", headers={
+        "Cache-Control": _LOOKUP_PENDING_CC if pending else _GENERATED_CC,
+        "ETag": gen_cover.etag(etag, gen),
+        "X-SoniqBoom-Art": "generated",
+    })
+
+
+async def _stand_in_304(if_none_match: str, track_id: str, track, etag: str, gen, box_sub, box,
+                        source_mtime: float | None, online) -> Response | None:
+    """A 304 for a client that holds the stand-in still due, else None."""
+    if _box_shown(track_id, track, box, source_mtime):
+        if if_none_match == igdb_cover.etag(etag, box):
+            return Response(status_code=304, headers={"ETag": if_none_match,
+                                                      "Cache-Control": _ONLINE_CC})
+        return None
+    if gen is None or online.hit or if_none_match != gen_cover.etag(etag, gen):
+        return None
+    headers = {"ETag": if_none_match, "Cache-Control": _GENERATED_CC}
+    if source_mtime is None and is_remote_path(track.path):
+        await _fill_remote_art_later(track_id, track)   # (as for "no cover yet", below)
+    if folder_covers.pending(track) or _backfill_pending(track_id) or igdb_cover.pending(box_sub):
+        headers["Cache-Control"] = _LOOKUP_PENDING_CC
+    return Response(status_code=304, headers=headers)
 
 
 # ── Online covers (core/online_cover.py) ─────────────────────────────────────
@@ -1819,22 +1928,36 @@ async def online_cover_for(track_id: str, size: str = "full") -> tuple[bytes | N
     ``full`` — or None, can one still turn up soon)``.  The second is True
     while the track's answer is not known — a lookup queued or running, or
     one that has to wait (the lookups paused) — or is a short-lived "none":
-    the caller must not remember "no cover" for long then.  Like
-    ``_online_response``, only for a track known to have no cover of its own."""
+    the caller must not remember the answer for long then.  Like
+    ``_online_response``, only for a track known to have no cover of its own;
+    a retro track gets its game box cover the same way, else its generated
+    cover (the first part is then never None while those are on)."""
     try:
         track = await get_track(track_id)
         if not track:
             return None, False
+        # A retro track's stand-in: its stored game box cover (own cover known
+        # missing), else its generated cover — also while its own cover is
+        # still on its way (then with "may come", so it is not kept long).
+        gen = await gen_cover.spec_if_on(track)
         if folder_covers.pending(track) or _backfill_pending(track_id):
-            return None, True                   # the share's own or folder image is on its way
+            # (the share's own or folder image is on its way)
+            return (await gen_cover.picture(gen, size) if gen else None), True
         online = await online_cover.state(track)
+        box_sub, box = await igdb_cover.stored(track)
+        if _box_shown(track_id, track, box, None):
+            data = await igdb_cover.image(track, size)
+            if data:
+                return data, False
         if not _own_cover_missing(track_id, track):       # (the mark ``_resolve_full_art`` just set)
-            return None, False
+            # (unread or unreadable: the stand-in is not kept long)
+            return (await gen_cover.picture(gen, size), True) if gen else (None, False)
         data = await online_cover.image(online, size)
         if data:
             return data, False
         _ask_online(online, track_id, track)
-        return None, online.open and not online_cover.lookups_off()
+        may_come = (online.open and not online_cover.lookups_off()) or igdb_cover.pending(box_sub)
+        return (await gen_cover.picture(gen, size) if gen else None), may_come
     except Exception:
         log.debug("online cover failed for %s", track_id, exc_info=True)
         return None, False
